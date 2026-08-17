@@ -183,6 +183,23 @@ reportGeneralTypeIssues = "none"       # -> raises 218 errors (usage of literal 
 reportOptionalMemberAccess = "warning" # -> raises 8 errors
 reportPrivateUsage = "warning"
 
+extraPaths = [
+    "C:/Users/84580/workspace/cld/IsaacLab/source/isaaclab",
+    "C:/Users/84580/workspace/cld/IsaacLab/source/isaaclab_assets",
+    "C:/Users/84580/workspace/cld/IsaacLab/source/isaaclab_contrib",
+    "C:/Users/84580/workspace/cld/IsaacLab/source/isaaclab_experimental",
+    "C:/Users/84580/workspace/cld/IsaacLab/source/isaaclab_mimic",
+    "C:/Users/84580/workspace/cld/IsaacLab/source/isaaclab_newton",
+    "C:/Users/84580/workspace/cld/IsaacLab/source/isaaclab_ov",
+    "C:/Users/84580/workspace/cld/IsaacLab/source/isaaclab_ovphysx",
+    "C:/Users/84580/workspace/cld/IsaacLab/source/isaaclab_physx",
+    "C:/Users/84580/workspace/cld/IsaacLab/source/isaaclab_ppisp",
+    "C:/Users/84580/workspace/cld/IsaacLab/source/isaaclab_rl",
+    "C:/Users/84580/workspace/cld/IsaacLab/source/isaaclab_tasks",
+    "C:/Users/84580/workspace/cld/IsaacLab/source/isaaclab_tasks_experimental",
+    "C:/Users/84580/workspace/cld/IsaacLab/source/isaaclab_teleop",
+    "C:/Users/84580/workspace/cld/IsaacLab/source/isaaclab_visualizers"
+]
 
 [tool.codespell]
 skip = '*.usd,*.usda,*.usdz,*.svg,*.png,_isaac_sim*,*.bib,*.css,*/_build'

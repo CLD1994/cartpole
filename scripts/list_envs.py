@@ -87,7 +87,7 @@ def main():
     task_specs = [
         spec
         for spec in gym.registry.values()
-        if "Template-" in spec.id and (args_cli.keyword is None or args_cli.keyword in spec.id)
+        if "Hexchip-" in spec.id and (args_cli.keyword is None or args_cli.keyword in spec.id)
     ]
 
     if args_cli.show_presets:

@@ -1,9 +1,12 @@
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
 import math
+
+from isaaclab_newton.physics import KaminoSolverCfg, MJWarpSolverCfg, NewtonCfg
+from isaaclab_physx.physics import PhysxCfg
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
@@ -18,12 +21,59 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.utils.configclass import configclass
 
 from . import mdp
+from isaaclab_tasks.utils import PresetCfg
 
 ##
 # Pre-defined configs
 ##
 
 from isaaclab_assets.robots.cartpole import CARTPOLE_CFG  # isort:skip
+
+
+##
+# Physics backend presets
+##
+
+
+@configclass
+class CartpolePhysicsCfg(PresetCfg):
+    default: PhysxCfg = PhysxCfg()
+    physx: PhysxCfg = PhysxCfg()
+    newton_mjwarp: NewtonCfg = NewtonCfg(
+        solver_cfg=MJWarpSolverCfg(
+            njmax=5,
+            nconmax=3,
+            cone="pyramidal",
+            impratio=1,
+            integrator="implicitfast",
+        ),
+        num_substeps=1,
+        debug_mode=False,
+        use_cuda_graph=True,
+    )
+    newton_kamino: NewtonCfg = NewtonCfg(
+        solver_cfg=KaminoSolverCfg(
+            integrator="moreau",
+            use_collision_detector=True,
+            sparse_jacobian=True,
+            constraints_alpha=0.1,
+            padmm_max_iterations=100,
+            padmm_primal_tolerance=1e-4,
+            padmm_dual_tolerance=1e-4,
+            padmm_compl_tolerance=1e-4,
+            padmm_rho_0=0.05,
+            padmm_eta=1e-5,
+            padmm_use_acceleration=True,
+            padmm_warmstart_mode="containers",
+            padmm_contact_warmstart_method="geom_pair_net_force",
+            padmm_use_graph_conditionals=False,
+            collision_detector_pipeline="unified",
+            collision_detector_max_contacts_per_pair=8,
+        ),
+        num_substeps=1,
+        debug_mode=False,
+        use_cuda_graph=True,
+    )
 
 
 ##
@@ -41,8 +91,8 @@ class CartpoleSceneCfg(InteractiveSceneCfg):
         spawn=sim_utils.GroundPlaneCfg(size=(100.0, 100.0)),
     )
 
-    # robot
-    robot: ArticulationCfg = CARTPOLE_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+    # cartpole
+    robot: ArticulationCfg = CARTPOLE_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot") # type: ignore
 
     # lights
     dome_light = AssetBaseCfg(
@@ -135,6 +185,8 @@ class RewardsCfg:
         weight=-0.005,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=["cart_to_pole"])},
     )
+    # (6) Success rate tracking (zero-weight, metric only)
+    success_rate = RewTerm(func=mdp.survival_success_rate, weight=0.0) # type: ignore
 
 
 @configclass
@@ -157,8 +209,10 @@ class TerminationsCfg:
 
 @configclass
 class CartpoleEnvCfg(ManagerBasedRLEnvCfg):
+    """Configuration for the cartpole environment."""
+
     # Scene settings
-    scene: CartpoleSceneCfg = CartpoleSceneCfg(num_envs=4096, env_spacing=4.0)
+    scene: CartpoleSceneCfg = CartpoleSceneCfg(num_envs=4096, env_spacing=4.0, clone_in_fabric=True)
     # Basic settings
     observations: ObservationsCfg = ObservationsCfg()
     actions: ActionsCfg = ActionsCfg()
@@ -178,3 +232,4 @@ class CartpoleEnvCfg(ManagerBasedRLEnvCfg):
         # simulation settings
         self.sim.dt = 1 / 120
         self.sim.render_interval = self.decimation
+        self.sim.physics = CartpolePhysicsCfg() # type: ignore
