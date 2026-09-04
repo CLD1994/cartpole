@@ -63,3 +63,12 @@ class CartpolePPORunnerWithSymmetryCfg(CartpolePPORunnerCfg):
             use_data_augmentation=True, data_augmentation_func=symmetry.compute_symmetric_states
         ),
     )
+
+@configclass
+class RealCartpolePPORunnerCfg(CartpolePPORunnerCfg):
+    """PPO configuration for the sim2real (domain-randomized) cartpole task."""
+
+    # domain randomization makes optimization harder -> more iterations
+    max_iterations = 1000
+    save_interval = 50
+    experiment_name = "cartpole_real"

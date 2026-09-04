@@ -17,12 +17,29 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
 
-def joint_pos_target_l2(env: ManagerBasedRLEnv, target: float, asset_cfg: SceneEntityCfg) -> torch.Tensor:
-    """Penalize joint position deviation from a target value."""
+def joint_pos_target_l2(
+    env: ManagerBasedRLEnv,
+    target: float,
+    asset_cfg: SceneEntityCfg,
+    wrap: bool = True,
+) -> torch.Tensor:
+    """Penalize joint position deviation from a target value.
+
+    Args:
+        env: The environment.
+        target: Target joint position [rad or m, depending on joint type].
+        asset_cfg: The asset (articulation) whose joints are penalized.
+        wrap: Wrap joint positions to (-pi, pi] before taking the difference. Correct for
+            revolute joints; must be ``False`` for prismatic joints, whose position is a
+            length [m] and must not be angle-wrapped (beyond half a track length of ~3.14 m
+            the wrap would fold far positions back near the target and reward deviation).
+    """
     # extract the used quantities (to enable type-hinting)
     asset: Articulation = env.scene[asset_cfg.name]
-    # wrap the joint positions to (-pi, pi)
-    joint_pos = wrap_to_pi(asset.data.joint_pos[:, asset_cfg.joint_ids])
+    joint_pos = asset.data.joint_pos.torch[:, asset_cfg.joint_ids]
+    # wrap the joint positions to (-pi, pi) for revolute joints
+    if wrap:
+        joint_pos = wrap_to_pi(joint_pos)
     # compute the reward
     return torch.sum(torch.square(joint_pos - target), dim=1)
 
