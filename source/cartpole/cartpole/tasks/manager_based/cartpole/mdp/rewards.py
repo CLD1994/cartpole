@@ -55,7 +55,11 @@ class survival_success_rate(ManagerTermBase):
         super().__init__(cfg, env)
 
     def reset(self, env_ids: torch.Tensor):
-        survived = self._env.termination_manager.time_outs[env_ids] # type: ignore
+        manager = self._env.termination_manager
+        survived = manager.time_outs[env_ids] & ~manager.terminated[env_ids]
+        # 初始化或空重置没有可统计的回合，不发布空均值。
+        if survived.numel() == 0:
+            return
         self._env.extras.setdefault("log", {})["Metrics/success_rate"] = survived.float().mean().item()
 
     def __call__(self, env: ManagerBasedRLEnv) -> torch.Tensor:

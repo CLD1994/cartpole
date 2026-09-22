@@ -17,6 +17,8 @@ below are MEASURED with deploy/calibrate_force.py (2026-08-18), not datasheet gu
   - obs noise    : encoder quantization + finite-difference velocity noise
 """
 
+import math
+
 import torch
 
 from isaaclab.managers import EventTermCfg as EventTerm
@@ -35,6 +37,7 @@ from .mdp import (
 )
 from .mdp import dr_events as mdp_events
 from .mdp import lag_actions as mdp_actions
+from .mdp.terminations import pole_angle_out_of_bounds
 
 
 def gaussian_noise_from_list(data: torch.Tensor, cfg: GaussianNoiseCfg) -> torch.Tensor:
@@ -111,6 +114,14 @@ class RealCartpoleEnvCfg(CartpoleEnvCfg):
         self.terminations.cart_out_of_bounds = DoneTerm(
             func=joint_pos_out_of_manual_limit,
             params={"asset_cfg": SceneEntityCfg("robot", joint_names=["slider_to_cart"]), "bounds": (-0.173, 0.173)},
+        )
+        # 真实杆角度相对直立方向超过 ±60° 时判为失败；不受观测噪声影响。
+        self.terminations.pole_out_of_bounds = DoneTerm(
+            func=pole_angle_out_of_bounds,
+            params={
+                "asset_cfg": SceneEntityCfg("robot", joint_names=["cart_to_pole"]),
+                "max_angle": math.pi / 3,
+            },
         )
         self.events.reset_cart_position = EventTerm(
             func=reset_joints_by_offset,

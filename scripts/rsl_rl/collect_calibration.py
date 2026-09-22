@@ -26,15 +26,20 @@ from __future__ import annotations
 # must be frozen before importing gymnasium, torch, RSL-RL, Isaac Lab, or local tasks.
 import argparse
 import contextlib
+from datetime import datetime, timezone
+import hashlib
 import importlib.metadata as metadata
 import json
 import os
 import re
 import sys
+import uuid
 from pathlib import Path
 
 
 SHELL_CWD = Path.cwd().resolve()
+SCRIPT_PATH = Path(__file__).resolve()
+ORIGINAL_ARGUMENTS = sys.argv[1:].copy()
 
 
 def _looks_like_local_checkpoint(value: str) -> bool:
@@ -114,46 +119,49 @@ def _freeze_explicit_checkpoint_argv() -> tuple[str | None, Path | None]:
     return raw_checkpoint, frozen_checkpoint
 
 
-EARLY_CHECKPOINT_ARG, EARLY_CHECKPOINT_PATH = _freeze_explicit_checkpoint_argv()
+if __name__ == "__main__":
+    EARLY_CHECKPOINT_ARG, EARLY_CHECKPOINT_PATH = _freeze_explicit_checkpoint_argv()
 
-print(f"[BOOT] shell cwd: {SHELL_CWD}")
-if EARLY_CHECKPOINT_PATH is not None:
-    print(f"[BOOT] early checkpoint: {EARLY_CHECKPOINT_PATH}")
-elif EARLY_CHECKPOINT_ARG is not None:
-    print(f"[BOOT] checkpoint source left for Isaac Lab resolver: {EARLY_CHECKPOINT_ARG}")
+    print(f"[BOOT] shell cwd: {SHELL_CWD}")
+    if EARLY_CHECKPOINT_PATH is not None:
+        print(f"[BOOT] early checkpoint: {EARLY_CHECKPOINT_PATH}")
+    elif EARLY_CHECKPOINT_ARG is not None:
+        print(f"[BOOT] checkpoint source left for Isaac Lab resolver: {EARLY_CHECKPOINT_ARG}")
 
 
-# Heavy / Isaac-related imports must remain below the cwd/checkpoint bootstrap above.
-import gymnasium as gym
+    # Heavy / Isaac-related imports must remain below the cwd/checkpoint bootstrap above.
+    import gymnasium as gym
+    from rsl_rl.runners import DistillationRunner, OnPolicyRunner
+
+    from isaaclab.envs import DirectMARLEnvCfg, DirectRLEnvCfg, ManagerBasedRLEnvCfg
+    from isaaclab.utils.assets import retrieve_file_path
+    from isaaclab.utils.seed import configure_seed
+    from isaaclab.utils.string import list_intersection, string_to_callable
+
+    from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper, handle_deprecated_rsl_rl_cfg
+    from isaaclab_rl.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
+
+    import isaaclab_tasks  # noqa: F401
+    from isaaclab_tasks.utils import (
+        add_launcher_args,
+        get_checkpoint_path,
+        launch_simulation,
+        setup_preset_cli,
+    )
+    from isaaclab_tasks.utils.hydra import hydra_task_config
+
+    # local imports -- keep the same registration/CLI behavior as play_rsl_rl.py
+    import cli_args  # isort: skip
+
+    import cartpole.tasks  # noqa: F401, E402
+
+    with contextlib.suppress(ImportError):
+        import isaaclab_tasks_experimental  # noqa: F401
+
+
 import numpy as np
 import torch
 from packaging import version
-from rsl_rl.runners import DistillationRunner, OnPolicyRunner
-
-from isaaclab.envs import DirectMARLEnvCfg, DirectRLEnvCfg, ManagerBasedRLEnvCfg
-from isaaclab.utils.assets import retrieve_file_path
-from isaaclab.utils.seed import configure_seed
-from isaaclab.utils.string import list_intersection, string_to_callable
-
-from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper, handle_deprecated_rsl_rl_cfg
-from isaaclab_rl.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
-
-import isaaclab_tasks  # noqa: F401
-from isaaclab_tasks.utils import (
-    add_launcher_args,
-    get_checkpoint_path,
-    launch_simulation,
-    setup_preset_cli,
-)
-from isaaclab_tasks.utils.hydra import hydra_task_config
-
-# local imports -- keep the same registration/CLI behavior as play_rsl_rl.py
-import cli_args  # isort: skip
-
-import cartpole.tasks  # noqa: F401, E402
-
-with contextlib.suppress(ImportError):
-    import isaaclab_tasks_experimental  # noqa: F401
 
 
 OBSERVATION_NAMES = (
@@ -203,103 +211,109 @@ ROLE_CYCLE = np.asarray(
 )
 
 
-# -- argparse ----------------------------------------------------------------
-parser = argparse.ArgumentParser(description="Collect PTQ calibration observations from an RSL-RL CartPole policy.")
-parser.add_argument("--num_envs", type=int, default=32, help="Number of parallel environments. Default: 32.")
-parser.add_argument("--task", type=str, default=None, help="Task name. Use the same task used for training.")
-parser.add_argument(
-    "--agent",
-    type=str,
-    default="rsl_rl_cfg_entry_point",
-    help="RL agent configuration entry point.",
-)
-parser.add_argument("--seed", type=int, default=None, help="Environment/agent seed.")
-parser.add_argument(
-    "--use_pretrained_checkpoint",
-    action="store_true",
-    help="Use a published pretrained checkpoint instead of a local checkpoint.",
-)
-parser.add_argument(
-    "--disable_fabric",
-    action="store_true",
-    default=False,
-    help="Disable fabric and use USD I/O operations.",
-)
-parser.add_argument("--external_callback", default=None, help="External environment-registration callback.")
+if __name__ == "__main__":
+    # -- argparse ----------------------------------------------------------------
+    parser = argparse.ArgumentParser(description="Collect PTQ calibration observations from an RSL-RL CartPole policy.")
+    parser.add_argument("--num_envs", type=int, default=32, help="Number of parallel environments. Default: 32.")
+    parser.add_argument("--task", type=str, default=None, help="Task name. Use the same task used for training.")
+    parser.add_argument(
+        "--agent",
+        type=str,
+        default="rsl_rl_cfg_entry_point",
+        help="RL agent configuration entry point.",
+    )
+    parser.add_argument("--seed", type=int, default=None, help="Environment/agent seed.")
+    parser.add_argument(
+        "--candidates_only", "--candidates-only", action="store_true",
+        help="仅采集候选观测、来源和覆盖报告，不执行初筛；不能同时指定 --calib_sizes。",
+    )
+    parser.add_argument(
+        "--use_pretrained_checkpoint",
+        action="store_true",
+        help="Use a published pretrained checkpoint instead of a local checkpoint.",
+    )
+    parser.add_argument(
+        "--disable_fabric",
+        action="store_true",
+        default=False,
+        help="Disable fabric and use USD I/O operations.",
+    )
+    parser.add_argument("--external_callback", default=None, help="External environment-registration callback.")
 
-parser.add_argument(
-    "--candidate_count",
-    "--candidate-count",
-    dest="candidate_count",
-    type=int,
-    default=4096,
-    help="Number of rollout observations to collect before selection. Default: 4096.",
-)
-parser.add_argument(
-    "--sample_stride",
-    "--sample-stride",
-    dest="sample_stride",
-    type=int,
-    default=6,
-    help="Each environment contributes one sample every N policy steps, with a random per-env phase. Default: 6.",
-)
-parser.add_argument(
-    "--warmup_steps",
-    "--warmup-steps",
-    dest="warmup_steps",
-    type=int,
-    default=30,
-    help="Initial policy steps to run before candidate collection begins. Default: 30.",
-)
-parser.add_argument(
-    "--calib_sizes",
-    "--calib-sizes",
-    dest="calib_sizes",
-    type=int,
-    nargs="+",
-    default=[64, 128, 256, 512],
-    help="Calibration set sizes to export. Default: 64 128 256 512.",
-)
-parser.add_argument(
-    "--fps_clip",
-    "--fps-clip",
-    dest="fps_clip",
-    type=float,
-    default=3.0,
-    help="Clip robust-scaled features to +/- this value for FPS distance only. Default: 3.0.",
-)
-parser.add_argument(
-    "--selection_seed",
-    "--selection-seed",
-    dest="selection_seed",
-    type=int,
-    default=SELECTION_SEED_DEFAULT,
-    help=f"Random seed for representative-core ordering. Default: {SELECTION_SEED_DEFAULT}.",
-)
-parser.add_argument(
-    "--output_dir",
-    "--output-dir",
-    dest="output_dir",
-    type=str,
-    default=None,
-    help="Output directory. Relative paths use the invoking shell cwd. Default: <checkpoint_dir>/calibration.",
-)
+    parser.add_argument(
+        "--candidate_count",
+        "--candidate-count",
+        dest="candidate_count",
+        type=int,
+        default=4096,
+        help="Number of rollout observations to collect before selection. Default: 4096.",
+    )
+    parser.add_argument(
+        "--sample_stride",
+        "--sample-stride",
+        dest="sample_stride",
+        type=int,
+        default=6,
+        help="Each environment contributes one sample every N policy steps, with a random per-env phase. Default: 6.",
+    )
+    parser.add_argument(
+        "--warmup_steps",
+        "--warmup-steps",
+        dest="warmup_steps",
+        type=int,
+        default=30,
+        help="Initial policy steps to run before candidate collection begins. Default: 30.",
+    )
+    parser.add_argument(
+        "--calib_sizes",
+        "--calib-sizes",
+        dest="calib_sizes",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Calibration set sizes to export. Default: 64 128 256 512.",
+    )
+    parser.add_argument(
+        "--fps_clip",
+        "--fps-clip",
+        dest="fps_clip",
+        type=float,
+        default=3.0,
+        help="Clip robust-scaled features to +/- this value for FPS distance only. Default: 3.0.",
+    )
+    parser.add_argument(
+        "--selection_seed",
+        "--selection-seed",
+        dest="selection_seed",
+        type=int,
+        default=SELECTION_SEED_DEFAULT,
+        help=f"Random seed for representative-core ordering. Default: {SELECTION_SEED_DEFAULT}.",
+    )
+    parser.add_argument(
+        "--output_dir",
+        "--output-dir",
+        dest="output_dir",
+        type=str,
+        default=None,
+        help="输出父目录；每次创建唯一 collection 子目录。默认 <checkpoint_dir>/calibration。",
+    )
 
-cli_args.add_rsl_rl_args(parser)
-add_launcher_args(parser)
-args_cli, remaining_args = setup_preset_cli(parser)
+    cli_args.add_rsl_rl_args(parser)
+    add_launcher_args(parser)
+    args_cli, remaining_args = setup_preset_cli(parser)
 
 
-# Call an external callback if requested, matching the existing play script behavior.
-remaining_args_env_registration = None
-if args_cli.external_callback:
-    external_callback_function = string_to_callable(args_cli.external_callback, separator=".")
-    remaining_args_env_registration = external_callback_function()
+    # Call an external callback if requested, matching the existing play script behavior.
+    remaining_args_env_registration = None
+    if args_cli.external_callback:
+        external_callback_function = string_to_callable(args_cli.external_callback, separator=".")
+        remaining_args_env_registration = external_callback_function()
 
-remaining_args = list_intersection(remaining_args, remaining_args_env_registration)
-sys.argv = [sys.argv[0]] + remaining_args
+    remaining_args = list_intersection(remaining_args, remaining_args_env_registration)
+    sys.argv = [sys.argv[0]] + remaining_args
 
-installed_version = metadata.version("rsl-rl-lib")
+    installed_version = metadata.version("rsl-rl-lib")
+
 
 
 def _validate_args() -> list[int]:
@@ -311,10 +325,16 @@ def _validate_args() -> list[int]:
         raise ValueError("--sample_stride must be > 0")
     if args_cli.warmup_steps < 0:
         raise ValueError("--warmup_steps must be >= 0")
-    if args_cli.fps_clip <= 0:
+    if not np.isfinite(args_cli.fps_clip) or args_cli.fps_clip <= 0:
         raise ValueError("--fps_clip must be > 0")
+    if args_cli.selection_seed < 0:
+        raise ValueError("--selection_seed must be >= 0")
+    if args_cli.candidates_only:
+        if args_cli.calib_sizes is not None:
+            raise ValueError("--candidates_only and --calib_sizes cannot be combined")
+        return []
 
-    sizes = sorted(set(args_cli.calib_sizes))
+    sizes = sorted(set(args_cli.calib_sizes if args_cli.calib_sizes is not None else [64, 128, 256, 512]))
     if not sizes or sizes[0] <= 0:
         raise ValueError("--calib_sizes must contain positive integers")
     if sizes[-1] > args_cli.candidate_count:
@@ -387,7 +407,116 @@ def _resolve_output_dir(checkpoint_file: Path) -> Path:
     else:
         output_dir = checkpoint_file.parent / "calibration"
     output_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    output_dir = output_dir / f"collection-{stamp}-{uuid.uuid4().hex}"
+    output_dir.mkdir()
     return output_dir
+
+
+def file_identity(path: Path) -> dict:
+    """记录实际文件路径和内容身份；路径用于找到模型，哈希用于区分版本。"""
+    resolved = path.resolve()
+    checksum = hashlib.sha256()
+    with resolved.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            checksum.update(block)
+    return {"path": str(resolved), "sha256": checksum.hexdigest()}
+
+
+def write_json(path: Path, payload: dict) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as stream:
+        json.dump(payload, stream, ensure_ascii=False, indent=2, allow_nan=False)
+        stream.write("\n")
+    temporary.replace(path)
+
+
+def collect_candidates(env, policy, candidate_count, sample_stride, warmup_steps, sample_offsets):
+    """保存策略实际使用的观测；回合 0 是起点未知的初始片段，步数记为 -1。"""
+    offsets = np.asarray(sample_offsets)
+    if (candidate_count <= 0 or sample_stride <= 0 or warmup_steps < 0
+            or offsets.ndim != 1 or not len(offsets)
+            or not np.issubdtype(offsets.dtype, np.integer)
+            or np.any(offsets < 0) or np.any(offsets >= sample_stride)):
+        raise ValueError("Invalid collection counts or sample offsets")
+    num_envs = len(offsets)
+    episode = np.zeros(num_envs, np.int64)
+    age = np.full(num_envs, -1, np.int64)
+    rows, records = [], {name: [] for name in ("env_id", "episode_id", "episode_step", "policy_step")}
+    step, collected = 0, 0
+    obs = env.get_observations()
+    while collected < candidate_count:
+        with torch.inference_mode():
+            values = obs["policy"]
+            if values.shape != (num_envs, EXPECTED_OBS_DIM) or values.dtype != torch.float32:
+                raise ValueError(f"Expected float32 policy observations [{num_envs}, {EXPECTED_OBS_DIM}]")
+            if not bool(torch.isfinite(values).all()):
+                raise ValueError("Policy observations must be finite")
+            if step >= warmup_steps:
+                selected = np.flatnonzero(offsets == step % sample_stride)[:candidate_count - collected]
+                if len(selected):
+                    tensor_indices = torch.as_tensor(selected, device=values.device)
+                    rows.append(values[tensor_indices].detach().cpu().numpy().copy())
+                    records["env_id"].append(selected.copy())
+                    records["episode_id"].append(episode[selected].copy())
+                    records["episode_step"].append(age[selected].copy())
+                    records["policy_step"].append(np.full(len(selected), step, np.int64))
+                    collected += len(selected)
+            actions = policy(obs)
+            obs, _, dones, _ = env.step(actions)
+            finished = dones.detach().cpu().numpy()
+            if finished.shape != (num_envs,) or not np.isin(finished, [0, 1]).all():
+                raise ValueError("Expected one boolean/0/1 done flag per environment")
+            finished = finished.astype(bool)
+            policy.reset(dones)
+            age[age >= 0] += 1
+            episode[finished] += 1
+            age[finished] = 0
+        step += 1
+        if step % 500 == 0:
+            print(f"[INFO] Candidate progress: {collected}/{candidate_count}", flush=True)
+    return np.concatenate(rows), {name: np.concatenate(parts) for name, parts in records.items()}, {
+        "policy_steps_executed": step, "sample_offsets": offsets.tolist(),
+        "episode_tracking": "episode_id 从 0 开始；0 为初始片段，episode_step=-1 表示起点未知；done 后下一观测进入新回合，步数为 0。",
+    }
+
+
+def coverage_report(obs: np.ndarray, provenance: dict) -> dict:
+    """分段计数同时报告观测行数和不同 (env_id, episode_id) 数；不判定合格。"""
+    if obs.dtype != np.float32 or obs.ndim != 2 or obs.shape[1] != EXPECTED_OBS_DIM or not len(obs) or not np.isfinite(obs).all():
+        raise ValueError("Expected nonempty finite float32[N,4] observations")
+    for name in ("env_id", "episode_id", "episode_step", "policy_step"):
+        value = provenance[name]
+        if value.shape != (len(obs),) or not np.issubdtype(value.dtype, np.integer):
+            raise ValueError(f"Invalid provenance column: {name}")
+    identities = np.column_stack((provenance["env_id"], provenance["episode_id"]))
+
+    def count(mask):
+        return {"samples": int(mask.sum()), "episodes": int(len(np.unique(identities[mask], axis=0)))}
+
+    # 分段用于可读统计，边界不是采样门限或量化合格门限。
+    definitions = (
+        (OBSERVATION_NAMES[0], obs[:, 0], [-.15, -.1, 0, .1, .15]),
+        ("pole_angle_deg", np.rad2deg(obs[:, 1].astype(np.float64)), [-60, -45, -30, -15, 0, 15, 30, 45, 60]),
+        (OBSERVATION_NAMES[2], obs[:, 2], [-1, -.5, 0, .5, 1]),
+        (OBSERVATION_NAMES[3], obs[:, 3], [-6, -3, -1, 0, 1, 3, 6]),
+    )
+    features = {}
+    for name, values, inner in definitions:
+        bounds = [-np.inf, *inner, np.inf]
+        bins = []
+        for low, high in zip(bounds[:-1], bounds[1:]):
+            bins.append({"lower": low if np.isfinite(low) else None,
+                         "upper": high if np.isfinite(high) else None,
+                         **count((values >= low) & (values < high))})
+        features[name] = {"min": float(values.min()), "max": float(values.max()), "bins": bins,
+                          "directions": {"negative": count(values < 0), "zero": count(values == 0),
+                                         "positive": count(values > 0)}}
+    return {"sample_count": len(obs), "unique_observations": len(np.unique(obs, axis=0)),
+            "sampled_episode_count": len(np.unique(identities, axis=0)),
+            "initial_fragment_count": count(provenance["episode_id"] == 0)["episodes"],
+            "bin_semantics": "左闭右开；null 表示无穷端点；回合计数按环境和回合编号去重，包含初始片段。",
+            "features": features}
 
 
 def _robust_selection_space(
@@ -554,227 +683,252 @@ def _print_stats(title: str, obs: np.ndarray) -> None:
         )
 
 
-@hydra_task_config(args_cli.task, args_cli.agent)
+def config_value(value, location="config"):
+    """配置快照采用 JSON；特殊值带类型标记，不把未知对象静默丢弃。"""
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, (float, np.floating)):
+        return float(value) if np.isfinite(value) else {"nonfinite_float": str(float(value))}
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, dict):
+        if any(not isinstance(key, str) for key in value):
+            raise TypeError(f"Non-string configuration key at {location}")
+        return {key: config_value(item, f"{location}.{key}") for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [config_value(item, f"{location}[{i}]") for i, item in enumerate(value)]
+    if isinstance(value, (Path, torch.device)):
+        return str(value)
+    if isinstance(value, slice):
+        return {"slice": config_value([value.start, value.stop, value.step], location)}
+    if isinstance(value, np.ndarray):
+        return config_value(value.tolist(), location)
+    if isinstance(value, torch.Tensor):
+        return config_value(value.detach().cpu().tolist(), location)
+    if callable(value) and hasattr(value, "__qualname__") and hasattr(value, "__module__"):
+        return {"callable": f"{value.__module__}:{value.__qualname__}"}
+    raise TypeError(f"Unsupported configuration value at {location}: {type(value).__name__}")
+
+
+def export_collection(output_dir, candidate_obs, provenance, context, calib_sizes, fps_clip, selection_seed):
+    """先保存完整采集材料，再执行可选初筛；metadata.json 是成功完成标记。"""
+    coverage = coverage_report(candidate_obs, provenance)
+    write_json(output_dir / "collection_context.json", context)
+    np.save(output_dir / "candidates.npy", candidate_obs)
+    np.savez_compressed(output_dir / "sample_provenance.npz", **provenance)
+    write_json(output_dir / "coverage.json", coverage)
+    lines = ["# 采集覆盖报告", "", f"观测：{len(candidate_obs)} 条；不同观测：{coverage['unique_observations']} 条。",
+             f"采样涉及 {coverage['sampled_episode_count']} 个回合/片段，其中 {coverage['initial_fragment_count']} 个为起点未知的初始片段。",
+             "", "以下分段用于发现数据缺口，不是模型精度合格门限。区间左闭右开。", ""]
+    for name, feature in coverage["features"].items():
+        lines += [f"## {name}", "", "| 区间 | 样本数 | 回合/片段数 |", "| --- | ---: | ---: |"]
+        for band in feature["bins"]:
+            low = "−∞" if band["lower"] is None else str(band["lower"])
+            high = "+∞" if band["upper"] is None else str(band["upper"])
+            lines.append(f"| [{low}, {high}) | {band['samples']} | {band['episodes']} |")
+        lines.append("")
+    lines += ["最终标定应使用完整候选池进行三层激活覆盖筛选。初筛集合不保证覆盖激活极值。", ""]
+    (output_dir / "coverage.md").write_text("\n".join(lines), encoding="utf-8")
+    common = {**context, "collection_status": "complete", "candidate_count": len(candidate_obs),
+              "observation_order": list(OBSERVATION_NAMES), "candidate_statistics": _describe(candidate_obs),
+              "files": {name: file_identity(output_dir / name) for name in
+                        ("candidates.npy", "sample_provenance.npz", "coverage.json", "coverage.md")}}
+    if not calib_sizes:
+        write_json(output_dir / "metadata.json", {**common, "preselection_status": "not_requested",
+                   "selection_version": None, "calibration_sets": {}, "selection": None})
+        return
+    robust_z, selection_features, robust_radius, robust_center, robust_scale = _robust_selection_space(
+        candidate_obs, fps_clip
+    )
+    del robust_z  # radius/features are sufficient from here onward.
+
+    radius_p95 = float(np.percentile(robust_radius, TAIL_START_PERCENTILE))
+    radius_p995 = float(np.percentile(robust_radius, TAIL_END_PERCENTILE))
+    core_mask = robust_radius <= radius_p95
+    tail_mask = (robust_radius > radius_p95) & (robust_radius <= radius_p995)
+    extreme_mask = robust_radius > radius_p995
+
+    print(
+        "[INFO] Robust-radius pools: "
+        f"core={int(core_mask.sum())}, tail={int(tail_mask.sum())}, extreme={int(extreme_mask.sum())}, "
+        f"P95={radius_p95:.6g}, P99.5={radius_p995:.6g}"
+    )
+
+    max_size = calib_sizes[-1]
+    selection_indices, selection_roles = _hybrid_v2_order(
+        selection_features,
+        core_mask,
+        tail_mask,
+        max_size,
+        selection_seed,
+    )
+
+    # Selection invariants: core roles never come from tail/extreme; tail role stays in P95..P99.5.
+    representative_indices = selection_indices[selection_roles == ROLE_REPRESENTATIVE]
+    core_coverage_indices = selection_indices[selection_roles == ROLE_CORE_COVERAGE]
+    controlled_tail_indices = selection_indices[selection_roles == ROLE_CONTROLLED_TAIL]
+    if not np.all(core_mask[representative_indices]):
+        raise RuntimeError("Internal error: representative role selected a non-core sample")
+    if not np.all(core_mask[core_coverage_indices]):
+        raise RuntimeError("Internal error: core-coverage role selected a non-core sample")
+    if not np.all(tail_mask[controlled_tail_indices]):
+        raise RuntimeError("Internal error: controlled-tail role selected a sample outside P95..P99.5")
+    if np.any(extreme_mask[selection_indices]):
+        raise RuntimeError("Internal error: Hybrid-v2 actively selected an extreme >P99.5 sample")
+
+    np.save(output_dir / "robust_radius.npy", robust_radius.astype(np.float32, copy=False))
+    np.save(output_dir / f"selection_indices_{max_size}.npy", selection_indices)
+    np.save(output_dir / f"selection_roles_{max_size}.npy", selection_roles.astype(np.uint8, copy=False))
+
+    exported: dict[str, str] = {}
+    calibration_statistics: dict[str, dict[str, dict[str, float]]] = {}
+    role_counts_by_size: dict[str, dict[str, int]] = {}
+    for size in calib_sizes:
+        prefix_indices = selection_indices[:size]
+        selected_obs = candidate_obs[prefix_indices].astype(np.float32, copy=False)
+        filename = f"calibration_{size}.npy"
+        np.save(output_dir / filename, selected_obs)
+        exported[str(size)] = filename
+        calibration_statistics[str(size)] = _describe(selected_obs)
+        role_counts_by_size[str(size)] = _role_counts(selection_roles, size)
+        _print_stats(f"calibration {size}", selected_obs)
+        print(f"[INFO] Role counts {size}: {role_counts_by_size[str(size)]}")
+
+    metadata_payload = {
+        **common,
+        "preselection_status": "complete",
+        "selection_version": SELECTION_VERSION,
+        "observation_order": list(OBSERVATION_NAMES),
+        "onnx_expected_input": {"name": "obs", "shape": [1, EXPECTED_OBS_DIM], "dtype": "float32"},
+        "fps_clip": float(fps_clip),
+        "robust_center": robust_center.tolist(),
+        "robust_scale": robust_scale.tolist(),
+        "radius_p95": radius_p95,
+        "radius_p995": radius_p995,
+        "core_pool_count": int(core_mask.sum()),
+        "tail_pool_count": int(tail_mask.sum()),
+        "extreme_pool_count": int(extreme_mask.sum()),
+        "selection": {
+            "representative_ratio": 0.75,
+            "core_coverage_ratio": 0.1875,
+            "controlled_tail_ratio": 0.0625,
+            "tail_start_percentile": TAIL_START_PERCENTILE,
+            "tail_end_percentile": TAIL_END_PERCENTILE,
+            "selection_seed": int(selection_seed),
+            "nested_prefixes": True,
+        },
+        "selection_role_encoding": ROLE_NAMES,
+        "role_counts": role_counts_by_size,
+        "calibration_sets": exported,
+        "candidate_statistics": _describe(candidate_obs),
+        "calibration_statistics": calibration_statistics,
+    }
+    metadata_payload["files"].update({path.name: file_identity(path) for path in output_dir.glob("*.npy")})
+    write_json(output_dir / "metadata.json", metadata_payload)
+
+
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
-    """Roll out the policy, collect raw policy observations, and export Hybrid-v2 sets."""
-
+    """在主机采集真实策略输入，并保存可供后续筛选的完整数据。"""
     calib_sizes = _validate_args()
-
     if version.parse(installed_version) < version.parse("4.0.0"):
-        raise RuntimeError(
-            f"This collector targets the project's RSL-RL >= 4 API; installed version is {installed_version}."
-        )
-
+        raise RuntimeError(f"This collector requires RSL-RL >= 4; installed: {installed_version}")
+    requested_seed = args_cli.seed
     with launch_simulation(env_cfg, args_cli):
         task_name = args_cli.task.split(":")[-1]
         train_task_name = task_name.replace("-Play", "")
-
         agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
         env_cfg.scene.num_envs = args_cli.num_envs
         agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, installed_version)
-
         env_cfg.seed = agent_cfg.seed
         env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
-
-        # Anchor the default training log tree to the original shell cwd as well.
-        log_root_path = (SHELL_CWD / "logs" / "rsl_rl" / agent_cfg.experiment_name).resolve()
-        print(f"[INFO] Loading experiment from directory: {log_root_path}")
-
+        log_root_path = SHELL_CWD / "logs" / "rsl_rl" / agent_cfg.experiment_name
         resume_file = _resolve_resume_checkpoint(train_task_name, log_root_path, agent_cfg)
-        if not resume_file.is_file():
-            raise FileNotFoundError(f"Checkpoint must resolve to a file before runner.load(): {resume_file}")
-
-        checkpoint_dir = resume_file.parent
         output_dir = _resolve_output_dir(resume_file)
-
-        env_cfg.log_dir = str(checkpoint_dir)
-        env = gym.make(args_cli.task, cfg=env_cfg)
-
-        if isinstance(env.unwrapped.cfg, DirectMARLEnvCfg):
-            from isaaclab.envs import multi_agent_to_single_agent
-
-            env = multi_agent_to_single_agent(env)
-
-        env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
-
-        print(f"[INFO] Loading checkpoint FILE: {resume_file}")
-        if agent_cfg.class_name == "OnPolicyRunner":
-            runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-        elif agent_cfg.class_name == "DistillationRunner":
-            runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-        else:
-            raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
-
-        if args_cli.deterministic:
-            configure_seed(env_cfg.seed, True)
-        runner.load(str(resume_file))
-        policy = runner.get_inference_policy(device=env.unwrapped.device)
-
-        obs = env.get_observations()
-        policy_obs = obs["policy"]
-        if policy_obs.ndim != 2 or policy_obs.shape[1] != EXPECTED_OBS_DIM:
-            raise RuntimeError(
-                "Unexpected policy observation shape: "
-                f"{tuple(policy_obs.shape)}; expected [num_envs, {EXPECTED_OBS_DIM}] for "
-                f"{OBSERVATION_NAMES}."
-            )
-
-        num_envs = int(policy_obs.shape[0])
-        device = policy_obs.device
-        sample_offsets = torch.randint(0, args_cli.sample_stride, (num_envs,), device=device)
-
-        print(
-            "[INFO] Collecting candidates: "
-            f"num_envs={num_envs}, candidate_count={args_cli.candidate_count}, "
-            f"warmup_steps={args_cli.warmup_steps}, sample_stride={args_cli.sample_stride}"
-        )
-        print(f"[INFO] Observation order: {OBSERVATION_NAMES}")
-
-        candidates: list[np.ndarray] = []
-        collected = 0
-        step = 0
-
+        print(f"[INFO] 本次采集目录: {output_dir}", flush=True)
+        env_cfg.log_dir = str(resume_file.parent)
+        stage = "configuration"
+        env = None
         try:
-            while collected < args_cli.candidate_count:
-                with torch.inference_mode():
-                    policy_obs = obs["policy"]
-
-                    if step >= args_cli.warmup_steps:
-                        sample_mask = sample_offsets == (step % args_cli.sample_stride)
-                        if torch.any(sample_mask):
-                            batch = policy_obs[sample_mask].detach().cpu().numpy().astype(np.float32, copy=False)
-                            remaining = args_cli.candidate_count - collected
-                            if len(batch) > remaining:
-                                batch = batch[:remaining]
-                            candidates.append(batch.copy())
-                            collected += len(batch)
-
-                    actions = policy(obs)
-                    obs, _, dones, _ = env.step(actions)
-                    policy.reset(dones)
-
-                step += 1
-                if collected and (collected % 512 < num_envs):
-                    print(f"[INFO] Candidate progress: {collected}/{args_cli.candidate_count}", end="\r")
-        finally:
-            env.close()
-
-        print()
-        candidate_obs = np.concatenate(candidates, axis=0).astype(np.float32, copy=False)
-        if candidate_obs.shape != (args_cli.candidate_count, EXPECTED_OBS_DIM):
-            raise RuntimeError(f"Internal error: collected candidate shape is {candidate_obs.shape}")
-        if not np.isfinite(candidate_obs).all():
-            bad = np.argwhere(~np.isfinite(candidate_obs))[:10]
-            raise RuntimeError(f"Candidate observations contain NaN/Inf at indices {bad.tolist()}")
-
-        np.save(output_dir / "candidates.npy", candidate_obs)
-        _print_stats("candidate observations", candidate_obs)
-
-        robust_z, selection_features, robust_radius, robust_center, robust_scale = _robust_selection_space(
-            candidate_obs, args_cli.fps_clip
-        )
-        del robust_z  # radius/features are sufficient from here onward.
-
-        radius_p95 = float(np.percentile(robust_radius, TAIL_START_PERCENTILE))
-        radius_p995 = float(np.percentile(robust_radius, TAIL_END_PERCENTILE))
-        core_mask = robust_radius <= radius_p95
-        tail_mask = (robust_radius > radius_p95) & (robust_radius <= radius_p995)
-        extreme_mask = robust_radius > radius_p995
-
-        print(
-            "[INFO] Robust-radius pools: "
-            f"core={int(core_mask.sum())}, tail={int(tail_mask.sum())}, extreme={int(extreme_mask.sum())}, "
-            f"P95={radius_p95:.6g}, P99.5={radius_p995:.6g}"
-        )
-
-        max_size = calib_sizes[-1]
-        selection_indices, selection_roles = _hybrid_v2_order(
-            selection_features,
-            core_mask,
-            tail_mask,
-            max_size,
-            args_cli.selection_seed,
-        )
-
-        # Selection invariants: core roles never come from tail/extreme; tail role stays in P95..P99.5.
-        representative_indices = selection_indices[selection_roles == ROLE_REPRESENTATIVE]
-        core_coverage_indices = selection_indices[selection_roles == ROLE_CORE_COVERAGE]
-        controlled_tail_indices = selection_indices[selection_roles == ROLE_CONTROLLED_TAIL]
-        if not np.all(core_mask[representative_indices]):
-            raise RuntimeError("Internal error: representative role selected a non-core sample")
-        if not np.all(core_mask[core_coverage_indices]):
-            raise RuntimeError("Internal error: core-coverage role selected a non-core sample")
-        if not np.all(tail_mask[controlled_tail_indices]):
-            raise RuntimeError("Internal error: controlled-tail role selected a sample outside P95..P99.5")
-        if np.any(extreme_mask[selection_indices]):
-            raise RuntimeError("Internal error: Hybrid-v2 actively selected an extreme >P99.5 sample")
-
-        np.save(output_dir / "robust_radius.npy", robust_radius.astype(np.float32, copy=False))
-        np.save(output_dir / f"selection_indices_{max_size}.npy", selection_indices)
-        np.save(output_dir / f"selection_roles_{max_size}.npy", selection_roles.astype(np.uint8, copy=False))
-
-        exported: dict[str, str] = {}
-        calibration_statistics: dict[str, dict[str, dict[str, float]]] = {}
-        role_counts_by_size: dict[str, dict[str, int]] = {}
-        for size in calib_sizes:
-            prefix_indices = selection_indices[:size]
-            selected_obs = candidate_obs[prefix_indices].astype(np.float32, copy=False)
-            filename = f"calibration_{size}.npy"
-            np.save(output_dir / filename, selected_obs)
-            exported[str(size)] = filename
-            calibration_statistics[str(size)] = _describe(selected_obs)
-            role_counts_by_size[str(size)] = _role_counts(selection_roles, size)
-            _print_stats(f"calibration {size}", selected_obs)
-            print(f"[INFO] Role counts {size}: {role_counts_by_size[str(size)]}")
-
-        metadata_payload = {
-            "selection_version": SELECTION_VERSION,
-            "task": args_cli.task,
-            "checkpoint": str(resume_file),
-            "rsl_rl_version": installed_version,
-            "observation_order": list(OBSERVATION_NAMES),
-            "onnx_expected_input": {"name": "obs", "shape": [1, EXPECTED_OBS_DIM], "dtype": "float32"},
-            "num_envs": num_envs,
-            "candidate_count": int(args_cli.candidate_count),
-            "warmup_steps": int(args_cli.warmup_steps),
-            "sample_stride": int(args_cli.sample_stride),
-            "sampling": "random per-environment phase + fixed stride",
-            "fps_clip": float(args_cli.fps_clip),
-            "robust_center": robust_center.tolist(),
-            "robust_scale": robust_scale.tolist(),
-            "radius_p95": radius_p95,
-            "radius_p995": radius_p995,
-            "core_pool_count": int(core_mask.sum()),
-            "tail_pool_count": int(tail_mask.sum()),
-            "extreme_pool_count": int(extreme_mask.sum()),
-            "selection": {
-                "representative_ratio": 0.75,
-                "core_coverage_ratio": 0.1875,
-                "controlled_tail_ratio": 0.0625,
-                "tail_start_percentile": TAIL_START_PERCENTILE,
-                "tail_end_percentile": TAIL_END_PERCENTILE,
+            model_source = file_identity(resume_file)
+            context = {
+                "collection_version": 1, "collection_id": output_dir.name,
+                "started_at_utc": datetime.now(timezone.utc).isoformat(),
+                "task": args_cli.task, "checkpoint": model_source["path"], "model": model_source,
+                "script": file_identity(SCRIPT_PATH), "shell_cwd": str(SHELL_CWD),
+                "arguments": ORIGINAL_ARGUMENTS, "checkpoint_argument": EARLY_CHECKPOINT_ARG,
+                "rsl_rl_version": installed_version,
+                "seed": {"requested": requested_seed, "agent": agent_cfg.seed},
+                "deterministic": bool(args_cli.deterministic),
                 "selection_seed": int(args_cli.selection_seed),
-                "nested_prefixes": True,
-            },
-            "selection_role_encoding": ROLE_NAMES,
-            "role_counts": role_counts_by_size,
-            "calibration_sets": exported,
-            "candidate_statistics": _describe(candidate_obs),
-            "calibration_statistics": calibration_statistics,
-        }
-        with open(output_dir / "metadata.json", "w", encoding="utf-8") as f:
-            json.dump(metadata_payload, f, indent=2, ensure_ascii=False)
-
-        print(f"\n[INFO] Calibration data written to: {output_dir.resolve()}")
-        print("[INFO] Saved files:")
-        print("       candidates.npy")
-        print("       robust_radius.npy")
-        print(f"       selection_indices_{max_size}.npy")
-        print(f"       selection_roles_{max_size}.npy")
-        for size in calib_sizes:
-            print(f"       calibration_{size}.npy")
-        print("       metadata.json")
+                "num_envs": int(args_cli.num_envs), "candidate_count": int(args_cli.candidate_count),
+                "warmup_steps": int(args_cli.warmup_steps), "sample_stride": int(args_cli.sample_stride),
+                "sampling": "random per-environment phase + fixed stride",
+                "preselection_requested": bool(calib_sizes), "requested_calibration_sizes": calib_sizes,
+            }
+            write_json(output_dir / "collection_context.json", context)
+            write_json(output_dir / "env_config.json", config_value(env_cfg.to_dict()))
+            write_json(output_dir / "agent_config.json", config_value(agent_cfg.to_dict()))
+            stage = "environment"
+            env = gym.make(args_cli.task, cfg=env_cfg)
+            effective_seed = env.unwrapped.cfg.seed
+            context["seed"]["environment"] = config_value(effective_seed)
+            context["seed"]["environment_status"] = "known" if isinstance(effective_seed, (int, np.integer)) and effective_seed >= 0 else "unknown"
+            if isinstance(env.unwrapped.cfg, DirectMARLEnvCfg):
+                from isaaclab.envs import multi_agent_to_single_agent
+                env = multi_agent_to_single_agent(env)
+            env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+            write_json(output_dir / "env_config.json", config_value(env.unwrapped.cfg.to_dict()))
+            context["configuration_files"] = {name: file_identity(output_dir / name)
+                                              for name in ("env_config.json", "agent_config.json")}
+            write_json(output_dir / "collection_context.json", context)
+            stage = "model_load"
+            if agent_cfg.class_name == "OnPolicyRunner":
+                runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+            elif agent_cfg.class_name == "DistillationRunner":
+                runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+            else:
+                raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
+            if args_cli.deterministic:
+                configure_seed(env_cfg.seed, True)
+            print(f"[INFO] 实际模型文件: {model_source['path']}", flush=True)
+            print(f"[INFO] 模型 SHA-256: {model_source['sha256']}", flush=True)
+            print(f"[INFO] 环境种子: {effective_seed}; 筛选种子: {args_cli.selection_seed}", flush=True)
+            runner.load(str(resume_file))
+            policy = runner.get_inference_policy(device=env.unwrapped.device)
+            offsets = torch.randint(0, args_cli.sample_stride, (args_cli.num_envs,),
+                                    device=env.unwrapped.device).cpu().numpy()
+            stage = "collection"
+            candidate_obs, provenance, rollout = collect_candidates(
+                env, policy, args_cli.candidate_count, args_cli.sample_stride, args_cli.warmup_steps, offsets)
+            context["rollout"] = rollout
+            context["finished_at_utc"] = datetime.now(timezone.utc).isoformat()
+            stage = "environment_close"
+            collected_env, env = env, None
+            collected_env.close()
+            stage = "source_verification"
+            if file_identity(resume_file) != model_source:
+                raise RuntimeError("Checkpoint changed during collection")
+            stage = "export"
+            export_collection(output_dir, candidate_obs, provenance, context, calib_sizes,
+                              args_cli.fps_clip, args_cli.selection_seed)
+        except Exception as error:
+            failure = {"stage": stage, "error_type": type(error).__name__,
+                       "message": str(error), "collection_status": "failed"}
+            if env is not None:
+                try:
+                    env.close()
+                except Exception as cleanup_error:
+                    failure["cleanup_error"] = {"error_type": type(cleanup_error).__name__,
+                                                "message": str(cleanup_error)}
+            write_json(output_dir / "failure.json", failure)
+            raise
+        print(f"[INFO] 采集完成: {output_dir}", flush=True)
+        print(f"[INFO] 请查看 {output_dir / 'coverage.md'}")
+        if calib_sizes:
+            print("[INFO] calibration_*.npy 是初筛结果；请用完整候选池继续进行三层激活覆盖筛选。")
+        else:
+            print("[INFO] 仅候选池模式：已保存完整观测、逐行来源和覆盖报告。")
 
 
 if __name__ == "__main__":
-    main()
+    hydra_task_config(args_cli.task, args_cli.agent)(main)()
