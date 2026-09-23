@@ -7,7 +7,8 @@ from isaaclab.utils.configclass import configclass
 
 from isaaclab_rl.rsl_rl import RslRlMLPModelCfg, RslRlOnPolicyRunnerCfg, RslRlPpoAlgorithmCfg, RslRlSymmetryCfg
 
-from .. mdp import symmetry
+from ..mdp import symmetry
+
 
 @configclass
 class CartpolePPORunnerCfg(RslRlOnPolicyRunnerCfg):
@@ -41,6 +42,7 @@ class CartpolePPORunnerCfg(RslRlOnPolicyRunnerCfg):
         max_grad_norm=1.0,
     )
 
+
 @configclass
 class CartpolePPORunnerWithSymmetryCfg(CartpolePPORunnerCfg):
     """Configuration for the PPO agent with symmetry augmentation."""
@@ -64,6 +66,7 @@ class CartpolePPORunnerWithSymmetryCfg(CartpolePPORunnerCfg):
         ),
     )
 
+
 @configclass
 class RealCartpolePPORunnerCfg(CartpolePPORunnerCfg):
     """PPO configuration for the sim2real (domain-randomized) cartpole task."""
@@ -72,3 +75,13 @@ class RealCartpolePPORunnerCfg(CartpolePPORunnerCfg):
     max_iterations = 1000
     save_interval = 50
     experiment_name = "cartpole_real"
+
+
+@configclass
+class RealCartpoleV2PPORunnerCfg(RealCartpolePPORunnerCfg):
+    """PPO configuration for the v2 rig (stepper, velocity-command actions, 200 Hz)."""
+
+    # 200 Hz steps are 3.3x shorter than v1's 60 Hz: 16 steps cover only 80 ms of dynamics,
+    # so collect longer rollout chunks per update
+    num_steps_per_env = 48
+    experiment_name = "cartpole_real_v2"

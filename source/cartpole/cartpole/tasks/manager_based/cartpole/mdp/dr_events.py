@@ -158,6 +158,98 @@ def randomize_motor_lag(
     term.tau[env_ids] = torch.rand(len(env_ids), device=env.device) * (hi - lo) + lo
 
 
+def randomize_pole_axis_properties(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    asset_cfg: SceneEntityCfg,
+    mass_range: tuple[float, float],
+    length: float,
+    com_offset_range: tuple[float, float],
+    inertia_scale_range: tuple[float, float],
+) -> None:
+    """Set the pole's mass, COM and inertia for a uniform rod pivoted off-center (v2 rig).
+
+    The v2 rig's pole is a uniform 0.30 m rod pivoted 20 mm from its short end, so the COM sits
+    0.130 m from the pivot axis — not at length/2 like the v1 (end-pivoted) rod. Transverse
+    inertia about the COM stays ``m*L^2/12`` for a uniform rod regardless of the pivot position.
+    The COM offset and the inertia magnitude are randomized independently of the mass so each
+    uncertainty (assembly position, uniformity assumption) is sampled on its own axis.
+
+    Args:
+        env: The environment.
+        env_ids: Environment indices to randomize.
+        asset_cfg: The asset (articulation) whose pole body is modified.
+        mass_range: (min, max) pole mass [kg].
+        length: Total rod length [m] (fixed).
+        com_offset_range: (min, max) pivot-to-COM distance [m].
+        inertia_scale_range: (min, max) multiplier applied to the uniform-rod inertia.
+    """
+    asset = env.scene[asset_cfg.name]
+    pole_ids, pole_names = asset.find_bodies("pole")
+    if not pole_ids:
+        _logger.warning("randomize_pole_axis_properties: no bodies matched key 'pole'.")
+        return
+    num = len(env_ids)
+    masses = torch.rand(num, 1, device=env.device) * (mass_range[1] - mass_range[0]) + mass_range[0]
+    asset.set_masses_index(masses=masses, body_ids=pole_ids, env_ids=env_ids)
+    # COM at the sampled offset along the rod axis (pole body frame: rod along z)
+    com_lo, com_hi = com_offset_range
+    com_offsets = torch.rand(num, 1, device=env.device) * (com_hi - com_lo) + com_lo
+    com = torch.zeros(num, 1, 7, device=env.device)
+    com[:, :, 2] = com_offsets  # z offset from the pivot
+    com[:, :, 6] = 1.0  # identity quaternion (x, y, z, w)
+    asset.set_coms_index(coms=com, body_ids=pole_ids, env_ids=env_ids)
+    # inertia about COM: transverse m*L^2/12 (uniform rod), scaled by an independent factor
+    s_lo, s_hi = inertia_scale_range
+    scales = torch.rand(num, 1, device=env.device) * (s_hi - s_lo) + s_lo
+    i_trans = masses * (length**2) / 12.0 * scales
+    inertia = torch.zeros(num, 1, 9, device=env.device)
+    inertia[:, :, 0] = i_trans  # I_xx
+    inertia[:, :, 4] = i_trans  # I_yy
+    inertia[:, :, 8] = i_trans * 0.01  # I_zz (thin rod; small but PhysX requires > 0)
+    asset.set_inertias_index(inertias=inertia, body_ids=pole_ids, env_ids=env_ids)
+
+    if "_pole_v2_props" not in _logged_bodies:
+        _logged_bodies.add("_pole_v2_props")
+        _write_diag(f"v2 pole[{pole_names[0]}]: mass={masses[0, 0]:.4f}kg com_offset={com_offsets[0, 0]:.4f}m")
+        # read back the pole properties to confirm the override took effect (same as v1)
+        e = int(env_ids[0])
+        com_b = [round(float(x), 4) for x in asset.data.body_com_pose_b[e, pole_ids[0]]]
+        inertia_b = [round(float(x), 4) for x in asset.data.body_inertia[e, pole_ids[0]]]
+        mass = float(asset.data._body_mass.numpy()[e, pole_ids[0]])
+        _write_diag(f"v2 pole[{pole_names[0]}] AFTER set: mass={mass:.4f}kg com_body={com_b} inertia={inertia_b}")
+
+
+def randomize_velocity_tracking(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    action_name: str,
+    vel_max_range: tuple[float, float],
+    tau_range: tuple[float, float],
+    acc_max_range: tuple[float, float],
+) -> None:
+    """Randomize the tracking parameters of the velocity-tracking action term per environment.
+
+    Args:
+        env: The environment.
+        env_ids: Environment indices to randomize.
+        action_name: Name of the action term in the action manager.
+        vel_max_range: (min, max) authority scale [m/s]. Upper bound must not exceed the
+            firmware session clamp ``VEL_MAX`` (deploy/v2/protocol.md).
+        tau_range: (min, max) tracking time constant [s].
+        acc_max_range: (min, max) acceleration limit [m/s^2]. Upper bound must not exceed the
+            firmware session clamp ``ACC_MAX``.
+    """
+    term = env.action_manager.get_term(action_name)
+    num = len(env_ids)
+    lo, hi = vel_max_range
+    term.vel_max[env_ids] = torch.rand(num, device=env.device) * (hi - lo) + lo
+    lo, hi = tau_range
+    term.tau[env_ids] = torch.rand(num, device=env.device) * (hi - lo) + lo
+    lo, hi = acc_max_range
+    term.acc_max[env_ids] = torch.rand(num, device=env.device) * (hi - lo) + lo
+
+
 def randomize_motor_delay(
     env: ManagerBasedEnv,
     env_ids: torch.Tensor,
