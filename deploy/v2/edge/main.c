@@ -217,8 +217,10 @@ static int goto_center(double timeout_s)
     return -1;
 }
 
-/* ---- 控制环 ---- */
-static void control_loop(void)
+/* ---- 控制环 ----
+ * 返回 0：SIGINT/SIGTERM 正常退出；返回 -1：致命错误（推理句柄失效），
+ * 调用方走统一清理路径（VEL 0 -> 释放资源）。 */
+static int control_loop(void)
 {
     const double period = 1.0 / CFG_CONTROL_HZ;
     double next = now_s() + period;
@@ -268,7 +270,12 @@ static void control_loop(void)
             (float)((double)g_vx_mm_s * 1e-3),
             (float)((double)g_vth_mrad_s * 1e-3),
         };
-        float action = policy_forward(obs);
+        float action;
+        if (policy_forward(obs, &action) != 0) {
+            /* 库契约：句柄已失效，不得继续推理；停机走统一退出路径 */
+            fprintf(stderr, "[edge] policy inference failed, stopping\n");
+            return -1;
+        }
         if (action > 1.0f) {
             action = 1.0f;
         }
@@ -292,6 +299,7 @@ static void control_loop(void)
         sleep_to(next);
         next += period;
     }
+    return 0;
 }
 
 static void print_usage(const char *prog)
@@ -360,8 +368,7 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
-    control_loop();
-    rc = 0;
+    rc = control_loop() == 0 ? 0 : 1;
 
 cleanup:
     if (g_uart.fd >= 0) {
