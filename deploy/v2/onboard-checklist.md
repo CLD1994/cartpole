@@ -33,7 +33,7 @@ idf.py -B build-selftest flash monitor
 | A5 | telemetry | `SELF-TEST DONE: 2/2 PASS` | |
 | A6 | cartproto | `SELF-TEST DONE: 3/3 PASS`；UART1 冒烟三行 `MODE DISABLED NONE` / `OK VEL_MAX 1000` / `ERR VEL_MAX`（460800，CH343P 口可见）；启动无 `GPIO 41 is not usable` 警告 | |
 | A7 | cartfsm 核心 | `SELF-TEST DONE: 3/3 PASS` | |
-| A8 | STATE 流 | 460800 抓 10 s：`state --secs 10` → 行率 199–201 Hz、UNKNOWN=0、静止 x_um 漂移 < 1000 µm | 行率: 漂移: |
+| A8 | STATE 流 | 460800 抓 10 s：`state --secs 10` → 行率 199–201 Hz、UNKNOWN=0、静止 x_um 漂移 < 1000 µm | 行率: 漂移: | 200.7 Hz / UNKNOWN 0 / 漂移 20 µm（修复 host 工具窗口丢行后实测，eb48ec3） |
 | A9 | 手推方向 | 在 as5600 自测末尾的 **MANUAL CHECK（= A9）**段执行：转电机轴（= 经皮带移动小车）3 圈，日志给 `delta` 符号——记下转动方向与符号的关系，留 C4 交叉核对 | x_um 随移动单调变化；符号记入下表 | 符号: |
 | A10 | 手转摆杆一圈 | 在 mt6835 自测末尾的 **MANUAL CHECK（= A10）**段执行：提示后 15 s 内将摆杆转一整圈后停在出发点，自动判定 | `A10 判定：圈数守恒 OK（检测到 k 圈，残余 ±x°）`，k 与实际转的圈数一致 | k / 残余: |
 
@@ -47,9 +47,9 @@ idf.py -B build-flowtest flash monitor
 
 | # | 检查项 | 预期 | 记录 |
 |---|---|---|---|
-| B1 | cartfsm 流程自测 | `SELF-TEST DONE: 5/5 PASS`（注入堵转→READY+原点 −265000 µm；超时→FAULT；AS5600 失联→FAULT（日志含耗时 ms，设计 ≤15）；丢步注入→FAULT；RESET 后重 HOME） | 失联耗时: |
-| B2 | FAULT 次序 | 日志/MODE 行序：目标置 0 → EN 关 → `MODE FAULT <reason>` | |
-| B3 | 行中 `\r` 注入 | 串口发送 `VE\rL 200\n` 与 130 字节乱码+`\n` | 均无任何命令执行、无输出（重同步生效） |
+| B1 | cartfsm 流程自测 | `SELF-TEST DONE: 5/5 PASS`（注入堵转→READY+原点 −265000 µm；超时→FAULT；AS5600 失联→FAULT（日志含耗时 ms，设计 ≤15）；丢步注入→FAULT；RESET 后重 HOME） | 失联耗时: | 5/5；失联→FAULT+EN 关 10 ms |
+| B2 | FAULT 次序 | 日志/MODE 行序：目标置 0 → EN 关 → `MODE FAULT <reason>` | | MODE 序列完整对应 5 用例；HOME_TIMEOUT/AS5600/STEP_LOSS 原因码全部正确（2026-09-25） |
+| B3 | 行中 `\r` 注入 | 串口发送 `VE\rL 200\n` 与 130 字节乱码+`\n` | 均无任何命令执行、无输出（重同步生效） | `VE\rL 200\n`：无任何回应行 ✓；乱码组待补 |
 
 ## 阶段 C：正式固件 + 台位标定（机械在位、12V）
 
@@ -88,7 +88,8 @@ C1–C6 结果写入 `deploy/v2/edge/config.h`（会话推送值）：
 2. StallGuard 低速可靠性（50 mm/s ≈ 1.25 rps）→ C1/C3 判定；
    不触发则提 HOME_VEL 或改 C−E 判据（protocol.md 未决事项路径）。
 3. SGTHRS/STEP_LOSS_UM 初值 → C2/C3 实测回填。
-4. 460800 联调 → A8/C10；不过则 230400（两端同步改）。
+4. 460800 联调 → A8 已过（200.7 Hz / UNKNOWN 0 / 漂移 20 µm，
+   10 s 窗口）；余 C10 600 s 长跑复核，不过则 230400（两端同步改）。
 5. 步进 ISR 吞吐上限 vs VEL_MAX（默认 1000 mm/s ≈ 40 kHz 步频）：
    第四轮均值已回填——ISR avg ≈ 11k cycles ≈ 46 µs（三段均摊），
    **可持续 ≈ 22 kHz ≈ 550 mm/s（40 steps/mm）**；max 19.5k（81 µs，
