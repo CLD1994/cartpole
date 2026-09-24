@@ -26,16 +26,16 @@ idf.py -B build-selftest flash monitor
 
 | # | 检查项 | 预期 | 记录 |
 |---|---|---|---|
-| A1 | 启动横幅 | `cartpole firmware up`（app_main），无 panic；EN 保持高（电机不使能） | |
-| A2 | settings | `SELF-TEST DONE: 22/22 PASS`（默认微步 8 等向量） | |
-| A3 | step_engine | `SELF-TEST DONE: 7/7 PASS`（含看门狗恢复、换向长拍、急停；ISR 最大周期数 < 5000） | ISR cycles: |
+| A1 | 启动横幅 | 无 panic；`bsp: BSP initialization complete`（含 I2C 扫描见 0x36、SPI 初始化）；EN 保持高（电机不使能） | |
+| A2 | settings | `SELF-TEST DONE: 21/21 PASS`（默认微步 8 等向量） | |
+| A3 | step_engine | `SELF-TEST DONE: 7/7 PASS`（含首拍间隔、看门狗恢复、换向长拍、急停、X_INV 电平翻转）；ISR max/avg cycles 记录备查（第三轮实测 max ≈ 16.2k cycles ≈ 68 µs，见未决⑤） | ISR max/avg: |
 | A4 | mt6835 **首读关卡** | `MT6835 在线——首读 raw21=<非 0 且稳定>`；`SELF-TEST DONE: 3/3 PASS`（静止抖动 ≤ 2 count）。若 raw21 恒 0/乱码 → 核对 T4-brief.md 帧格式 | raw21: |
 | A5 | telemetry | `SELF-TEST DONE: 2/2 PASS` | |
-| A6 | cartproto | `SELF-TEST DONE: 3/3 PASS`；UART1 冒烟三行 `MODE DISABLED NONE` / `OK VEL_MAX 1000` / `ERR VEL_MAX`（460800，CH343P 口可见） | |
+| A6 | cartproto | `SELF-TEST DONE: 3/3 PASS`；UART1 冒烟三行 `MODE DISABLED NONE` / `OK VEL_MAX 1000` / `ERR VEL_MAX`（460800，CH343P 口可见）；启动无 `GPIO 41 is not usable` 警告 | |
 | A7 | cartfsm 核心 | `SELF-TEST DONE: 3/3 PASS` | |
 | A8 | STATE 流 | 460800 抓 10 s：`state --secs 10` → 行率 199–201 Hz、UNKNOWN=0、静止 x_um 漂移 < 1000 µm | 行率: 漂移: |
 | A9 | 手推方向 | 在 as5600 自测末尾的 **MANUAL CHECK（= A9）**段执行：转电机轴（= 经皮带移动小车）3 圈，日志给 `delta` 符号——记下转动方向与符号的关系，留 C4 交叉核对 | x_um 随移动单调变化；符号记入下表 | 符号: |
-| A10 | 手转摆杆一圈 | 在 mt6835 自测末尾的 **MANUAL CHECK（= A10）**段执行：提示后 15 s 内将摆杆转一整圈回到出发点，自动判定 | `A10 判定：圈数守恒 OK` | |
+| A10 | 手转摆杆一圈 | 在 mt6835 自测末尾的 **MANUAL CHECK（= A10）**段执行：提示后 15 s 内将摆杆转一整圈后停在出发点，自动判定 | `A10 判定：圈数守恒 OK（检测到 k 圈，残余 ±x°）`，k 与实际转的圈数一致 | k / 残余: |
 
 ## 阶段 B：flowtest 构建（开 EN；有 12V 时小车真实运动）
 
@@ -89,3 +89,9 @@ C1–C6 结果写入 `deploy/v2/edge/config.h`（会话推送值）：
    不触发则提 HOME_VEL 或改 C−E 判据（protocol.md 未决事项路径）。
 3. SGTHRS/STEP_LOSS_UM 初值 → C2/C3 实测回填。
 4. 460800 联调 → A8/C10；不过则 230400（两端同步改）。
+5. 步进 ISR 吞吐上限 vs VEL_MAX（默认 1000 mm/s ≈ 40 kHz 步频）：
+   第三轮分段最大值合计 ≈ 16.2k cycles ≈ 68 µs（排拍 > 递推 > 脉冲，
+   约各 1/3），只能支撑 ~15 kHz 步频；最大值含离群成分，**均值**
+   （第四轮日志 avg 字段）才是可持续上限的依据。回填均值后定论：
+   若上限低于控制需求速度 → ISR 优化（GPIO/定时器直写寄存器，
+   预估可到 ~20 µs ≈ 50 kHz）；若够用 → 在本条记录实测上限并关闭。
