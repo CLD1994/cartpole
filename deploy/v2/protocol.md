@@ -45,6 +45,7 @@ STATE <x_um> <theta_urad> <vx_mm_s> <vth_mrad_s>\n
 |---|---|---|
 | DISABLED | 收到 `HOME` | HOMING |
 | HOMING | 堵转触发 | READY（触发点记为 `x = −265000 µm`） |
+| HOMING | 收到 `RESET` | DISABLED（用户中止回零的逃生口，立即停机并关 EN） |
 | HOMING | AS5600 或 MT6835 读取失败 | FAULT |
 | HOMING | 回零超时（`HOME_TIMEOUT` 内未触发堵转） | FAULT |
 | READY | 丢步 / 堵转 / AS5600 或 MT6835 读取失败 | FAULT |
@@ -74,7 +75,7 @@ MODE <mode> <reason>\n
 ```
 VEL <v_mm_s>\n            目标速度 [mm/s]，钳位 ±VEL_MAX 后斜坡跟踪
 HOME\n                    启动回零
-RESET\n                   清除 FAULT
+RESET\n                   清除 FAULT；HOMING 中为中止回零
 QUERY\n                   查询当前模式，回答一行 MODE
 CONFIG <NAME> <value>\n   设置运行参数，回答 OK 或 ERR
 CONFIG?\n                 dump 全部参数（调试与日志记录用）
@@ -86,7 +87,7 @@ CONFIG?\n                 dump 全部参数（调试与日志记录用）
 |---|---|---|---|---|
 | `VEL` | 忽略 | 忽略 | 执行 | 忽略 |
 | `HOME` | → HOMING | 忽略 | 忽略 | 忽略 |
-| `RESET` | 忽略 | 忽略 | 忽略 | → DISABLED |
+| `RESET` | 忽略 | → DISABLED | 忽略 | → DISABLED |
 | `QUERY` | 回 `MODE` | 回 `MODE` | 回 `MODE` | 回 `MODE` |
 | `CONFIG` | 接受 | 拒绝（`ERR`） | 接受 | 拒绝（`ERR`） |
 | `CONFIG?` | 接受 | 接受 | 接受 | 接受 |
