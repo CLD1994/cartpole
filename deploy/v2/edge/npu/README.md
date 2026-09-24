@@ -31,6 +31,8 @@
 + `ot_sys` + `ot_base`。
 
 交叉工具链（`arm-v01c02-linux-musleabi-gcc`，GCC 10.3 musl 1.2.3，Cortex-A7
-softfp）与 SDK 头文件、musl ARM 库由 CV610 侧项目的交叉编译交接包提供；
-Windows 主机经 WSL Ubuntu 构建，完整命令见上级 `CMakeLists.txt` 顶部注释。
-板端沿用已验证的 SDK 启动环境解析上述动态库。
+softfp）与 SDK 头文件、musl ARM 库由 CV610 侧项目的交叉编译交接包提供。
+依赖的常驻位置是 **WSL 内部 `~/cv610`**（ext4；NTFS 会破坏符号链接与大小写
+敏感文件名，不能作为工具链的家）：`setup-wsl.sh` 负责一次性导入并按交接清单
+恢复完整性，`build.sh` 是日常交叉编译入口（含产物自检），两者都在 WSL
+Ubuntu 内执行、随本仓库版本化。板端沿用已验证的 SDK 启动环境解析上述动态库。
