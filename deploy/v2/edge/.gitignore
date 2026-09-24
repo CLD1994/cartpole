@@ -1,0 +1,4 @@
+# 主机单元测试产物（make test 在源码目录生成）
+proto_test
+policy_test
+console_test
