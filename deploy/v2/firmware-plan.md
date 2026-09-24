@@ -38,11 +38,12 @@
 
 ## 未决事项（执行中须停下确认，不得静默选择）
 
-1. **CONFIG 注册表扩项（须用户批准 protocol.md 修订）**：摆角零位/方向、电机方向反转、StallGuard 阈值、丢步阈值是台位标定量，按「参数权威在端侧」原则建议扩进 CONFIG 注册表：`POLE_ZERO_URAD`（−3141592..3141592，默认 0）、`POLE_INV`（0/1，默认 0）、`X_INV`（0/1，默认 0）、`SGTHRS`（0..255，默认 40）、`STEP_LOSS_MM`（0.5..20，默认 3.0）。任务 7 按此实现；用户否决则改为固件 NVS + Kconfig 门控的 bring-up 工具设置，协议不动。
-2. **MT6835 SPI 读帧格式**：角度寄存器地址、命令字节、角度位域须从 MT6835 数据手册抄录并写进测试向量（任务 4 步骤 1）。不得凭记忆编造帧格式。
-3. **StallGuard 低速可靠性**：HOME_VEL 50 mm/s ≈ 1.25 rps 可能低于 StallGuard 有效区。联调时若不触发，按 protocol.md 未决事项路径调整（提速/换 C−E 判据）。
-4. **丢步阈值默认 3 mm** 与 **SGTHRS 默认 40** 是待实机标定的初值。
-5. 460800 两端联调（protocol.md 未决事项沿用）。
+1. **MT6835 SPI 读帧格式**：角度寄存器地址、命令字节、角度位域须从 MT6835 数据手册抄录并写进测试向量（任务 4 步骤 1）。不得凭记忆编造帧格式。
+2. **StallGuard 低速可靠性**：HOME_VEL 50 mm/s ≈ 1.25 rps 可能低于 StallGuard 有效区。联调时若不触发，按 protocol.md 未决事项路径调整（提速/换 C−E 判据）。
+3. `SGTHRS` 默认 40 与 `STEP_LOSS_UM` 默认 3000 是待实机标定的初值。
+4. 460800 两端联调（protocol.md 未决事项沿用）。
+
+台位标定量（`POLE_ZERO_URAD`/`POLE_INV`/`X_INV`/`SGTHRS`/`STEP_LOSS_UM`）已批准扩入 protocol.md 参数注册表（2026-09-23 修订），不是未决事项；标定初值在实机验收时确定并写回端侧 `config.h`。
 
 ## 目标组件结构（预估，允许执行者微调归属，接口签名不得擅改）
 
@@ -278,10 +279,10 @@ esp_err_t cartfsm_start(void);   /* 1 kHz 监督任务（CPU1, prio 4），上�
 /* 模式与原因（与 protocol.md 枚举一一对应） */
 typedef enum { CM_DISABLED, CM_HOMING, CM_READY, CM_FAULT } cm_mode_t;
 typedef enum { CR_NONE, CR_STEP_LOSS, CR_STALL, CR_AS5600, CR_MT6835, CR_HOME_TIMEOUT } cm_reason_t;
-/* 参数注册表：protocol.md 七项 + 未决事项 1 的扩项（批准前只编入七项，扩项编译开关隔离） */
+/* 参数注册表：protocol.md §参数注册表 十二项全量 */
 typedef struct {
     long vel_max, acc_max, wdt_ms, wdt_dec, home_vel, home_timeout_ms, x_limit_um;
-    long pole_zero_urad, pole_inv, x_inv, sgthrs, step_loss_mm;  /* 扩项（待批准） */
+    long pole_zero_urad, pole_inv, x_inv, sgthrs, step_loss_um;  /* 台位标定项 */
 } fw_params_t;
 const fw_params_t *fw_params(void);   /* 快照，volatile 存储 */
 ```
@@ -304,7 +305,7 @@ const fw_params_t *fw_params(void);   /* 快照，volatile 存储 */
 
 软限位（契约）：监督任务每毫秒读 `x_um`，`|x| > X_LIMIT` 时把与越界同号的目标分量替换为 0（实现：钳 `vel_target` 的符号，向内不受限）。
 
-标定量作用点（扩项批准后）：`X_INV` 由 cartfsm 写 `step_engine_set_dir_invert()`——引擎位置计数含反转后即物理域，与 AS5600 的 E 同域，E−C 判据无需再换算；`POLE_ZERO_URAD`/`POLE_INV` 在 telemetry 组帧时应用于 `mt6835_theta_urad()` 的原始角（mt6835 组件保持纯传感器，不读参数）。速度换算统一走 cartfsm 内一个辅助函数 `mmps_to_q16(long v_mm_s)`（×40 steps/s 再 ×65536，u64 中间量），VEL 与回零共用。
+标定量作用点：`X_INV` 由 cartfsm 写 `step_engine_set_dir_invert()`——引擎位置计数含反转后即物理域，与 AS5600 的 E 同域，E−C 判据无需再换算；`POLE_ZERO_URAD`/`POLE_INV` 在 telemetry 组帧时应用于 `mt6835_theta_urad()` 的原始角（mt6835 组件保持纯传感器，不读参数）。速度换算统一走 cartfsm 内一个辅助函数 `mmps_to_q16(long v_mm_s)`（×40 steps/s 再 ×65536，u64 中间量），VEL 与回零共用。
 
 - [ ] **步骤 1：失败测试（纯逻辑）**。转换表逐行写成用例（含 `HOME` 在 READY/FAULT 被忽略、`RESET` 在非 FAULT 被忽略、`VEL` 在非 READY 被忽略）；CONFIG 矩阵 4 模式 × 2 命令；参数范围表（protocol.md §参数注册表 逐项边界值 ±1）；扩项各自范围。运行确认失败。
 - [ ] **步骤 2：实现**。`params.c`：默认值常量表 + `fw_params_set(name, value)`（范围与模式校验）；监督任务：读 as5600_is_ok/mt6835_is_ok、算 `\|E−C\|`（E=counts×1600/4096=counts×125/32 对齐到 steps 域，u64）、软限位钳位、堵转源（任务 8 接入，先留接口 `cartfsm_report_stall(bool)`）；EN 与 MODE 推送在转换点原子完成。
@@ -315,10 +316,9 @@ const fw_params_t *fw_params(void);   /* 快照，volatile 存储 */
 
 **文件：**
 - 修改：`components/tmc2209/tmc2209.c/.h`（`set_stall_threshold` 若未在任务 7 落地则在此落地）、`components/cartfsm/cartfsm.c`（回零流程 + DIAG1 采样）、`components/bsp/bsp.c`（DIAG1 上升沿捕获：1 kHz 电平轮询即可，GPIO ISR 非必需——预估）
-- 修改：`components/tmc2209/Kconfig`（默认 SGTHRS）
 
 - [ ] **步骤 1：失败测试（流程级，纯逻辑）**。注入假 stall 报告与时钟，断言：HOME → HOMING →（stall）→ READY 且 `as5600_set_origin(-265)` 被调用（用 spy）；HOME → 超时 → FAULT/HOME_TIMEOUT；HOMING 中 AS5600 失败 → FAULT/AS5600 优先于超时。
-- [ ] **步骤 2：实现**。EN 开后先写 SGTHRS（CONFIG 扩项或默认 40）；回零速度 −HOME_VEL 经 `vel_target`；1 kHz 轮询 DIAG1 电平（`gpio_get_level`，CONFIG_GPIO16），高电平视为堵转（极性按 TMC2209 DIAG 配置，`GCONF.diag_step`… 以数据手册为准——**上板用示波器/逻辑分析仪或低速手堵验证极性，未决事项 3**）。
+- [ ] **步骤 2：实现**。EN 开后按 `fw_params()->sgthrs` 写 `tmc2209_set_stall_threshold()`；回零速度 −HOME_VEL 经 `vel_target`；1 kHz 轮询 DIAG1 电平（`gpio_get_level`，CONFIG_GPIO16），高电平视为堵转（极性按 TMC2209 DIAG 配置——**上板用示波器/逻辑分析仪或低速手堵验证极性，未决事项 2**）。
 - [ ] **步骤 3：上板验收**（机械台位在位）：小车置行程中段，发 `HOME`：观察向 −x 低速运动、触端堵转、停在端部、MODE READY；连续 5 次回零，`x_um` 起点散布记录进 `docs/reviews/T8-acceptance.md`（protocol.md 预期 ±1–2 mm）。
 - [ ] **步骤 4：提交** `git commit -m "回零：StallGuard 堵转检测 + 原点重置 + 超时故障"`
 
