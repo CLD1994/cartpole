@@ -28,7 +28,7 @@ idf.py -B build-selftest flash monitor
 |---|---|---|---|
 | A1 | 启动横幅 | 无 panic；`bsp: BSP initialization complete`（含 I2C 扫描见 0x36、SPI 初始化）；EN 保持高（电机不使能） | |
 | A2 | settings | `SELF-TEST DONE: 21/21 PASS`（默认微步 8 等向量） | |
-| A3 | step_engine | `SELF-TEST DONE: 7/7 PASS`（含首拍间隔、看门狗恢复、换向长拍、急停、X_INV 电平翻转）；ISR max/avg cycles 记录备查（第三轮实测 max ≈ 16.2k cycles ≈ 68 µs，见未决⑤） | ISR max/avg: |
+| A3 | step_engine | `SELF-TEST DONE: 7/7 PASS`（含首拍间隔、看门狗恢复、换向长拍、急停、X_INV 电平翻转）；ISR max/avg cycles 记录备查（第四轮实测 max ≈ 19.5k cycles ≈ 81 µs，avg ≈ 11k ≈ 46 µs，见未决⑤） | ISR max/avg: |
 | A4 | mt6835 **首读关卡** | `MT6835 在线——首读 raw21=<非 0 且稳定>`；`SELF-TEST DONE: 3/3 PASS`（静止抖动 ≤ 2 count）。若 raw21 恒 0/乱码 → 核对 T4-brief.md 帧格式 | raw21: |
 | A5 | telemetry | `SELF-TEST DONE: 2/2 PASS` | |
 | A6 | cartproto | `SELF-TEST DONE: 3/3 PASS`；UART1 冒烟三行 `MODE DISABLED NONE` / `OK VEL_MAX 1000` / `ERR VEL_MAX`（460800，CH343P 口可见）；启动无 `GPIO 41 is not usable` 警告 | |
@@ -90,8 +90,10 @@ C1–C6 结果写入 `deploy/v2/edge/config.h`（会话推送值）：
 3. SGTHRS/STEP_LOSS_UM 初值 → C2/C3 实测回填。
 4. 460800 联调 → A8/C10；不过则 230400（两端同步改）。
 5. 步进 ISR 吞吐上限 vs VEL_MAX（默认 1000 mm/s ≈ 40 kHz 步频）：
-   第三轮分段最大值合计 ≈ 16.2k cycles ≈ 68 µs（排拍 > 递推 > 脉冲，
-   约各 1/3），只能支撑 ~15 kHz 步频；最大值含离群成分，**均值**
-   （第四轮日志 avg 字段）才是可持续上限的依据。回填均值后定论：
-   若上限低于控制需求速度 → ISR 优化（GPIO/定时器直写寄存器，
-   预估可到 ~20 µs ≈ 50 kHz）；若够用 → 在本条记录实测上限并关闭。
+   第四轮均值已回填——ISR avg ≈ 11k cycles ≈ 46 µs（三段均摊），
+   **可持续 ≈ 22 kHz ≈ 550 mm/s（40 steps/mm）**；max 19.5k（81 µs，
+   离群）。阶段 B/C（≤200 mm/s = 8 kHz）裕量充足，不受影响。
+   控制器需要 >550 mm/s（摆上/急回收）之前，做 ISR 直写寄存器
+   优化（GPIO W1TS/W1TC + 定时器 alarm 直写，预估合计 ~20 µs ≈
+   50 kHz ≈ 1.25 m/s）；间隔采样自测为安全网。优化完成后本条关闭
+   并记录实测新上限。
