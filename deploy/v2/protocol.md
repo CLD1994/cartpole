@@ -48,7 +48,7 @@ STATE <x_um> <theta_urad> <vx_mm_s> <vth_mrad_s>\n
 | HOMING | 收到 `RESET` | DISABLED（用户中止回零的逃生口，立即停机并关 EN） |
 | HOMING | AS5600 或 MT6835 读取失败 | FAULT |
 | HOMING | 回零超时（`HOME_TIMEOUT` 内未触发堵转） | FAULT |
-| READY | 丢步 / 堵转 / AS5600 或 MT6835 读取失败 | FAULT |
+| READY | 丢步 / 堵转（运动中） / AS5600 或 MT6835 读取失败 | FAULT |
 | FAULT | 收到 `RESET` | DISABLED |
 
 ### `MODE` 行：模式事件与查询应答
