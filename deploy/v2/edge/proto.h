@@ -24,7 +24,7 @@ typedef enum {
     FW_REASON_STEP_LOSS,
     FW_REASON_STALL,
     FW_REASON_AS5600,
-    FW_REASON_MT6901,
+    FW_REASON_MT6835,
     FW_REASON_HOME_TIMEOUT,
 } fw_reason_t;
 

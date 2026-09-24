@@ -51,8 +51,8 @@ static void test_mode_valid(void)
     assert(m.mode == FW_FAULT && m.reason == FW_REASON_STEP_LOSS);
     assert(proto_parse_line("MODE FAULT AS5600", &m) == PROTO_MODE);
     assert(m.reason == FW_REASON_AS5600);
-    assert(proto_parse_line("MODE FAULT MT6901", &m) == PROTO_MODE);
-    assert(m.reason == FW_REASON_MT6901);
+    assert(proto_parse_line("MODE FAULT MT6835", &m) == PROTO_MODE);
+    assert(m.reason == FW_REASON_MT6835);
     assert(proto_parse_line("MODE FAULT HOME_TIMEOUT", &m) == PROTO_MODE);
     assert(m.reason == FW_REASON_HOME_TIMEOUT);
     assert(proto_parse_line("MODE DISABLED NONE", &m) == PROTO_MODE);

@@ -76,8 +76,8 @@ static bool parse_reason_word(const char *w, size_t len, fw_reason_t *out)
         *out = FW_REASON_STALL;
     } else if (word_eq(w, len, "AS5600")) {
         *out = FW_REASON_AS5600;
-    } else if (word_eq(w, len, "MT6901")) {
-        *out = FW_REASON_MT6901;
+    } else if (word_eq(w, len, "MT6835")) {
+        *out = FW_REASON_MT6835;
     } else if (word_eq(w, len, "HOME_TIMEOUT")) {
         *out = FW_REASON_HOME_TIMEOUT;
     } else {
@@ -239,8 +239,8 @@ const char *proto_reason_name(fw_reason_t r)
         return "STALL";
     case FW_REASON_AS5600:
         return "AS5600";
-    case FW_REASON_MT6901:
-        return "MT6901";
+    case FW_REASON_MT6835:
+        return "MT6835";
     case FW_REASON_HOME_TIMEOUT:
         return "HOME_TIMEOUT";
     default:

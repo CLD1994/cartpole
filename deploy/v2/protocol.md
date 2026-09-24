@@ -45,9 +45,9 @@ STATE <x_um> <theta_urad> <vx_mm_s> <vth_mrad_s>\n
 |---|---|---|
 | DISABLED | 收到 `HOME` | HOMING |
 | HOMING | 堵转触发 | READY（触发点记为 `x = −265000 µm`） |
-| HOMING | AS5600 或 MT6901 读取失败 | FAULT |
+| HOMING | AS5600 或 MT6835 读取失败 | FAULT |
 | HOMING | 回零超时（`HOME_TIMEOUT` 内未触发堵转） | FAULT |
-| READY | 丢步 / 堵转 / AS5600 或 MT6901 读取失败 | FAULT |
+| READY | 丢步 / 堵转 / AS5600 或 MT6835 读取失败 | FAULT |
 | FAULT | 收到 `RESET` | DISABLED |
 
 ### `MODE` 行：模式事件与查询应答
@@ -64,7 +64,7 @@ MODE <mode> <reason>\n
 | `STEP_LOSS` | 丢步（AS5600 位置与指令位置偏差超阈值） |
 | `STALL` | 堵转（READY 跟踪中） |
 | `AS5600` | 小车编码器读取失败 |
-| `MT6901` | 摆角编码器读取失败 |
+| `MT6835` | 摆角编码器读取失败 |
 | `HOME_TIMEOUT` | 回零超时 |
 
 `MODE` 行无 ACK，端侧晚开串口会错过开机以来的转换，因此端侧在启动同步和任何需要复核的时刻发 `QUERY` 补一拍。
@@ -139,5 +139,5 @@ CONFIG?\n                 dump 全部参数（调试与日志记录用）
 - 回零重复性实测（堵转触发点散布，预期 ±1–2 mm）。
 - StallGuard 阈值调校（过高漏检丢步，过低在急加减速瞬态误报；仅在速度高于最低门限时评估）。
 - 参数注册表默认值与范围依据实测微调。
-- MT6901 的 SPI 寄存器映射在固件实现阶段确定。
+- MT6835 的 SPI 寄存器映射在固件实现阶段确定。
 - 与旧协议（`deploy/protocol.md`）的关系：旧协议随旧装置退役，本文件为新装置唯一协议权威。

@@ -7,7 +7,7 @@
 ONNX → 量化 → policy.om ──scp──>  Hi3516CV610                ESP32-S3 固件
                                    cartpole_edge              ├─ 步进电机（TMC2209）
                                       │  ↑ STATE 200 Hz 遥测   ├─ AS5600 小车位置
-                                      │  ↓ VEL/HOME/CONFIG …   └─ MT6901 摆角（SPI）
+                                      │  ↓ VEL/HOME/CONFIG …   └─ MT6835 摆角（SPI）
                                       └───── UART 460800 8N1 ──┘
 ```
 
