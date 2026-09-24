@@ -25,6 +25,12 @@
 
 `svp_acl_init` / `svp_acl_rt_set_device` 等运行时符号不在本库内，由 CV610 SDK
 的 `svp_acl` 库提供（头文件为 `<acl/svp_acl.h>`，错误码类型 `svp_acl_error`，
-0 表示成功）。构建时用 `-DSVP_ACL_ROOT` 指向该安装根目录，见上级
-`CMakeLists.txt`。`policy.c` 在拿不到 SDK 头（主机单元测试）时按同一签名使用
-最小声明。
+0 表示成功；与 `policy.c` 主机侧最小声明逐项核验一致）。`libsvp_acl.so` 自身
+只登记 `libc.so`，链接时必须显式带入附加库，否则出现未定义符号：完整集合为
+`svp_acl` + `ss_mpi_sysmem` + `protobuf-c` + `securec` + `ot_osal` + `ot_irq`
++ `ot_sys` + `ot_base`。
+
+交叉工具链（`arm-v01c02-linux-musleabi-gcc`，GCC 10.3 musl 1.2.3，Cortex-A7
+softfp）与 SDK 头文件、musl ARM 库由 CV610 侧项目的交叉编译交接包提供；
+Windows 主机经 WSL Ubuntu 构建，完整命令见上级 `CMakeLists.txt` 顶部注释。
+板端沿用已验证的 SDK 启动环境解析上述动态库。
