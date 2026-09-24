@@ -34,8 +34,8 @@ idf.py -B build-selftest flash monitor
 | A6 | cartproto | `SELF-TEST DONE: 3/3 PASS`；UART1 冒烟三行 `MODE DISABLED NONE` / `OK VEL_MAX 1000` / `ERR VEL_MAX`（460800，CH343P 口可见） | |
 | A7 | cartfsm 核心 | `SELF-TEST DONE: 3/3 PASS` | |
 | A8 | STATE 流 | 460800 抓 10 s：`state --secs 10` → 行率 199–201 Hz、UNKNOWN=0、静止 x_um 漂移 < 1000 µm | 行率: 漂移: |
-| A9 | 手推方向 | 手推小车，x_um 变化方向与推的方向一致（不符 → AS5600_INVERT_DIR 复核） | |
-| A10 | 手转摆杆一圈 | theta_urad 连续变化，约 ±π 处跳变回 0（圈守恒观察） | |
+| A9 | 手推方向 | 在 as5600 自测末尾的 **MANUAL CHECK（= A9）**段执行：转电机轴（= 经皮带移动小车）3 圈，日志给 `delta` 符号——记下转动方向与符号的关系，留 C4 交叉核对 | x_um 随移动单调变化；符号记入下表 | 符号: |
+| A10 | 手转摆杆一圈 | 在 mt6835 自测末尾的 **MANUAL CHECK（= A10）**段执行：提示后 15 s 内将摆杆转一整圈回到出发点，自动判定 | `A10 判定：圈数守恒 OK` | |
 
 ## 阶段 B：flowtest 构建（开 EN；有 12V 时小车真实运动）
 
