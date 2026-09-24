@@ -49,6 +49,7 @@ idf.py -B build-flowtest flash monitor
 |---|---|---|---|
 | B1 | cartfsm 流程自测 | `SELF-TEST DONE: 5/5 PASS`（注入堵转→READY+原点 −265000 µm；超时→FAULT；AS5600 失联→FAULT（日志含耗时 ms，设计 ≤15）；丢步注入→FAULT；RESET 后重 HOME） | 失联耗时: |
 | B2 | FAULT 次序 | 日志/MODE 行序：目标置 0 → EN 关 → `MODE FAULT <reason>` | |
+| B3 | 行中 `\r` 注入 | 串口发送 `VE\rL 200\n` 与 130 字节乱码+`\n` | 均无任何命令执行、无输出（重同步生效） |
 
 ## 阶段 C：正式固件 + 台位标定（机械在位、12V）
 
@@ -64,6 +65,7 @@ idf.py -B build flash
 | C1 | DIAG 极性（未决②） | `py home` 后低速手堵 | 堵转触发 FAULT STALL（或回零完成）；不堵无误触发 1 min | 极性: |
 | C2 | SGTHRS 初标（未决③） | `py config SGTHRS <20..80>` 扫描 + 手堵 | 灵敏且空载不误报 | 选定: |
 | C3 | 回零散布 | `py home` ×5（间隔 `RESET`），读静止 x_um | 散布 ≤ 2000 µm | 各次 x_um: |
+| C3b | **E−C 域对齐关卡**（丢步判据结构前提：DIR 高时 AS5600 计数须增） | 回零后 `py vel 50 --hold 3`：x_um 增大（与 +x 命令同向）、全程无 STEP_LOSS 误报 | 方向一致、无误报；不符 = 机械/接线不对齐，先处理硬件（AS5600_INVERT_DIR）再继续 | |
 | C4 | 符号约定（protocol.md §符号约定） | `py vel 200 --hold 1` 记实际方向 = +x；手掰摆顶同向看 theta | theta 同向增大；VEL −200 反向 | |
 | C5 | 摆角零位 | 手扶摆杆机械直立，读 STATE theta | 读数 θ₀；标定值 = −θ₀ | θ₀: |
 | C6 | 标定落地 | `py config POLE_ZERO_URAD <−θ₀>`（及 C1–C4 所得 POLE_INV/X_INV/SGTHRS）后复核 | 直立 theta≈0；VEL 200 方向与 theta 符号符合约定 | |
