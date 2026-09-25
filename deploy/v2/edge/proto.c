@@ -72,8 +72,6 @@ static bool parse_reason_word(const char *w, size_t len, fw_reason_t *out)
         *out = FW_REASON_NONE;
     } else if (word_eq(w, len, "STEP_LOSS")) {
         *out = FW_REASON_STEP_LOSS;
-    } else if (word_eq(w, len, "STALL")) {
-        *out = FW_REASON_STALL;
     } else if (word_eq(w, len, "AS5600")) {
         *out = FW_REASON_AS5600;
     } else if (word_eq(w, len, "MT6835")) {
@@ -235,8 +233,6 @@ const char *proto_reason_name(fw_reason_t r)
         return "NONE";
     case FW_REASON_STEP_LOSS:
         return "STEP_LOSS";
-    case FW_REASON_STALL:
-        return "STALL";
     case FW_REASON_AS5600:
         return "AS5600";
     case FW_REASON_MT6835:

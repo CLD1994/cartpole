@@ -22,7 +22,6 @@ typedef enum {
 typedef enum {
     FW_REASON_NONE = 0,
     FW_REASON_STEP_LOSS,
-    FW_REASON_STALL,
     FW_REASON_AS5600,
     FW_REASON_MT6835,
     FW_REASON_HOME_TIMEOUT,
