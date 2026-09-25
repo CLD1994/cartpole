@@ -16,7 +16,7 @@
 #define CFG_STATE_TIMEOUT_S 0.2       /* 超过此时长无 STATE 行：发 VEL 0 并等待恢复 */
 
 /* ---- 动作映射（策略输出 [-1,1] -> 目标速度） ---- */
-#define CFG_V_MAX_MPS       1.0       /* 训练随机化上界（0.8–1.0），部署取上界 */
+#define CFG_V_MAX_MPS       0.5       /* 训练随机化上界（0.4–0.5；上限由 ISR 实测可持续 ≈0.55 m/s 决定），部署取上界 */
 
 /* ---- 安全 ---- */
 #define CFG_TRACK_LIMIT_M   0.260     /* 端侧软限位（与固件 X_MARGIN_UM 窗口各自独立，再挡一层向外的速度） */

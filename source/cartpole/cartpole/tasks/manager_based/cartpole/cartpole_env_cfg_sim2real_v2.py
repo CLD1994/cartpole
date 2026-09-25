@@ -15,9 +15,11 @@ Key differences vs ``cartpole_env_cfg_sim2real.py`` (the v1 DC-motor rig):
     trajectory executor, not a force-balance system) — the force gain / deadzone / viscous
     damping model of v1 does not apply
   - control rate 200 Hz (physics 400 Hz, decimation 2); NPU inference measured at 0.38 ms max
-  - tracking randomization upper bounds are pinned to the firmware session clamps
-    (VEL_MAX = 1000 mm/s, ACC_MAX = 5000 mm/s^2): the training distribution must lie entirely
-    inside what the rig can execute
+  - tracking randomization upper bounds are pinned to what the rig can execute: acc_max to
+    the firmware session clamp ACC_MAX = 5000 mm/s^2, and vel_max below the measured
+    ISR-sustainable step rate (~0.55 m/s, tighter than the VEL_MAX = 1000 mm/s protocol
+    clamp; onboard-checklist 未决⑤): the training distribution must lie entirely inside
+    what the rig can execute
 """
 
 import math
@@ -63,7 +65,7 @@ class RealCartpoleV2EnvCfg(CartpoleEnvCfg):
         self.actions.joint_effort = mdp_actions.JointVelocityTrackingActionCfg(
             asset_name="robot",
             joint_names=["slider_to_cart"],
-            vel_max=0.9,  # nominal authority scale [m/s]; randomized 0.8-1.0 (<= VEL_MAX 1.0)
+            vel_max=0.45,  # nominal authority scale [m/s]; randomized 0.4-0.5 (< ISR ceiling ~0.55 m/s)
             tau=0.02,  # nominal tracking time constant [s]; randomized 0.010-0.040
             acc_max=4.0,  # nominal acceleration limit [m/s^2]; randomized 3-5 (<= ACC_MAX 5)
             delay_steps=1,
@@ -170,13 +172,14 @@ class RealCartpoleV2EnvCfg(CartpoleEnvCfg):
                 "damping_range": {"slider_to_cart": (0.0, 2.0), "cart_to_pole": (0.0, 0.01)},
             },
         )
-        # tracking dynamics (vel_max / tau / acc_max), bounds pinned to the firmware clamps
+        # tracking dynamics (vel_max / tau / acc_max); vel bound below the ISR-sustainable
+        # step rate (~0.55 m/s, onboard-measured), acc bound at the firmware ACC_MAX clamp
         self.events.randomize_tracking = EventTerm(
             func=mdp_events.randomize_velocity_tracking,
             mode="reset",
             params={
                 "action_name": "joint_effort",
-                "vel_max_range": (0.8, 1.0),
+                "vel_max_range": (0.4, 0.5),
                 "tau_range": (0.010, 0.040),
                 "acc_max_range": (3.0, 5.0),
             },

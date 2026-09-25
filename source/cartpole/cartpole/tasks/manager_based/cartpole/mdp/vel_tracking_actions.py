@@ -43,12 +43,13 @@ class JointVelocityTrackingActionCfg(JointEffortActionCfg):
 
     class_type: type[JointVelocityTrackingAction] | str = "{DIR}.vel_tracking_action:JointVelocityTrackingAction"
 
-    vel_max: float = 0.9
+    vel_max: float = 0.45
     """Authority scale [m/s]: the clipped action in [-1, 1] maps to a velocity target in
     [-vel_max, vel_max]. Randomized per-environment by ``randomize_velocity_tracking``.
     Note: the base class ``scale`` is unused (kept at 1.0); ``vel_max`` plays its role as a
-    per-environment tensor. The training upper bound must not exceed the firmware session
-    clamp ``VEL_MAX`` (see deploy/v2/protocol.md)."""
+    per-environment tensor. The training upper bound must stay below the rig's
+    ISR-sustainable step rate (~0.55 m/s, onboard-measured), which is tighter than the
+    protocol clamp ``VEL_MAX`` (see deploy/v2/protocol.md)."""
 
     tau: float = 0.02
     """Tracking time constant [s]: how fast the tracked velocity converges toward the target
