@@ -99,12 +99,13 @@ static int control_loop(void)
             continue;
         }
 
-        /* 观测（顺序/单位与训练一致）与推理 */
+        /* 观测（顺序/单位与训练一致；θ/θ̇ 按部署边界符号映射取反——
+         * 训练侧摆角正方向与实机相反，见 sim2real-spec「部署边界符号映射」） */
         float obs[4] = {
             (float)x_m,
-            (float)th_rad,
+            (float)-th_rad,
             (float)((double)vx_mm_s * 1e-3),
-            (float)((double)vth_mrad_s * 1e-3),
+            (float)((double)-vth_mrad_s * 1e-3),
         };
         float action;
         if (policy_forward(obs, &action) != 0) {
