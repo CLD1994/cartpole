@@ -29,7 +29,7 @@ struct fw_param {
     long value;
 };
 
-#define CFG_FW_PARAM_COUNT  4
+#define CFG_FW_PARAM_COUNT  6
 extern const struct fw_param CFG_FW_PARAMS[CFG_FW_PARAM_COUNT];
 
 #endif /* EDGE_CONFIG_H */

@@ -15,6 +15,9 @@ const struct fw_param CFG_FW_PARAMS[CFG_FW_PARAM_COUNT] = {
     {"ACC_MAX", 5000},
     {"WDT_MS", 100},
     {"WDT_DEC", 5000},
+    /* 台位标定量（上板验收 2026-09-26：θ₀ 由下垂读数+180° 反推） */
+    {"POLE_ZERO_URAD", 1655229},
+    {"POLE_INV", 1},
 };
 
 /* ---- 会话状态 ---- */
