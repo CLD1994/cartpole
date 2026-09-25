@@ -19,9 +19,9 @@
 #define CFG_V_MAX_MPS       1.0       /* 训练随机化上界（0.8–1.0），部署取上界 */
 
 /* ---- 安全 ---- */
-#define CFG_TRACK_LIMIT_M   0.260     /* 与固件 X_LIMIT 一致；端侧再挡一层向外的速度 */
+#define CFG_TRACK_LIMIT_M   0.260     /* 端侧软限位（与固件 X_MARGIN_UM 窗口各自独立，再挡一层向外的速度） */
 #define CFG_ENGAGE_ANGLE_RAD 0.524    /* 策略接管门限：|theta| 超过 30° 发 VEL 0（摆杆下垂/大倾角不驱动） */
-#define CFG_CENTER_VEL_MMS  100       /* 回零后把小车移回行程中点的速度 */
+#define CFG_CENTER_VEL_MMS  100       /* 标定 ENABLE 后把小车从端点移回行程中点的速度 */
 
 /* ---- 会话启动时推送的固件参数（CONFIG 命令，见 protocol.md 注册表） ---- */
 struct fw_param {
@@ -29,7 +29,7 @@ struct fw_param {
     long value;
 };
 
-#define CFG_FW_PARAM_COUNT  7
+#define CFG_FW_PARAM_COUNT  4
 extern const struct fw_param CFG_FW_PARAMS[CFG_FW_PARAM_COUNT];
 
 #endif /* EDGE_CONFIG_H */

@@ -13,7 +13,6 @@
 /* 固件模式（MODE 行第一个字段） */
 typedef enum {
     FW_DISABLED = 0,
-    FW_HOMING,
     FW_READY,
     FW_FAULT,
 } fw_mode_t;
@@ -24,7 +23,6 @@ typedef enum {
     FW_REASON_STEP_LOSS,
     FW_REASON_AS5600,
     FW_REASON_MT6835,
-    FW_REASON_HOME_TIMEOUT,
 } fw_reason_t;
 
 /* 解析结果类型 */
@@ -70,7 +68,7 @@ void proto_rx_feed(proto_rx_t *rx, const uint8_t *data, size_t n, proto_line_cb 
 /* 命令构造（写入 buf，返回长度，含 '\n'；buf 至少 64 字节）。
  * 数值非法（NaN/超出 int 范围）时返回 0，调用方跳过发送。 */
 size_t proto_format_vel(char *buf, double v_mm_s);
-size_t proto_format_simple(char *buf, const char *cmd); /* HOME / RESET / QUERY */
+size_t proto_format_simple(char *buf, const char *cmd); /* RESET / QUERY / MARK LEFT / ENABLE */
 size_t proto_format_config(char *buf, const char *name, long value);
 
 /* 模式/原因枚举的名字（日志用） */

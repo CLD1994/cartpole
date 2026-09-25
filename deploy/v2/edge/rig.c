@@ -15,9 +15,6 @@ const struct fw_param CFG_FW_PARAMS[CFG_FW_PARAM_COUNT] = {
     {"ACC_MAX", 5000},
     {"WDT_MS", 100},
     {"WDT_DEC", 5000},
-    {"HOME_VEL", 50},
-    {"HOME_TIMEOUT", 30000},
-    {"X_LIMIT", 260000},
 };
 
 /* ---- 会话状态 ---- */
@@ -212,15 +209,7 @@ int rig_wait_mode(fw_mode_t target, double timeout_s)
     return -1;
 }
 
-int rig_wait_ready(double timeout_s)
-{
-    if (rig_send_simple("HOME") != 0) {
-        return -1;
-    }
-    return rig_wait_mode(FW_READY, timeout_s);
-}
-
-/* 回零完成后把小车从中点移回行程中点（协议操作流程第 5 步）。 */
+/* 标定 ENABLE 后把小车从端点移回行程中点（协议操作流程）。 */
 int rig_goto_center(double timeout_s)
 {
     double t0 = rig_now_s();

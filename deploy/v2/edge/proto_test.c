@@ -53,12 +53,11 @@ static void test_mode_valid(void)
     assert(m.reason == FW_REASON_AS5600);
     assert(proto_parse_line("MODE FAULT MT6835", &m) == PROTO_MODE);
     assert(m.reason == FW_REASON_MT6835);
-    assert(proto_parse_line("MODE FAULT HOME_TIMEOUT", &m) == PROTO_MODE);
-    assert(m.reason == FW_REASON_HOME_TIMEOUT);
     assert(proto_parse_line("MODE DISABLED NONE", &m) == PROTO_MODE);
     assert(m.mode == FW_DISABLED);
-    assert(proto_parse_line("MODE HOMING NONE", &m) == PROTO_MODE);
-    assert(m.mode == FW_HOMING);
+    /* HOMING 模式与 HOME_TIMEOUT 原因已随自动回零退役（calib-spec §5） */
+    assert(proto_parse_line("MODE HOMING NONE", &m) == PROTO_UNKNOWN);
+    assert(proto_parse_line("MODE FAULT HOME_TIMEOUT", &m) == PROTO_UNKNOWN);
 }
 
 static void test_mode_invalid(void)
@@ -77,6 +76,13 @@ static void test_config_replies(void)
     assert(strcmp(m.param, "VEL_MAX") == 0 && m.value == 1000);
     assert(proto_parse_line("ERR ACC_MAX", &m) == PROTO_ERR);
     assert(strcmp(m.param, "ACC_MAX") == 0);
+    /* 标定回执名单是单 token（calib-spec §2），走同一 OK <NAME> <value> 语法 */
+    assert(proto_parse_line("OK MARK_LEFT 123", &m) == PROTO_OK);
+    assert(strcmp(m.param, "MARK_LEFT") == 0 && m.value == 123);
+    assert(proto_parse_line("OK MARK_RIGHT 530000", &m) == PROTO_OK);
+    assert(strcmp(m.param, "MARK_RIGHT") == 0 && m.value == 530000);
+    assert(proto_parse_line("ERR ENABLE", &m) == PROTO_ERR);
+    assert(strcmp(m.param, "ENABLE") == 0);
     assert(proto_parse_line("OK", &m) == PROTO_UNKNOWN);       /* OK 缺参数名/值 */
     assert(proto_parse_line("ERR", &m) == PROTO_UNKNOWN);      /* ERR 缺参数名 */
 }
@@ -97,8 +103,9 @@ static void test_format(void)
     assert(proto_format_vel(buf, -12.6) > 0 && strcmp(buf, "VEL -13\n") == 0); /* 四舍五入 */
     assert(proto_format_vel(buf, NAN) == 0);                                   /* NaN 拒发 */
     assert(proto_format_vel(buf, 1.0e12) == 0);                                /* 超界拒发 */
-    assert(proto_format_simple(buf, "HOME") > 0 && strcmp(buf, "HOME\n") == 0);
-    assert(proto_format_config(buf, "X_LIMIT", 260000) > 0 && strcmp(buf, "CONFIG X_LIMIT 260000\n") == 0);
+    assert(proto_format_simple(buf, "MARK LEFT") > 0 && strcmp(buf, "MARK LEFT\n") == 0);
+    assert(proto_format_simple(buf, "ENABLE") > 0 && strcmp(buf, "ENABLE\n") == 0);
+    assert(proto_format_config(buf, "X_MARGIN_UM", 10000) > 0 && strcmp(buf, "CONFIG X_MARGIN_UM 10000\n") == 0);
 }
 
 static void test_rx_feed(void)

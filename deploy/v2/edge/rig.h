@@ -24,13 +24,12 @@ void rig_pump(void); /* 泵串口：非阻塞读 + 行分发 */
 
 /* 发送。失败返回 -1；VEL 数值非法（NaN/超界）同样返回 -1 且不发送。 */
 int rig_send_vel(double v_mm_s);
-int rig_send_simple(const char *cmd); /* HOME / RESET / QUERY / CONFIG? */
+int rig_send_simple(const char *cmd); /* RESET / QUERY / CONFIG? / MARK LEFT / ENABLE */
 int rig_send_config(const char *name, long value);
 
 int rig_sync_mode(double timeout_s);    /* 发 QUERY 等模式已知；超时返回 -1 */
 int rig_wait_state(double timeout_s);   /* 等第一条 STATE；超时返回 -1 */
 int rig_push_params(void);              /* 推送 CFG_FW_PARAMS 表（间隔 10 ms） */
-int rig_wait_ready(double timeout_s);   /* 发 HOME 并等 READY；FAULT/超时返回 -1 */
 int rig_wait_mode(fw_mode_t target, double timeout_s); /* 只等待不发命令 */
 int rig_goto_center(double timeout_s);  /* 以 CFG_CENTER_VEL_MMS 移回行程中点 */
 

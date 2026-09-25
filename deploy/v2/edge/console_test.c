@@ -42,7 +42,10 @@ int main(void)
     /* 无参命令与别名 */
     expect_ok("", CONSOLE_CMD_NONE);
     expect_ok("   \t ", CONSOLE_CMD_NONE);
-    expect_ok("home", CONSOLE_CMD_HOME);
+    expect_ok("calib", CONSOLE_CMD_CALIB);
+    expect_ok("mark-left", CONSOLE_CMD_MARK_LEFT);
+    expect_ok("  mark-right  ", CONSOLE_CMD_MARK_RIGHT);
+    expect_ok("enable", CONSOLE_CMD_ENABLE);
     expect_ok("  center  ", CONSOLE_CMD_CENTER);
     expect_ok("state", CONSOLE_CMD_STATE);
     expect_ok("query", CONSOLE_CMD_QUERY);
@@ -68,7 +71,7 @@ int main(void)
     CHECK(console_parse("config", &req) == 0 && req.cmd == CONSOLE_CMD_CONFIG && req.dump);
     CHECK(console_parse("config VEL_MAX 800", &req) == 0 && !req.dump &&
           strcmp(req.name, "VEL_MAX") == 0 && req.value == 800);
-    CHECK(console_parse("config X_LIMIT -1", &req) == 0 && req.value == -1);
+    CHECK(console_parse("config X_MARGIN_UM -1", &req) == 0 && req.value == -1);
     CHECK(console_parse("config A_1 5", &req) == 0);
     CHECK(console_parse("config AAAAAAAAAAAAAAA 5", &req) == 0); /* 15 字符，最长合法 */
     /* config：非法输入 */
@@ -82,7 +85,9 @@ int main(void)
     /* 未知命令、多余参数、大小写敏感 */
     expect_err("foo");
     expect_err("HOME");
-    expect_err("home extra");
+    expect_err("home");
+    expect_err("calib extra");
+    expect_err("mark left");   /* 连写形式，无此命令 */
     expect_err("quit now");
     expect_err("a b c d e");
 

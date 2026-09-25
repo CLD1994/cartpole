@@ -54,8 +54,6 @@ static bool parse_mode_word(const char *w, size_t len, fw_mode_t *out)
 {
     if (word_eq(w, len, "DISABLED")) {
         *out = FW_DISABLED;
-    } else if (word_eq(w, len, "HOMING")) {
-        *out = FW_HOMING;
     } else if (word_eq(w, len, "READY")) {
         *out = FW_READY;
     } else if (word_eq(w, len, "FAULT")) {
@@ -76,8 +74,6 @@ static bool parse_reason_word(const char *w, size_t len, fw_reason_t *out)
         *out = FW_REASON_AS5600;
     } else if (word_eq(w, len, "MT6835")) {
         *out = FW_REASON_MT6835;
-    } else if (word_eq(w, len, "HOME_TIMEOUT")) {
-        *out = FW_REASON_HOME_TIMEOUT;
     } else {
         return false;
     }
@@ -215,8 +211,6 @@ const char *proto_mode_name(fw_mode_t m)
     switch (m) {
     case FW_DISABLED:
         return "DISABLED";
-    case FW_HOMING:
-        return "HOMING";
     case FW_READY:
         return "READY";
     case FW_FAULT:
@@ -237,8 +231,6 @@ const char *proto_reason_name(fw_reason_t r)
         return "AS5600";
     case FW_REASON_MT6835:
         return "MT6835";
-    case FW_REASON_HOME_TIMEOUT:
-        return "HOME_TIMEOUT";
     default:
         return "?";
     }

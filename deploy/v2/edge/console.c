@@ -104,18 +104,22 @@ int console_parse(const char *line, console_req_t *req)
         req->cmd = CONSOLE_CMD_HELP;
         return 0;
     }
-    if (strcmp(tok[0], "home") == 0 || strcmp(tok[0], "center") == 0 ||
-        strcmp(tok[0], "state") == 0 || strcmp(tok[0], "query") == 0 ||
-        strcmp(tok[0], "reset") == 0) {
+    if (strcmp(tok[0], "calib") == 0 || strcmp(tok[0], "mark-left") == 0 ||
+        strcmp(tok[0], "mark-right") == 0 || strcmp(tok[0], "enable") == 0 ||
+        strcmp(tok[0], "center") == 0 || strcmp(tok[0], "state") == 0 ||
+        strcmp(tok[0], "query") == 0 || strcmp(tok[0], "reset") == 0) {
         if (n != 1) {
             snprintf(req->err, sizeof(req->err), "%s takes no arguments", tok[0]);
             return -1;
         }
-        req->cmd = strcmp(tok[0], "home") == 0     ? CONSOLE_CMD_HOME
-                   : strcmp(tok[0], "center") == 0 ? CONSOLE_CMD_CENTER
-                   : strcmp(tok[0], "state") == 0  ? CONSOLE_CMD_STATE
-                   : strcmp(tok[0], "query") == 0  ? CONSOLE_CMD_QUERY
-                                                   : CONSOLE_CMD_RESET;
+        req->cmd = strcmp(tok[0], "calib") == 0          ? CONSOLE_CMD_CALIB
+                   : strcmp(tok[0], "mark-left") == 0    ? CONSOLE_CMD_MARK_LEFT
+                   : strcmp(tok[0], "mark-right") == 0   ? CONSOLE_CMD_MARK_RIGHT
+                   : strcmp(tok[0], "enable") == 0       ? CONSOLE_CMD_ENABLE
+                   : strcmp(tok[0], "center") == 0       ? CONSOLE_CMD_CENTER
+                   : strcmp(tok[0], "state") == 0        ? CONSOLE_CMD_STATE
+                   : strcmp(tok[0], "query") == 0        ? CONSOLE_CMD_QUERY
+                                                        : CONSOLE_CMD_RESET;
         return 0;
     }
     if (strcmp(tok[0], "vel") == 0) {
@@ -164,26 +168,74 @@ static void nap_ms(int ms)
     nanosleep(&ts, NULL);
 }
 
+/* 等操作者推车到位后按回车（calib 交互引导用）。 */
+static int wait_enter(void)
+{
+    int c = getchar();
+    while (c != '\n' && c != EOF) {
+        c = getchar();
+    }
+    return c == EOF ? -1 : 0;
+}
+
+/* 发命令并等 OK/ERR 回执（回执名经控制台回显核对）。 */
+static int send_and_await(const char *cmd)
+{
+    if (rig_send_simple(cmd) != 0) {
+        return -1;
+    }
+    if (rig_wait_reply(1.0) != 0) {
+        fprintf(stderr, "[edge] %s rejected/failed\n", cmd);
+        return -1;
+    }
+    return 0;
+}
+
 int console_exec(const console_req_t *req)
 {
     switch (req->cmd) {
-    case CONSOLE_CMD_HOME: {
+    case CONSOLE_CMD_CALIB: {
         int known;
         fw_mode_t m = rig_mode(&known, NULL);
         if (known && m != FW_DISABLED) {
-            fprintf(stderr, "[edge] HOME requires DISABLED (current %s)\n", proto_mode_name(m));
+            fprintf(stderr, "[edge] calib requires DISABLED (current %s)\n",
+                    proto_mode_name(m));
             return -1;
         }
-        printf("[edge] homing...\n");
-        if (rig_send_simple("HOME") != 0) {
+        printf("[edge] push cart to LEFT end, then press Enter...");
+        fflush(stdout);
+        if (wait_enter() != 0) {
             return -1;
         }
-        if (rig_wait_mode(FW_READY, 35.0) != 0) {
-            fprintf(stderr, "[edge] homing failed (see MODE events above)\n");
+        if (send_and_await("MARK LEFT") != 0) {
+            fprintf(stderr, "[edge] MARK LEFT rejected/failed\n");
             return -1;
         }
+        printf("[edge] push cart to RIGHT end, then press Enter...");
+        fflush(stdout);
+        if (wait_enter() != 0) {
+            return -1;
+        }
+        if (send_and_await("MARK RIGHT") != 0) {
+            fprintf(stderr, "[edge] MARK RIGHT rejected (L invalid? no left mark?)\n");
+            return -1;
+        }
+        if (rig_send_simple("ENABLE") != 0) {
+            return -1;
+        }
+        if (rig_wait_mode(FW_READY, 2.0) != 0) {
+            fprintf(stderr, "[edge] ENABLE failed (see MODE events)\n");
+            return -1;
+        }
+        printf("[edge] calibrated & READY; use 'center' to move to mid-track\n");
         return 0;
     }
+    case CONSOLE_CMD_MARK_LEFT:
+        return send_and_await("MARK LEFT");
+    case CONSOLE_CMD_MARK_RIGHT:
+        return send_and_await("MARK RIGHT");
+    case CONSOLE_CMD_ENABLE:
+        return send_and_await("ENABLE");
     case CONSOLE_CMD_CENTER:
         if (rig_goto_center(15.0) != 0) {
             fprintf(stderr, "[edge] move-to-center failed\n");
@@ -252,7 +304,10 @@ static void print_help(void)
 {
     printf("commands:\n"
            "  vel <mm/s>            set held target velocity (kept while READY & STATE fresh)\n"
-           "  home                  start homing, wait for READY\n"
+           "  calib                 interactive 2-point calibration (MARK LEFT/RIGHT + ENABLE)\n"
+           "  mark-left             send MARK LEFT (cart at left end)\n"
+           "  mark-right            send MARK RIGHT (cart at right end)\n"
+           "  enable                ENABLE after calibration, wait READY\n"
            "  center                move cart to track center\n"
            "  state                 print latest STATE snapshot\n"
            "  query                 ask firmware mode\n"
@@ -286,11 +341,14 @@ static int handle_line(const char *line, int *holding, double *held_vel)
         *holding = 1;
         *held_vel = req.vel_mm_s;
         return 0;
-    case CONSOLE_CMD_HOME:
+    case CONSOLE_CMD_CALIB:
+    case CONSOLE_CMD_MARK_LEFT:
+    case CONSOLE_CMD_MARK_RIGHT:
+    case CONSOLE_CMD_ENABLE:
     case CONSOLE_CMD_CENTER:
     case CONSOLE_CMD_RESET:
     case CONSOLE_CMD_CONFIG:
-        /* 模式变更类命令期间不保持速度，避免回零/清障后意外续动 */
+        /* 模式变更类命令期间不保持速度，避免标定/使能/清障后意外续动 */
         *holding = 0;
         console_exec(&req);
         return 0;

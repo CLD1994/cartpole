@@ -141,13 +141,10 @@ static int control_loop(void)
 static int run_policy(int argc, char **argv, int first)
 {
     const char *model = NULL;
-    int do_home = 1;
 
     for (int k = first; k < argc; k++) {
         if (strcmp(argv[k], "--model") == 0 && k + 1 < argc) {
             model = argv[++k];
-        } else if (strcmp(argv[k], "--no-home") == 0) {
-            do_home = 0;
         } else {
             fprintf(stderr, "[edge] unknown run argument: %s\n", argv[k]);
             return 1;
@@ -175,22 +172,17 @@ static int run_policy(int argc, char **argv, int first)
         return 1;
     }
 
-    if (mode == FW_DISABLED && do_home) {
-        printf("[edge] homing...\n");
-        if (rig_wait_ready(35.0) != 0) {
-            fprintf(stderr, "[edge] homing failed (see MODE events above)\n");
-            return 1;
-        }
-        if (rig_goto_center(15.0) != 0) {
-            fprintf(stderr, "[edge] move-to-center failed\n");
-            return 1;
-        }
-        printf("[edge] ready at track center; lift the pole near upright to engage the policy\n");
-    } else if (mode != FW_READY) {
-        fprintf(stderr, "[edge] firmware in %s; start from DISABLED (power-cycle or RESET) or pass --no-home\n",
+    if (mode != FW_READY) {
+        fprintf(stderr, "[edge] firmware in %s; calibrate first "
+                "(console 'calib'), or RESET a FAULT\n",
                 proto_mode_name(mode));
         return 1;
     }
+    if (rig_goto_center(15.0) != 0) {
+        fprintf(stderr, "[edge] move-to-center failed\n");
+        return 1;
+    }
+    printf("[edge] ready at track center; lift the pole near upright to engage the policy\n");
 
     return control_loop() == 0 ? 0 : 1;
 }
@@ -304,8 +296,11 @@ static void print_usage(const char *prog)
             "usage: %s [--port /dev/ttyXXXX] [command [args]]\n"
             "  (no command)                     interactive console (default)\n"
             "  console                          same as above\n"
-            "  run --model path.om [--no-home]  policy control (model required)\n"
-            "  home [--center]                  one-shot: HOME, wait READY; then move to center\n"
+            "  run --model path.om              policy control (model required; firmware must be READY)\n"
+            "  calib                            one-shot: interactive 2-point calibration (MARK LEFT/RIGHT + ENABLE)\n"
+            "  mark-left                        one-shot: send MARK LEFT (cart at left end)\n"
+            "  mark-right                       one-shot: send MARK RIGHT (cart at right end)\n"
+            "  enable                           one-shot: ENABLE after calibration, wait READY\n"
             "  center                           one-shot: move cart to track center (needs READY)\n"
             "  vel <mm/s> [--hold s]            one-shot: hold velocity for s seconds (default 1.0)\n"
             "  state                            one-shot: print latest STATE snapshot\n"
@@ -330,18 +325,18 @@ static int dispatch(const char *cmd, int argc, char **argv, int first)
     if (strcmp(cmd, "run") == 0) {
         return run_policy(argc, argv, first);
     }
-    if (strcmp(cmd, "home") == 0) {
-        if (nargs != 0 && !(nargs == 1 && strcmp(argv[first], "--center") == 0)) {
+    if (strcmp(cmd, "calib") == 0 || strcmp(cmd, "mark-left") == 0 ||
+        strcmp(cmd, "mark-right") == 0 || strcmp(cmd, "enable") == 0) {
+        if (nargs != 0) {
+            fprintf(stderr, "[edge] %s takes no arguments\n", cmd);
+            return 1;
+        }
+        console_req_t req;
+        if (parse_argv_as_console(cmd, NULL, NULL, &req) != 0) {
             print_usage(prog);
             return 1;
         }
-        console_req_t req = {.cmd = CONSOLE_CMD_HOME};
-        int rc = console_exec(&req) == 0 ? 0 : 1;
-        if (rc == 0 && nargs == 1) {
-            req.cmd = CONSOLE_CMD_CENTER;
-            rc = console_exec(&req) == 0 ? 0 : 1;
-        }
-        return rc;
+        return console_exec(&req) == 0 ? 0 : 1;
     }
     if (strcmp(cmd, "center") == 0 || strcmp(cmd, "query") == 0 || strcmp(cmd, "reset") == 0) {
         if (nargs != 0) {
