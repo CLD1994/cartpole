@@ -85,8 +85,8 @@ HOMING 到位判定阈值共用，不新增 HOME 专用阈值参数。
 - reason 枚举移除 `STALL`，终集为 `NONE / STEP_LOSS / AS5600 / MT6835 /
   HOME_TIMEOUT`。
 - 参数注册表移除 `SGTHRS`；`STEP_LOSS_UM` 条目补注双角色与延迟公式。
-- 端侧 `deploy/v2/edge/`：`proto` 枚举移除 `FW_REASON_STALL`；`config.h`
-  推送集移除 `SGTHRS`。
+- 端侧 `deploy/v2/edge/`：`proto` 枚举移除 `FW_REASON_STALL`；参数
+  推送表（`rig.c` 的 `CFG_FW_PARAMS`）本不含 `SGTHRS`，无需改动。
 - `deploy/v2/onboard-checklist.md` 同步：C1 改写为到位判定验证（含负路径），
   C2（SGTHRS 扫描）删除，阶段 D 标定集相应缩减，未决②③关闭或改写。
 
@@ -107,7 +107,10 @@ HOMING 到位判定阈值共用，不新增 HOME 专用阈值参数。
 **流程自测（flowtest，注入式）**。注入点设在判定入口，真实代码路径完整：
 
 - `loss_bias`（既有）：对 `E` 注入偏置，驱动 `D`；
-- 达速锁存强制置位（新增，仅 flowtest 编译）：替代真实运动置位 `latch`。
+- `follow_cmd`（新增，仅 flowtest 编译）：判定用 `E` 以指令位置替代
+  ——理想编码器替身，使超时/失联用例不依赖台位 12V；
+- `speed_latch` 覆写（新增，仅 flowtest 编译）：-1 自然判据（默认）、
+  0 强制清零、1 强制置位，替代真实运动置位 `latch`。
 
 | 用例 | 注入序列 | 期望 |
 |---|---|---|

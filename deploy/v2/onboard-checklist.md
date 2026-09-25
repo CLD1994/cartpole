@@ -47,7 +47,7 @@ idf.py -B build-flowtest flash monitor
 
 | # | 检查项 | 预期 | 记录 |
 |---|---|---|---|
-| B1 | cartfsm 流程自测 | `SELF-TEST DONE: 5/5 PASS`（注入堵转→READY+原点 −265000 µm；超时→FAULT；AS5600 失联→FAULT（日志含耗时 ms，设计 ≤15）；丢步注入→FAULT；RESET 后重 HOME） | 失联耗时: | 5/5；失联→FAULT+EN 关 10 ms |
+| B1 | cartfsm 流程自测 | `SELF-TEST DONE: 6/6 PASS`（注入到位→READY+原点 −265000 µm；未达速偏差→FAULT/STEP_LOSS；超时→FAULT；AS5600 失联→FAULT（日志含耗时 ms，设计 ≤15）；丢步注入→FAULT；RESET 后重 HOME） | 失联耗时: | 5/5（旧用例集）；失联→FAULT+EN 关 10 ms |
 | B2 | FAULT 次序 | 日志/MODE 行序：目标置 0 → EN 关 → `MODE FAULT <reason>` | | MODE 序列完整对应 5 用例；HOME_TIMEOUT/AS5600/STEP_LOSS 原因码全部正确（2026-09-25） |
 | B3 | 行中 `\r` 注入 | 串口发送 `VE\rL 200\n` 与 130 字节乱码+`\n` | 均无任何命令执行、无输出（重同步生效） | `VE\rL 200\n`：无任何回应行 ✓；乱码组待补 |
 
@@ -62,8 +62,7 @@ idf.py -B build flash
 
 | # | 检查项 | 操作 | 预期 | 记录 |
 |---|---|---|---|---|
-| C1 | DIAG 极性（未决②） | `py home` 后低速手堵 | 堵转触发 FAULT STALL（或回零完成）；不堵无误触发 1 min | 极性: |
-| C2 | SGTHRS 初标（未决③） | `py config SGTHRS <20..80>` 扫描 + 手堵 | 灵敏且空载不误报 | 选定: |
+| C1 | 到位判定验证 | `py home` 后小车走到挡块停住 | `MODE READY NONE`、x_um ≈ −265000；再验负路径：起点压挡块时 `py home` → FAULT STEP_LOSS（日志含挪车提示） | |
 | C3 | 回零散布 | `py home` ×5（间隔 `RESET`），读静止 x_um | 散布 ≤ 2000 µm | 各次 x_um: |
 | C3b | **E−C 域对齐关卡**（丢步判据结构前提：DIR 高时 AS5600 计数须增） | 回零后 `py vel 50 --hold 3`：x_um 增大（与 +x 命令同向）、全程无 STEP_LOSS 误报 | 方向一致、无误报；不符 = 机械/接线不对齐，先处理硬件（AS5600_INVERT_DIR）再继续 | |
 | C4 | 符号约定（protocol.md §符号约定） | `py vel 200 --hold 1` 记实际方向 = +x；手掰摆顶同向看 theta | theta 同向增大；VEL −200 反向 | |
@@ -77,7 +76,7 @@ idf.py -B build flash
 ## 阶段 D：标定值写回端侧
 
 C1–C6 结果写入 `deploy/v2/edge/config.h`（会话推送值）：
-`POLE_ZERO_URAD / POLE_INV / X_INV / SGTHRS`（及实测微调的
+`POLE_ZERO_URAD / POLE_INV / X_INV`（及实测微调的
 `STEP_LOSS_UM`）。随后按 `docs/reviews/T10-acceptance.md` 走
 端到端五用例（含 PC 端侧程序经 CH343P 直连的全形态 CLI）。
 若 PC 侧串口设备名与 `CFG_SERIAL_PORT` 不符，一并更新。
@@ -85,9 +84,9 @@ C1–C6 结果写入 `deploy/v2/edge/config.h`（会话推送值）：
 ## 未决事项出口（本清单完成时逐项关闭）
 
 1. MT6835 帧格式 → A4 关闭（手册已核对，实测为准）。
-2. StallGuard 低速可靠性（50 mm/s ≈ 1.25 rps）→ C1/C3 判定；
-   不触发则提 HOME_VEL 或改 C−E 判据（protocol.md 未决事项路径）。
-3. SGTHRS/STEP_LOSS_UM 初值 → C2/C3 实测回填。
+2. StallGuard 低速可靠性 → 已裁决改位置偏差判据（`homing-spec.md`），
+   本项关闭；C1 验证新判据。
+3. `STEP_LOSS_UM` 初值（兼 HOMING 到位阈值）→ C1/C3 实测回填。
 4. 460800 联调 → A8 已过（200.7 Hz / UNKNOWN 0 / 漂移 20 µm，
    10 s 窗口）；余 C10 600 s 长跑复核，不过则 230400（两端同步改）。
 5. 步进 ISR 吞吐上限 vs VEL_MAX（默认 1000 mm/s ≈ 40 kHz 步频）：
