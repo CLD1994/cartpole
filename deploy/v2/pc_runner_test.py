@@ -225,6 +225,23 @@ static volatile sig_atomic_t g_stop;
 """
 
 
+class FrameFixTest(unittest.TestCase):
+    """部署边界符号映射：θ、θ̇ 取反，x、ẋ 与动作不变
+    （桌面刚体仿真判别实验定案，见 sim2real-spec 符号映射）。"""
+
+    def test_theta_channels_negated_others_kept(self):
+        obs = (0.123, -3.14, 0.5, -1.2)
+        self.assertEqual(
+            pc_runner.to_policy_frame(obs), (0.123, 3.14, 0.5, 1.2)
+        )
+
+    def test_involution(self):
+        obs = (1.0, -2.0, 3.0, -4.0)
+        self.assertEqual(
+            pc_runner.to_policy_frame(pc_runner.to_policy_frame(obs)), obs
+        )
+
+
 class EdgeConstantLoaderTest(unittest.TestCase):
     """加载器输入是文本；对真实文件的解析由运行时自校验，不属单元层。"""
 

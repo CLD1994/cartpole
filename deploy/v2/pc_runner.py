@@ -23,6 +23,10 @@ policy.onnx，normalizer 已烘焙进图，输入顺序 [x, θ, ẋ, θ̇]）。
 安全语义与 edge/main.c 逐条对齐；常量不在此处另立权威——默认值从
 edge/config.h 与 edge/rig.c 的 CFG_FW_PARAMS 表解析（失败即拒绝启动），
 CLI 可临时覆盖。固件侧另有看门狗、软限位、STEP_LOSS 兜底。
+
+部署边界符号映射（2026-09-25 实机定案，详见 sim2real-spec）：训练侧摆角
+正方向与实机相反（仅角量），观测送入模型前对 θ、θ̇ 取反，x、ẋ 与动作
+不变。默认开启；--no-frame-fix 仅在训练侧改为实机同向约定并重训后使用。
 """
 
 from __future__ import annotations
@@ -139,6 +143,16 @@ def build_obs(x_um: int, theta_urad: int, vx_mm_s: int, vth_mrad_s: int):
         vx_mm_s * 1e-3,
         vth_mrad_s * 1e-3,
     )
+
+
+def to_policy_frame(obs):
+    """实机观测 -> 策略坐标系：θ、θ̇ 取反，x、ẋ 与动作不变。
+
+    训练侧摆角正方向与实机约定相反（摆顶向 −x 为正），线位置/线速度
+    与动作符号一致。判别依据：桌面刚体仿真七候选映射实验中本映射唯一
+    全存活（其余 ~1 s 内倒下），实机闭环已排除恒等映射。详见
+    sim2real-spec「部署边界符号映射」。"""
+    return (obs[0], -obs[1], obs[2], -obs[3])
 
 
 def gate_reason(
@@ -421,9 +435,17 @@ def run_loop(rig: Rig, policy: PolicyOnnx, args) -> dict:
         "[pc] policy loop at %.0f Hz%s. Ctrl+C to stop."
         % (args.hz, " (dry-run: 不发 VEL)" if args.dry_run else "")
     )
+    print("[pc] 部署边界符号映射(θ,θ̇ 取反): %s" % ("开" if args.frame_fix else "关"))
+    last_mode, last_reason = rig.mode, rig.reason
     try:
         while True:
             rig.pump()
+            if rig.mode_known and (rig.mode, rig.reason) != (last_mode, last_reason):
+                print(
+                    "[pc] 固件模式变化: %s %s -> %s %s"
+                    % (last_mode, last_reason or "NONE", rig.mode, rig.reason or "NONE")
+                )
+                last_mode, last_reason = rig.mode, rig.reason
             tel = rig.last_state
             age = rig.state_age_s()
             reason = None
@@ -459,7 +481,9 @@ def run_loop(rig: Rig, policy: PolicyOnnx, args) -> dict:
             v_mm_s = 0
             action = None
             if tel is not None:
-                action = policy.forward(obs)
+                # 模型接口走策略坐标系（θ/θ̇ 取反），门控/统计/显示保持实机坐标系
+                model_obs = to_policy_frame(obs) if args.frame_fix else obs
+                action = policy.forward(model_obs)
                 stats["infer"] += 1
                 # dry-run 下计算「本应发送」的指令仅供核对显示；被门控
                 # 拦截的正常模式置零。两种情况都不在这里发送。
@@ -479,11 +503,12 @@ def run_loop(rig: Rig, policy: PolicyOnnx, args) -> dict:
             if stats["ticks"] % args.print_every == 0 and tel is not None:
                 label = reason if reason is not None else ("dry" if args.dry_run else "drive")
                 print(
-                    "[pc] t=%5.1fs x=%+.3fm θ=%+6.2f° a=%+.3f v=%+4dmm/s (%s)"
+                    "[pc] t=%5.1fs x=%+.3fm θ=%+6.2f° θ̇=%+5.2frad/s a=%+.3f v=%+4dmm/s (%s)"
                     % (
                         time.perf_counter() - t0,
                         obs[0],
                         math.degrees(obs[1]),
+                        obs[3],
                         action if action is not None else 0.0,
                         v_mm_s,
                         label,
@@ -548,6 +573,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dry-run", action="store_true", help="只组装观测跑推理打印动作，不发 VEL"
     )
+    parser.add_argument(
+        "--no-frame-fix",
+        action="store_true",
+        help="关闭部署边界符号映射（仅在训练侧已改为实机同向约定时使用）",
+    )
     parser.add_argument("--print-every", type=int, default=40, help="状态行间隔拍数")
     return parser
 
@@ -574,9 +604,10 @@ def main(argv=None) -> int:
         args.engage_rad if args.engage_rad is not None
         else cfg["ENGAGE_ANGLE_RAD"]
     )
+    args.frame_fix = not args.no_frame_fix
     print(
         "[pc] 配置: %.0f Hz, V_MAX=%.2f m/s, engage=%.3f rad (%.1f°), "
-        "track=±%.3f m, state_timeout=%.2f s"
+        "track=±%.3f m, state_timeout=%.2f s, frame_fix=%s"
         % (
             args.hz,
             args.v_max_mps,
@@ -584,6 +615,7 @@ def main(argv=None) -> int:
             math.degrees(args.engage_rad),
             args.track_limit_m,
             args.state_timeout_s,
+            "开" if args.frame_fix else "关",
         )
     )
     print("[pc] 会话参数推送集（%d 项，来自 edge/rig.c）" % len(params))
