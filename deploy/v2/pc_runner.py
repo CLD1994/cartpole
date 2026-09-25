@@ -339,9 +339,18 @@ class PolicyOnnx:
         if not path.is_file():
             raise RuntimeError("模型文件不存在: %s" % path)
         self._np = np
-        self._sess = ort.InferenceSession(
-            str(path), providers=["CPUExecutionProvider"]
-        )
+        try:
+            self._sess = ort.InferenceSession(
+                str(path), providers=["CPUExecutionProvider"]
+            )
+        except Exception as exc:
+            if "External data path" in str(exc):
+                raise RuntimeError(
+                    "模型权重在伴生外部数据 %s.data 中，主文件只含图结构；"
+                    "请把训练机 exported/ 目录内的 .data 伴生文件/目录连同"
+                    " policy.onnx 一起拷贝并保持同名相邻" % path.name
+                ) from exc
+            raise RuntimeError("onnxruntime 加载失败: %s" % exc) from exc
         inputs = self._sess.get_inputs()
         outputs = self._sess.get_outputs()
         if len(inputs) != 1 or len(outputs) != 1:
