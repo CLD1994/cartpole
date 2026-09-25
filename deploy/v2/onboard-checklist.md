@@ -47,11 +47,11 @@ idf.py -B build-flowtest flash monitor
 
 | # | 检查项 | 预期 | 记录 |
 |---|---|---|---|
-| B1 | cartfsm 流程自测 | `SELF-TEST DONE: 7/7 PASS`（注入到位→READY+原点 −265000 µm；未达速偏差→FAULT/STEP_LOSS；超时→FAULT；AS5600 失联→FAULT（日志含耗时 ms，设计 ≤15）；丢步注入→FAULT；RESET 后重 HOME；挪车重回零（入口重锚）） | 失联耗时: | 5/5（旧用例集）；失联→FAULT+EN 关 10 ms |
-| B2 | FAULT 次序 | 日志/MODE 行序：目标置 0 → EN 关 → `MODE FAULT <reason>` | | MODE 序列完整对应 5 用例；HOME_TIMEOUT/AS5600/STEP_LOSS 原因码全部正确（2026-09-25） |
+| B1 | cartfsm 流程自测 | `SELF-TEST DONE: 7/7 PASS`（标定正路径→READY；无左标与 L 非法拒且状态保持；上电未标定 ENABLE 拒；重开标定；READY 偏差→FAULT/STEP_LOSS；AS5600 失联→FAULT（日志含耗时 ms，设计 ≤15）；RESET 后直接 ENABLE 恢复） | 失联耗时: |
+| B2 | FAULT 次序 | 日志/MODE 行序：目标置 0 → EN 关 → `MODE FAULT <reason>` | |
 | B3 | 行中 `\r` 注入 | 串口发送 `VE\rL 200\n` 与 130 字节乱码+`\n` | 均无任何命令执行、无输出（重同步生效） | `VE\rL 200\n`：无任何回应行 ✓；乱码组待补 |
 
-## 阶段 C：正式固件 + 台位标定（机械在位、12V）
+## 阶段 C：正式固件 + 两点标定（机械在位、12V）
 
 ```powershell
 idf.py -B build build
@@ -59,34 +59,36 @@ idf.py -B build flash
 ```
 
 工具 `py` = `python tools/cartpole_host.py --port <COM> `。
+标定规程（每次上电执行，RAM 标定断电丢失）：推最左 `py mark-left` →
+推最右 `py mark-right` → `py enable`。
 
 | # | 检查项 | 操作 | 预期 | 记录 |
 |---|---|---|---|---|
-| C1 | 到位判定验证 | `py home` 后小车走到挡块停住 | `MODE READY NONE`、x_um ≈ −265000；再验负路径：起点压挡块时 `py home` → FAULT STEP_LOSS（日志含挪车提示） | |
-| C3 | 回零散布 | `py home` ×5（间隔 `RESET`），读静止 x_um | 散布 ≤ 2000 µm | 各次 x_um: |
-| C3b | **E−C 域对齐关卡**（丢步判据结构前提：DIR 高时 AS5600 计数须增） | 回零后 `py vel 50 --hold 3`：x_um 增大（与 +x 命令同向）、全程无 STEP_LOSS 误报 | 方向一致、无误报；不符 = 机械/接线不对齐，先处理硬件（AS5600_INVERT_DIR）再继续 | |
-| C4 | 符号约定（protocol.md §符号约定） | `py vel 200 --hold 1` 记实际方向 = +x；手掰摆顶同向看 theta | theta 同向增大；VEL −200 反向 | |
-| C5 | 摆角零位 | 手扶摆杆机械直立，读 STATE theta | 读数 θ₀；标定值 = −θ₀ | θ₀: |
-| C6 | 标定落地 | `py config POLE_ZERO_URAD <−θ₀>`（及 C1–C4 所得 POLE_INV/X_INV）后复核 | 直立 theta≈0；VEL 200 方向与 theta 符号符合约定 | |
-| C7 | 看门狗 | `py wdt-test` | ~100 ms 减速到 0；QUERY 回 `MODE READY NONE`；恢复发送继续跟踪 | |
-| C8 | 收紧立即生效 | READY 中 `py config X_LIMIT 10000`，再 `py vel 200` | 越界即停向外分量 | |
-| C9 | 拔线观察（台位可承受时） | READY 中拔 AS5600（再拔 MT6835） | ≤15 ms FAULT 对应 reason、EN 关、**STATE 流不断**（θ 恒有效） | 耗时: |
-| C10 | 长稳 | `py state --secs 600` | 199–201 Hz、UNKNOWN=0、无 reboot | |
+| C1 | 标定正路径 | 推最左 `py mark-left` → 推最右 `py mark-right` → `py enable` | 两 `OK` 回显（L ≈ 530 mm）；`MODE READY NONE`；`py state` 静止 x_um ≈ +L/2，回中后 ≈ 0 | L: |
+| C2 | 标定负路径 | 先右后左再标、两点重合、未标定即 `py enable` | 均回 `ERR`，状态不变 | |
+| C3 | 域对齐 | `py vel 50 --hold 1` 记实际方向 = +x | x_um 增大（L 为正已保证 E 域；此处核指令域，反了改 X_INV） | |
+| C4 | 符号约定 | 同向手掰摆顶看 theta | theta 同向增大；`VEL −50` 反向 | |
+| C5 | 摆角零位 | 手扶摆杆机械直立读 STATE theta | 读数 θ₀；标定值 = −θ₀ | θ₀: |
+| C6 | 标定落地 | `py config POLE_ZERO_URAD <−θ₀>`（及 POLE_INV/X_INV）后复核 | 直立 theta≈0；VEL 50 方向与 theta 符号符合约定 | |
+| C7 | 软限位 | 右端 `py vel 200` / `py vel -200`；左端对称 | 向外钳制不动、向内可动 | |
+| C8 | 标定重复性 | 同一端点重复标记 3 次读回显 | 散布 ≤ 100 µm | |
+| C9 | 看门狗 | `py wdt-test` | ~100 ms 减速到 0；QUERY 回 READY NONE；恢复发送继续跟踪 | |
+| C10 | 丢步/拔线/长稳 | READY 中手推小车 ≥3 mm（STEP_LOSS）；拔 AS5600（再拔 MT6835）；`py state --secs 600` | 手推 ≤ T/|v| 内 FAULT STEP_LOSS；拔线 ≤15 ms FAULT 对应 reason、EN 关、STATE 流不断；200 Hz 无 reboot | 手推耗时: 拔线耗时: |
 
 ## 阶段 D：标定值写回端侧
 
-C1–C6 结果写入 `deploy/v2/edge/config.h`（会话推送值）：
+C3–C6 结果写入 `deploy/v2/edge/config.h`（会话推送值）：
 `POLE_ZERO_URAD / POLE_INV / X_INV`（及实测微调的
-`STEP_LOSS_UM`）。随后按 `docs/reviews/T10-acceptance.md` 走
+`STEP_LOSS_UM`、`X_MARGIN_UM` 如需）。随后按 `docs/reviews/T10-acceptance.md` 走
 端到端五用例（含 PC 端侧程序经 CH343P 直连的全形态 CLI）。
 若 PC 侧串口设备名与 `CFG_SERIAL_PORT` 不符，一并更新。
 
 ## 未决事项出口（本清单完成时逐项关闭）
 
 1. MT6835 帧格式 → A4 关闭（手册已核对，实测为准）。
-2. StallGuard 低速可靠性 → 已裁决改位置偏差判据（`homing-spec.md`），
-   本项关闭；C1 验证新判据。
-3. `STEP_LOSS_UM` 初值（兼 HOMING 到位阈值）→ C1/C3 实测回填。
+2. 堵转检测 → 运行中堵转/丢步由 STEP_LOSS 判据捕获（READY 中
+   |E−C| 越限即 FAULT）；验证见 C10。
+3. `STEP_LOSS_UM` 初值 → C1/C7 实测回填。
 4. 460800 联调 → A8 已过（200.7 Hz / UNKNOWN 0 / 漂移 20 µm，
    10 s 窗口）；余 C10 600 s 长跑复核，不过则 230400（两端同步改）。
 5. 步进 ISR 吞吐上限 vs VEL_MAX（默认 1000 mm/s ≈ 40 kHz 步频）：
@@ -97,3 +99,4 @@ C1–C6 结果写入 `deploy/v2/edge/config.h`（会话推送值）：
    优化（GPIO W1TS/W1TC + 定时器 alarm 直写，预估合计 ~20 µs ≈
    50 kHz ≈ 1.25 m/s）；间隔采样自测为安全网。优化完成后本条关闭
    并记录实测新上限。
+6. 标定重复性 → C8 实测回填（散布 ≤ 100 µm 为传感器噪声级）。
