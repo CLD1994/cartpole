@@ -219,6 +219,85 @@ static int oneshot_state(void)
     return 0;
 }
 
+/* 窗口统计（与 host 工具 state --secs 同口径）：行率、无法解析行数、
+ * x/θ 走过的范围。θ 逐端换算为角度——±π 环绕边界处 min/max 分居两侧，
+ * 各自换算才有意义。判定同 host：199–201 Hz 且 unknown=0。 */
+static int oneshot_state_window(double secs)
+{
+    if (rig_wait_state(1.0) != 0) {
+        fprintf(stderr, "[edge] no STATE stream\n");
+        return 1;
+    }
+    rig_window_reset();
+    int64_t x, th, vx, vth;
+    int64_t xmin = INT64_MAX, xmax = INT64_MIN;
+    int64_t thmin = INT64_MAX, thmax = INT64_MIN;
+    double t0 = rig_now_s();
+    while (!rig_stop_requested() && rig_now_s() - t0 < secs) {
+        rig_pump();
+        rig_telemetry(&x, &th, &vx, &vth);
+        if (x < xmin) { xmin = x; }
+        if (x > xmax) { xmax = x; }
+        if (th < thmin) { thmin = th; }
+        if (th > thmax) { thmax = th; }
+        nap_ms(20);
+    }
+    double dt = rig_now_s() - t0;
+    double rate = dt > 0.0 ? (double)rig_state_count() / dt : 0.0;
+    long unknown = rig_unknown_count();
+    printf("[edge] window %.1f s: %ld STATE lines -> %.1f Hz (target 200)\n",
+           dt, rig_state_count(), rate);
+    printf("[edge] unknown lines: %ld (require 0)\n", unknown);
+    printf("[edge] x range [%lld, %lld] um  (x = %.2f .. %.2f mm)\n",
+           (long long)xmin, (long long)xmax, xmin / 1000.0, xmax / 1000.0);
+    printf("[edge] theta range [%lld, %lld] urad  (theta = %.2f .. %.2f deg)\n",
+           (long long)thmin, (long long)thmax, thmin / 17453.3, thmax / 17453.3);
+    return (rate >= 199.0 && rate <= 201.0 && unknown == 0) ? 0 : 1;
+}
+
+/* 看门狗断流验证（与 host 工具 wdt-test 同流程）：以 200 mm/s 持续喂狗
+ * 1 s，随后停止发送观察 1 s——固件看门狗应减速停车但模式保持 READY。 */
+static int oneshot_wdt_test(void)
+{
+    if (rig_sync_mode(1.0) != 0) {
+        fprintf(stderr, "[edge] no MODE reply (QUERY timed out)\n");
+        return 1;
+    }
+    int known;
+    fw_reason_t reason;
+    fw_mode_t mode = rig_mode(&known, &reason);
+    if (!known || mode != FW_READY) {
+        fprintf(stderr, "[edge] wdt-test requires READY (current %s)\n",
+                known ? proto_mode_name(mode) : "unknown");
+        return 1;
+    }
+    if (rig_wait_state(CFG_STATE_TIMEOUT_S) != 0) {
+        fprintf(stderr, "[edge] no STATE stream\n");
+        return 1;
+    }
+    double t0 = rig_now_s();
+    while (!rig_stop_requested() && rig_now_s() - t0 < 1.0) {
+        rig_send_vel(200.0);
+        rig_pump();
+        nap_ms(5);
+    }
+    printf("[edge] feeding stopped, observing 1 s ...\n");
+    t0 = rig_now_s();
+    while (!rig_stop_requested() && rig_now_s() - t0 < 1.0) {
+        rig_pump();
+        nap_ms(20);
+    }
+    if (rig_sync_mode(1.0) != 0) {
+        fprintf(stderr, "[edge] QUERY timed out after watchdog window\n");
+        return 1;
+    }
+    mode = rig_mode(&known, &reason);
+    printf("[edge] QUERY -> %s %s (expect READY NONE: watchdog is a transient guard)\n",
+           known ? proto_mode_name(mode) : "unknown",
+           known ? proto_reason_name(reason) : "-");
+    return (known && mode == FW_READY && reason == FW_REASON_NONE) ? 0 : 1;
+}
+
 static int oneshot_vel(double v_mm_s, double hold_s)
 {
     if (rig_sync_mode(1.0) != 0) {
@@ -304,10 +383,13 @@ static void print_usage(const char *prog)
             "  enable                           one-shot: ENABLE after calibration, wait READY\n"
             "  center                           one-shot: move cart to track center (needs READY)\n"
             "  vel <mm/s> [--hold s]            one-shot: hold velocity for s seconds (default 1.0)\n"
-            "  state                            one-shot: print latest STATE snapshot\n"
+            "  state [--secs s]                one-shot: STATE snapshot, or s-second window stats"
+            " (rate/unknown/ranges)\n"
             "  query                            one-shot: print firmware mode\n"
             "  config [NAME VALUE]              one-shot: set one param, or dump all with no args\n"
-            "  reset                            one-shot: clear FAULT\n",
+            "  reset                           one-shot: clear FAULT\n"
+            "  wdt-test                        one-shot: watchdog drop test (needs READY;"
+            " cart moves ~200 mm/s for 1 s)\n",
             prog);
 }
 
@@ -352,11 +434,24 @@ static int dispatch(const char *cmd, int argc, char **argv, int first)
         return console_exec(&req) == 0 ? 0 : 1;
     }
     if (strcmp(cmd, "state") == 0) {
-        if (nargs != 0) {
-            fprintf(stderr, "[edge] state takes no arguments\n");
+        double secs = 0.0;
+        if (nargs == 2 && strcmp(argv[first + 1], "--secs") == 0) {
+            if (parse_duration(argv[first + 2], &secs) != 0 || secs <= 0.0) {
+                print_usage(prog);
+                return 1;
+            }
+        } else if (nargs != 0) {
+            print_usage(prog);
             return 1;
         }
-        return oneshot_state();
+        return secs > 0.0 ? oneshot_state_window(secs) : oneshot_state();
+    }
+    if (strcmp(cmd, "wdt-test") == 0) {
+        if (nargs != 0) {
+            fprintf(stderr, "[edge] wdt-test takes no arguments\n");
+            return 1;
+        }
+        return oneshot_wdt_test();
     }
     if (strcmp(cmd, "vel") == 0) {
         double hold = 1.0;
@@ -396,7 +491,8 @@ static int dispatch(const char *cmd, int argc, char **argv, int first)
 static int is_known_command(const char *cmd)
 {
     static const char *const names[] = {
-        "console", "run", "home", "center", "vel", "state", "query", "config", "reset",
+        "console", "run", "calib", "mark-left", "mark-right", "enable",
+        "center", "vel", "state", "query", "config", "reset", "wdt-test",
     };
     for (size_t k = 0; k < sizeof(names) / sizeof(names[0]); k++) {
         if (strcmp(cmd, names[k]) == 0) {

@@ -43,6 +43,10 @@ void rig_telemetry(int64_t *x_um, int64_t *theta_urad, int64_t *vx_mm_s,
 double rig_state_age_s(void); /* 距最近 STATE 的秒数；从未收到返回 -1 */
 double rig_now_s(void);       /* CLOCK_MONOTONIC 秒 */
 
-void rig_print_state(void); /* 打印一行最新遥测快照（协议原单位） */
+void rig_print_state(void); /* 打印一行最新遥测快照（原始整数 + 可读换算） */
+
+void rig_window_reset(void); /* 清零窗口计数器 */
+long rig_state_count(void);  /* 窗口内 STATE 行数 */
+long rig_unknown_count(void); /* 窗口内无法解析行数 */
 
 #endif /* EDGE_RIG_H */

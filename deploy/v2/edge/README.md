@@ -7,11 +7,11 @@
 ONNX → 量化 → policy.om ──scp──>  Hi3516CV610                ESP32-S3 固件
                                    cartpole_edge              ├─ 步进电机（TMC2209）
                                       │  ↑ STATE 200 Hz 遥测   ├─ AS5600 小车位置
-                                      │  ↓ VEL/HOME/CONFIG …   └─ MT6835 摆角（SPI）
+                                      │  ↓ VEL/MARK/ENABLE/CONFIG …   └─ MT6835 摆角（SPI）
                                       └───── UART 460800 8N1 ──┘
 ```
 
-职责划分：本程序负责策略推理、控制节奏与端侧门控；固件负责斜坡跟踪、命令看门狗、软限位、模式机与回零。两侧的安全语义是分层的，任何一侧的修改都应以 `deploy/v2/protocol.md` 为共同基准。
+职责划分：本程序负责策略推理、控制节奏与端侧门控；固件负责斜坡跟踪、命令看门狗、软限位、模式机与两点标定。两侧的安全语义是分层的，任何一侧的修改都应以 `deploy/v2/protocol.md` 为共同基准。
 
 ## 权威文档
 
@@ -52,9 +52,9 @@ ONNX → 量化 → policy.om ──scp──>  Hi3516CV610                ESP32
 
 | 形态 | 命令 | 用途 |
 |---|---|---|
-| 策略模式 | `run --model path.om [--no-home]` | 正式控制：加载模型、回零回中、200 Hz 控制环 |
-| 交互控制台 | 无子命令或 `console` | 维护与板端联调：逐条发协议命令，实时看 MODE 事件与回执，不接触 NPU |
-| 一次性子命令 | `home`/`center`/`vel`/`state`/`query`/`config`/`reset` | 脚本化单条命令，直接透传固件 |
+| 策略模式 | `run --model path.om` | 正式控制：加载模型（固件须已标定并 ENABLE 到 READY）、200 Hz 控制环 |
+| 交互控制台 | 无子命令或 `console` | 维护与板端联调：逐条发协议命令，实时看 MODE 事件与回执，不接触 NPU；`calib` 引导两点标定 |
+| 一次性子命令 | `calib`/`mark-left`/`mark-right`/`enable`/`center`/`vel`/`state`/`query`/`config`/`reset`/`wdt-test` | 脚本化单条命令，直接透传固件 |
 
 参数推送策略：run 与 console 在会话开始推送 `CFG_FW_PARAMS` 表（参数权威在端侧，见 `config.h` 一节）；一次性子命令不推送——输入什么就发什么，便于隔离测试固件默认行为。
 
@@ -66,7 +66,7 @@ ONNX → 量化 → policy.om ──scp──>  Hi3516CV610                ESP32
 2. `policy_init` 初始化 SVP ACL 运行时（`svp_acl_init` + `svp_acl_rt_set_device(0)`）并加载 `.om` 模型（`--model` 必填，加载失败即退出，不降级）。
 3. 发 `QUERY` 同步固件当前模式（1 秒内无应答则判定固件未运行）。
 4. 按次序推送 `CFG_FW_PARAMS` 全部参数（逐条 `CONFIG`，间隔 10 ms 防淹没；`ERR` 应答打印告警但不中断）。
-5. 若固件处于 DISABLED 且未指定 `--no-home`：发 `HOME` 等 `MODE READY`（35 秒超时，对应固件 `HOME_TIMEOUT` 30 秒加裕量），随后以 `CFG_CENTER_VEL_MMS` 把小车从回零点（−265 mm）移回行程中点。
+5. 若固件未处于 READY：报错退出并提示——DISABLED 需先两点标定（`calib`，或 `mark-left` → 推右端 → `mark-right` → `enable`），FAULT 需先 `reset` 再重新 `enable`。`run` 不做标定、不自动回零。
 6. 进入控制环，提示操作者把摆杆扶到直立附近接管。
 
 ### 控制台与一次性命令
@@ -75,14 +75,16 @@ ONNX → 量化 → policy.om ──scp──>  Hi3516CV610                ESP32
 
 | 命令 | 行为 |
 |---|---|
-| `vel <mm/s>` | 控制台：设定持续保持的目标速度，程序每 20 ms 重发喂固件看门狗（`WDT_MS` 100），直到改目标、离开 READY、STATE 过期或退出。QUERY/STATE 等只读命令不打断保持；HOME/CENTER/RESET/CONFIG 会先释放保持 |
+| `calib` | 交互式两点标定：提示把小车推到左端 `MARK LEFT` → 推到右端 `MARK RIGHT` → `ENABLE` 等 READY；参数合法性由固件判定，回执逐条打印 |
+| `mark-left` / `mark-right` / `enable` | 标定原子步骤（控制台与子命令同名），用于脚本化或分步执行；`enable` 等 MODE READY |
+| `vel <mm/s>` | 控制台：设定持续保持的目标速度，程序每 20 ms 重发喂固件看门狗（`WDT_MS` 100），直到改目标、离开 READY、STATE 过期或退出。QUERY/STATE 等只读命令不打断保持；标定/使能/回中/清障/设参类命令会先释放保持 |
 | `vel <mm/s> --hold <s>`（仅子命令） | 定时保持：持续重发 s 秒（默认 1.0）后发 `VEL 0` 退出；期间离开 READY 或 STATE 过期立即停车并以非零码退出 |
-| `home` / `home --center`（子命令） | 发 `HOME` 等 READY（35 秒超时；要求当前 DISABLED）；`--center` 追加回中 |
 | `center` | 以 `CFG_CENTER_VEL_MMS` 移回行程中点（要求 READY） |
-| `state` | 打印最新遥测快照（协议原单位 + 新鲜度 + 模式） |
+| `state` / `state --secs s`（仅子命令） | 打印最新遥测快照（原始整数 + 可读换算 + 新鲜度 + 模式）；带 `--secs` 输出 s 秒窗口统计：行率（判 199–201 Hz）、无法解析行数（判 0）、x/θ 走过的范围（θ 逐端换算角度，±π 环绕处 min/max 分居两侧） |
 | `query` | 发 `QUERY`，打印 `MODE <mode> <reason>` |
 | `config` / `config NAME VALUE` | 全量 dump（发 `CONFIG?`，收集 0.5 秒应答）/ 设单参数并等回执 |
 | `reset` | 清 FAULT 回 DISABLED（要求当前 FAULT） |
+| `wdt-test`（仅子命令） | 看门狗断流验证：200 mm/s 喂狗 1 s → 停喂观察 1 s → QUERY 应答应为 READY NONE（看门狗是瞬态保护不改模式）；要求 READY，期间小车会动 |
 
 保持类速度命令启动前都会先等 STATE 流就位：「从未收到」与「已过期」是两个状态——前者等 `CFG_STATE_TIMEOUT_S` 后报无流退出，后者立即停车。控制台里 MODE 转换与 OK/ERR 回执始终打印，200 Hz STATE 流不刷屏（`state` 按需查看）。控制台与 run 退出（quit/Ctrl+D/Ctrl+C）统一发 `VEL 0`；一次性命令不在退出时干预电机（vel 自身管理起停）。
 
@@ -114,7 +116,7 @@ SIGINT、SIGTERM、推理失败、启动序列任何一步失败，都汇入同�
 | `CFG_V_MAX_MPS` | 0.5 | 动作尺度，**必须等于训练 `V_MAX_SIM` 随机化上界**（当前 0.4–0.5 取上界；上界压在 ISR 实测可持续速度 ≈0.55 m/s 之下） |
 | `CFG_TRACK_LIMIT_M` | 0.260 | 端侧软限位，与固件参数 `X_LIMIT` 保持一致（端侧再挡一层向外速度） |
 | `CFG_ENGAGE_ANGLE_RAD` | 0.524（30°） | 策略接管门限；大于训练可捕获角（约 ±15–20°），仅作为驱动许可而非恢复能力 |
-| `CFG_CENTER_VEL_MMS` | 100 | 回零后把小车移回行程中点的速度 |
+| `CFG_CENTER_VEL_MMS` | 100 | 标定 ENABLE 后把小车从端点移回行程中点的速度 |
 | `CFG_FW_PARAMS[]` | 见 `main.c` | 会话启动时经 `CONFIG` 推送的固件参数表。**参数权威在端侧**：固件只持默认值；表中每项的值必须落在协议注册表的合法范围内，否则固件回 `ERR` |
 
 固件参数表当前推送 7 项（`VEL_MAX` 1000、`ACC_MAX` 5000、`WDT_MS` 100、`WDT_DEC` 5000、`HOME_VEL` 50、`HOME_TIMEOUT` 30000、`X_LIMIT` 260000）。新增固件参数需要三处联动：本表、`../protocol.md` 注册表、固件实现。
@@ -164,16 +166,18 @@ bash deploy/v2/edge/build.sh
 | 命令 | 说明 |
 |---|---|
 | （无子命令）/ `console` | 交互控制台（默认形态，见「控制台与一次性命令」） |
-| `run --model path.om [--no-home]` | 策略模式（`--model` 必填） |
-| `home [--center]` | 一次性：回零等 READY，`--center` 追加回中 |
+| `run --model path.om` | 策略模式（`--model` 必填；固件须已 READY） |
+| `calib` | 一次性：交互式两点标定（MARK LEFT/RIGHT + ENABLE） |
+| `mark-left` / `mark-right` / `enable` | 一次性：标定原子步骤 |
 | `center` | 一次性：移回行程中点（要求 READY） |
 | `vel <mm/s> [--hold s]` | 一次性：保持速度 s 秒（默认 1.0）后停车 |
-| `state` | 一次性：打印最新遥测快照 |
+| `state [--secs s]` | 一次性：遥测快照，或 s 秒窗口统计 |
 | `query` | 一次性：打印固件当前模式 |
 | `config [NAME VALUE]` | 一次性：设单个参数，或无参数全量 dump |
 | `reset` | 一次性：清除 FAULT |
+| `wdt-test` | 一次性：看门狗断流验证（要求 READY，小车会动） |
 
-控制台内命令为同名全小写形式（`vel`/`home`/`center`/`state`/`query`/`config`/`reset`/`help`/`quit`）。正常演示流程（含 FAULT 恢复）见 `../protocol.md` 的「操作流程」一节。
+控制台内命令为同名全小写形式（`calib`/`mark-left`/`mark-right`/`enable`/`vel`/`center`/`state`/`query`/`config`/`reset`/`help`/`quit`）。正常演示流程（含 FAULT 恢复）见 `../protocol.md` 的「操作流程」一节。
 
 ## 维护者须知
 

@@ -28,6 +28,8 @@ static proto_rx_t g_rx;
 /* 遥测快照（STATE 行更新，各形态消费最新值） */
 static int64_t g_x_um, g_theta_urad, g_vx_mm_s, g_vth_mrad_s;
 static double g_state_t = -1.0; /* 最近 STATE 时刻 [s, monotonic] */
+static long g_state_count;   /* 窗口统计（rig_window_reset 清零） */
+static long g_unknown_count;
 
 /* 控制面：最后已知固件模式（MODE 事件与 QUERY 应答维护） */
 static fw_mode_t g_mode = FW_DISABLED;
@@ -108,7 +110,8 @@ static void handle_line(const char *line, size_t len, void *user)
     (void)user;
     proto_msg_t m;
     if (proto_parse_line(line, &m) == PROTO_UNKNOWN) {
-        return; /* 非法行静默丢弃 */
+        g_unknown_count++; /* 窗口统计用（state --secs）；解析层仍静默丢弃 */
+        return;
     }
     switch (m.type) {
     case PROTO_STATE:
@@ -117,6 +120,7 @@ static void handle_line(const char *line, size_t len, void *user)
         g_vx_mm_s = m.vx_mm_s;
         g_vth_mrad_s = m.vth_mrad_s;
         g_state_t = rig_now_s();
+        g_state_count++;
         break;
     case PROTO_MODE: {
         fw_mode_t prev = g_mode;
@@ -300,7 +304,26 @@ void rig_print_state(void)
         printf("no STATE received yet\n");
         return;
     }
-    printf("x=%+lld um  theta=%+lld urad  vx=%+lld mm/s  vth=%+lld mrad/s  age=%.0f ms  mode=%s\n",
-           (long long)x, (long long)th, (long long)vx, (long long)vth, age * 1000.0,
+    /* 原始整数保留（协议口径），并附人类可读换算（µm→mm、µrad→°） */
+    printf("x=%+lld um (x = %+.2f mm)  theta=%+lld urad (theta = %+.2f deg)"
+           "  vx=%+lld mm/s  vth=%+lld mrad/s  age=%.0f ms  mode=%s\n",
+           (long long)x, x / 1000.0, (long long)th, th / 17453.3,
+           (long long)vx, (long long)vth, age * 1000.0,
            known ? proto_mode_name(m) : "unknown");
+}
+
+void rig_window_reset(void)
+{
+    g_state_count = 0;
+    g_unknown_count = 0;
+}
+
+long rig_state_count(void)
+{
+    return g_state_count;
+}
+
+long rig_unknown_count(void)
+{
+    return g_unknown_count;
 }
