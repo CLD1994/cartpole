@@ -191,10 +191,24 @@ static int send_and_await(const char *cmd)
     return 0;
 }
 
+/* 模式未知时先 QUERY 同步（一次性命令是新进程、控制台首条命令同理）。
+ * 返回 0 表示模式已知，-1 表示 QUERY 超时。 */
+static int ensure_mode_known(void)
+{
+    int known;
+    rig_mode(&known, NULL);
+    if (known) {
+        return 0;
+    }
+    return rig_sync_mode(1.0) == 0 ? 0 : -1;
+}
+
 int console_exec(const console_req_t *req)
 {
     switch (req->cmd) {
     case CONSOLE_CMD_CALIB: {
+        /* 同步失败时保持原行为：前置检查跳过，由固件对 MARK 的拒绝兜底 */
+        (void)ensure_mode_known();
         int known;
         fw_mode_t m = rig_mode(&known, NULL);
         if (known && m != FW_DISABLED) {
@@ -273,15 +287,19 @@ int console_exec(const console_req_t *req)
         }
         return rig_wait_reply(1.0) == 0 ? 0 : -1;
     case CONSOLE_CMD_RESET: {
+        if (ensure_mode_known() != 0) {
+            fprintf(stderr, "[edge] no MODE reply (QUERY timed out)\n");
+            return -1;
+        }
         int known;
         fw_mode_t m = rig_mode(&known, NULL);
         if (known && m == FW_DISABLED) {
             printf("[edge] already DISABLED\n");
             return 0;
         }
-        if (!known || m != FW_FAULT) {
+        if (m != FW_FAULT) {
             fprintf(stderr, "[edge] RESET only clears FAULT (current %s)\n",
-                    known ? proto_mode_name(m) : "unknown");
+                    proto_mode_name(m));
             return -1;
         }
         if (rig_send_simple("RESET") != 0) {
@@ -333,9 +351,14 @@ static int handle_line(const char *line, int *holding, double *held_vel)
     case CONSOLE_CMD_NONE:
         return 0;
     case CONSOLE_CMD_VEL:
-        /* 保持前先等到 STATE 流就位（与一次性 vel 子命令同语义） */
+        /* 保持前先等 STATE 流就位、模式已知（与一次性 vel 子命令同语义）：
+         * tick_hold 对未知模式会立即释放保持，首条命令必须先 QUERY 同步 */
         if (rig_wait_state(CFG_STATE_TIMEOUT_S) != 0) {
             printf("[edge] WARNING: no STATE stream, ignoring vel\n");
+            return 0;
+        }
+        if (ensure_mode_known() != 0) {
+            printf("[edge] WARNING: no MODE reply, ignoring vel\n");
             return 0;
         }
         *holding = 1;
