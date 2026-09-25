@@ -24,23 +24,25 @@
 标定命令仅 DISABLED 态接受（EN 关，操作者可自由手推小车）：
 
 ```
-MARK LEFT\n     记当前 E 为左端，回 OK MARK LEFT <E µm>
-MARK RIGHT\n    记右端并完成标定，回 OK MARK RIGHT <L µm>
+MARK LEFT\n     记当前 E 为左端，回 OK MARK_LEFT <E µm>
+MARK RIGHT\n    记右端并完成标定，回 OK MARK_RIGHT <L µm>
 ENABLE\n        标定完成后使能进 READY，推 MODE READY NONE
 ```
 
 回执原则：有 `OK` 回执的命令（`CONFIG` / `MARK` / `ENABLE`）在拒绝时回
-`ERR <NAME>`；无回执命令（`VEL` / `RESET`）在不适用态静默忽略。
+`ERR <NAME>`；无回执命令（`VEL` / `RESET`）在不适用态静默忽略。回执
+NAME 为单 token（`MARK_LEFT` / `MARK_RIGHT` / `ENABLE`），与
+`OK <NAME> <value>` 的两字段语法一致——命令词是两个词，回执名是一个词。
 
 **标定决策表**（当前态 DISABLED）：
 
 | 标定状态 | 命令 | 结果 |
 |---|---|---|
 | 任意 | `MARK LEFT` | 记 `E_left = E`；状态 → `CAL_LEFT`；回 `OK MARK LEFT <E>`（重复标记即覆盖重开） |
-| `CAL_NONE` | `MARK RIGHT` | `ERR MARK RIGHT`（无左标） |
+| `CAL_NONE` | `MARK RIGHT` | `ERR MARK_RIGHT`（无左标） |
 | `CAL_LEFT` | `MARK RIGHT`，`L` 合法 | 记 `E_right = E`；状态 → `CAL_DONE`；**E/C 同帧重定基**：中点为 x=0（`E、C` 同帧换算，重定基后右端读 `+L/2`）；回 `OK MARK RIGHT <L>` |
-| `CAL_LEFT` | `MARK RIGHT`，`L` 非法 | `ERR MARK RIGHT`（保持 `CAL_LEFT`，左标值保留） |
-| `CAL_DONE` | `MARK RIGHT` | `ERR MARK RIGHT`（先 `MARK LEFT` 重开标定） |
+| `CAL_LEFT` | `MARK RIGHT`，`L` 非法 | `ERR MARK_RIGHT`（保持 `CAL_LEFT`，左标值保留） |
+| `CAL_DONE` | `MARK RIGHT` | `ERR MARK_RIGHT`（先 `MARK LEFT` 重开标定） |
 | `CAL_DONE` | `ENABLE` | → READY（见 §3） |
 | `CAL_NONE` / `CAL_LEFT` | `ENABLE` | `ERR ENABLE`（标定未完成） |
 
@@ -111,7 +113,8 @@ DISABLED 且 `CAL_DONE` 时 `ENABLE` 是进入 READY 的唯一路径，动作次
   回中 → 扶摆杆、策略接管；FAULT 后 `RESET` 回 DISABLED，标定仍有效，
   直接 `ENABLE` 恢复。
 - 端侧 `deploy/v2/edge/`：`rig.c` 的 `CFG_FW_PARAMS` 去掉
-  `HOME_VEL/HOME_TIMEOUT/X_LIMIT`（改为九项新集）；console 的回零流程
+  `HOME_VEL/HOME_TIMEOUT/X_LIMIT`（推送集变为四项运动参数，
+  `X_MARGIN_UM` 持固件默认无需推送）；console 的回零流程
   改为标定引导（`MARK LEFT → MARK RIGHT → ENABLE → 回中`）。
 - 上板清单 C 段改写为标定规程（见 §7）。
 
