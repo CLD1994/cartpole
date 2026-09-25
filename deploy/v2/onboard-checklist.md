@@ -47,7 +47,7 @@ idf.py -B build-flowtest flash monitor
 
 | # | 检查项 | 预期 | 记录 |
 |---|---|---|---|
-| B1 | cartfsm 流程自测 | `SELF-TEST DONE: 6/6 PASS`（注入到位→READY+原点 −265000 µm；未达速偏差→FAULT/STEP_LOSS；超时→FAULT；AS5600 失联→FAULT（日志含耗时 ms，设计 ≤15）；丢步注入→FAULT；RESET 后重 HOME） | 失联耗时: | 5/5（旧用例集）；失联→FAULT+EN 关 10 ms |
+| B1 | cartfsm 流程自测 | `SELF-TEST DONE: 7/7 PASS`（注入到位→READY+原点 −265000 µm；未达速偏差→FAULT/STEP_LOSS；超时→FAULT；AS5600 失联→FAULT（日志含耗时 ms，设计 ≤15）；丢步注入→FAULT；RESET 后重 HOME；挪车重回零（入口重锚）） | 失联耗时: | 5/5（旧用例集）；失联→FAULT+EN 关 10 ms |
 | B2 | FAULT 次序 | 日志/MODE 行序：目标置 0 → EN 关 → `MODE FAULT <reason>` | | MODE 序列完整对应 5 用例；HOME_TIMEOUT/AS5600/STEP_LOSS 原因码全部正确（2026-09-25） |
 | B3 | 行中 `\r` 注入 | 串口发送 `VE\rL 200\n` 与 130 字节乱码+`\n` | 均无任何命令执行、无输出（重同步生效） | `VE\rL 200\n`：无任何回应行 ✓；乱码组待补 |
 
