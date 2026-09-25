@@ -29,6 +29,12 @@ HOMING 到位判定阈值共用，不新增 HOME 专用阈值参数。
 `−HOME_VEL`（方向 −x），总时长由 `HOME_TIMEOUT` 把关，`RESET` 中止回零
 ——以上均为既有行为，不变。
 
+**HOME 入口重锚**：进入 HOMING 时固件把指令位置 `C` 整定到当前实测
+位置 `E`（引擎停止时整定），`D` 自入口从 0 起算。DISABLED 期间电机
+失电、小车可被手移，`C` 不再反映实况；不重锚则故障后的 `D` 残留使
+「挪车后重试」（§6 负路径恢复）与 protocol.md 操作流程第 7 步的
+FAULT→RESET→HOME 恢复环路不可达。
+
 **达速锁存 `latch`**：进入 HOMING 时清零；连续 2 拍满足
 `v_meas ≤ −0.8 × HOME_VEL`（含符号，回零方向 −x）即置位，置位后保持到
 离开 HOMING，不复位。2 拍约束用于抑制 AS5600 单拍计数噪声（±2 count
@@ -118,6 +124,7 @@ HOMING 到位判定阈值共用，不新增 HOME 专用阈值参数。
 | 未达速偏差 | HOME → `loss_bias` > `T`（锁存保持 0） | FAULT / `STEP_LOSS` |
 | READY 偏差 | READY → `loss_bias` > `T` | FAULT / `STEP_LOSS`（既有） |
 | 超时 / 失联 / RESET 中止 / 重回零 | 既有用例 | 不变（超时用例的持续运动断言保留） |
+| 挪车重回零 | HOMING 未达速偏差 FAULT → RESET → 清偏置重 HOME → 注入到位 | READY，静止 `x_um = −265000`（入口重锚回归锚） |
 
 `cm_step` 宿主向量同步：HOMING 完成事件的语义为「到位」，READY 不再
 消费该事件。

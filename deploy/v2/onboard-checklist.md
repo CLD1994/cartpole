@@ -67,7 +67,7 @@ idf.py -B build flash
 | C3b | **E−C 域对齐关卡**（丢步判据结构前提：DIR 高时 AS5600 计数须增） | 回零后 `py vel 50 --hold 3`：x_um 增大（与 +x 命令同向）、全程无 STEP_LOSS 误报 | 方向一致、无误报；不符 = 机械/接线不对齐，先处理硬件（AS5600_INVERT_DIR）再继续 | |
 | C4 | 符号约定（protocol.md §符号约定） | `py vel 200 --hold 1` 记实际方向 = +x；手掰摆顶同向看 theta | theta 同向增大；VEL −200 反向 | |
 | C5 | 摆角零位 | 手扶摆杆机械直立，读 STATE theta | 读数 θ₀；标定值 = −θ₀ | θ₀: |
-| C6 | 标定落地 | `py config POLE_ZERO_URAD <−θ₀>`（及 C1–C4 所得 POLE_INV/X_INV/SGTHRS）后复核 | 直立 theta≈0；VEL 200 方向与 theta 符号符合约定 | |
+| C6 | 标定落地 | `py config POLE_ZERO_URAD <−θ₀>`（及 C1–C4 所得 POLE_INV/X_INV）后复核 | 直立 theta≈0；VEL 200 方向与 theta 符号符合约定 | |
 | C7 | 看门狗 | `py wdt-test` | ~100 ms 减速到 0；QUERY 回 `MODE READY NONE`；恢复发送继续跟踪 | |
 | C8 | 收紧立即生效 | READY 中 `py config X_LIMIT 10000`，再 `py vel 200` | 越界即停向外分量 | |
 | C9 | 拔线观察（台位可承受时） | READY 中拔 AS5600（再拔 MT6835） | ≤15 ms FAULT 对应 reason、EN 关、**STATE 流不断**（θ 恒有效） | 耗时: |
