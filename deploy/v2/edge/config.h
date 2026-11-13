@@ -12,7 +12,7 @@
 #define CFG_BAUD            460800
 
 /* ---- 控制环 ---- */
-#define CFG_CONTROL_HZ      200.0     /* 与训练 dt 一致（sim2real-spec） */
+#define CFG_CONTROL_HZ      200.0     /* 旧部署节拍；不可直接部署500Hz新模型，见training-readiness */
 #define CFG_STATE_TIMEOUT_S 0.2       /* 超过此时长无 STATE 行：发 VEL 0 并等待恢复 */
 
 /* ---- 动作映射（策略输出 [-1,1] -> 目标速度） ---- */
