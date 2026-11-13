@@ -166,7 +166,10 @@ bool device_session_feed(device_session *s, const char *line, double now) {
         if (n >= 2) {
             for (int i = 0; i < FIELD_COUNT; ++i) if (!strcmp(words[1], names[i])) {
                 int64_t value;
-                if (n != 3 || !integer(words[2], &value)) goto malformed;
+                if (n != 3 || !integer(words[2], &value)) {
+                    s->meta[i].known = false;
+                    goto malformed;
+                }
                 if (s->view.phase == DEVICE_ACTIVE && s->meta[i].known && s->meta[i].value != value) {
                     fail(s, DEVICE_FIRMWARE_FAULT);
                     return false;

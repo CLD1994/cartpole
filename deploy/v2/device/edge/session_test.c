@@ -254,6 +254,47 @@ static void test_application_abort_stops_without_extending_deadline(void) {
     assert(device_session_snapshot(s).error == DEVICE_APPLICATION_ERROR);
     device_session_destroy(s);
 }
+static void test_missing_calibration_value_revokes_readback(void) {
+    struct wire w = {0}; device_session *s = create(&w); prepare(s);
+    assert(!device_session_feed(s, "OK CAL_STATE", 1));
+    assert(device_session_feed(s, "VEL_VALID 1 1", 1));
+    assert(device_session_feed(s, "STATE 0 0 0 0", 1));
+    assert(!device_session_start(s, 1)); device_session_destroy(s);
+}
+static void test_missing_config_value_revokes_readback(void) {
+    struct wire w = {0}; device_session *s = create(&w); prepare(s);
+    assert(!device_session_feed(s, "OK ACC_MAX", 1));
+    assert(device_session_feed(s, "VEL_VALID 1 1", 1));
+    assert(device_session_feed(s, "STATE 0 0 0 0", 1));
+    assert(!device_session_start(s, 1)); device_session_destroy(s);
+}
+static void test_missing_active_config_value_latches(void) {
+    struct wire w = {0}; device_session *s = create(&w); prepare(s);
+    assert(device_session_start(s, 1));
+    assert(!device_session_feed(s, "OK ACC_MAX", 1));
+    assert(device_session_snapshot(s).phase == DEVICE_STOPPING);
+    assert(device_session_snapshot(s).error == DEVICE_INVALID_LINE); device_session_destroy(s);
+}
+static void test_stopping_fault_survives_disabled_ack(void) {
+    struct wire w = {0}; device_session *s = create(&w); prepare(s);
+    assert(device_session_start(s, 1)); assert(device_session_stop(s, 1));
+    assert(!device_session_feed(s, "MODE FAULT STEP_LOSS", 1));
+    assert(!device_session_feed(s, "VEL_VALID 1 1", 1.02));
+    assert(!device_session_feed(s, "STATE 0 0 0 0", 1.03));
+    assert(!device_session_feed(s, "MODE DISABLED NONE", 1.04));
+    assert(device_session_snapshot(s).disabled_confirmed);
+    assert(device_session_snapshot(s).error == DEVICE_STOP_UNCONFIRMED); device_session_destroy(s);
+}
+static void test_stopping_error_survives_disabled_ack(void) {
+    struct wire w = {0}; device_session *s = create(&w); prepare(s);
+    assert(device_session_start(s, 1)); assert(device_session_stop(s, 1));
+    assert(!device_session_feed(s, "ERR DISABLE", 1));
+    assert(!device_session_feed(s, "VEL_VALID 1 1", 1.02));
+    assert(!device_session_feed(s, "STATE 0 0 0 0", 1.03));
+    assert(!device_session_feed(s, "MODE DISABLED NONE", 1.04));
+    assert(device_session_snapshot(s).disabled_confirmed);
+    assert(device_session_snapshot(s).error == DEVICE_FIRMWARE_FAULT); device_session_destroy(s);
+}
 int main(void) {
     test_create_is_inert(); test_refresh_only_queries(); test_start_requires_complete_metadata();
     test_start_is_not_enable(); test_action_maps_profile_velocity();
@@ -274,5 +315,8 @@ int main(void) {
     test_backlogged_validity_cannot_hide_expiry(); test_late_disabled_cannot_confirm_expired_stop();
     test_application_abort_is_inert_while_observing();
     test_application_abort_stops_without_extending_deadline();
-    puts("device session: 36 public-contract unit cases passed");
+    test_missing_calibration_value_revokes_readback();
+    test_missing_config_value_revokes_readback(); test_missing_active_config_value_latches();
+    test_stopping_fault_survives_disabled_ack(); test_stopping_error_survives_disabled_ack();
+    puts("device session: 41 public-contract unit cases passed");
 }

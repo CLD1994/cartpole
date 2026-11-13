@@ -144,10 +144,18 @@ class Session:
             return 'position_outside_limits'
         return None
 
+    @property
+    def expected_readback(self):
+        return {'CAL_STATE': 2, 'CAL_SAVED': 1, 'CAL_STORAGE': 0, **self.limits.config}
+
+    @property
+    def readback_names(self):
+        return self.expected_readback.keys() | {'CAL_LENGTH_UM'}
+
     def _metadata_reason(self, now):
         if self.mode != ('READY', 'NONE') or not self._fresh(self._mode_at, now, self.limits.preflight_timeout_s):
             return 'mode_not_ready'
-        expected = {'CAL_STATE': 2, 'CAL_SAVED': 1, 'CAL_STORAGE': 0, **self.limits.config}
+        expected = self.expected_readback
         for key, value in expected.items():
             entry = self.values.get(key)
             if entry is None or entry[0] != value or not self._fresh(entry[1], now, self.limits.preflight_timeout_s):
@@ -174,6 +182,7 @@ class Session:
         if self.phase in (Phase.ACTIVE, Phase.STOPPING):
             self.failure = self.failure or reason
         self.observation = None
+        self._valid = False
         if self.phase == Phase.ACTIVE:
             self._begin_stop(now)
 
@@ -240,21 +249,34 @@ class Session:
                     self.phase = Phase.FINISHED
                 elif self.phase == Phase.ACTIVE and self.mode != ('READY', 'NONE'):
                     self._fail('firmware_mode', now)
+                elif self.phase == Phase.STOPPING and self.mode not in (('READY', 'NONE'), ('DISABLED', 'NONE')):
+                    self._fail('firmware_mode', now)
             elif tag == 'OK':
+                known = len(words) >= 2 and words[1] in self.readback_names
+                if known:
+                    try:
+                        if len(words) != 3:
+                            raise ValueError()
+                        int(words[2])
+                    except ValueError:
+                        self.values.pop(words[1], None)
+                        raise
                 if len(words) == 3:
                     value = int(words[2])
                     previous = self.values.get(words[1])
                     self.values[words[1]] = (value, now)
                     if self.phase == Phase.ACTIVE:
-                        expected = {'CAL_STATE': 2, 'CAL_SAVED': 1, 'CAL_STORAGE': 0, **self.limits.config}
+                        expected = self.expected_readback
                         if (words[1] in expected and value != expected[words[1]]) or (words[1] == 'CAL_LENGTH_UM' and previous and value != previous[0]):
                             self._fail('readback_changed', now)
                 elif len(words) != 2:
                     raise ValueError()
             elif tag == 'ERR':
-                if self.phase == Phase.ACTIVE:
+                if self.phase == Phase.STOPPING and words == ['ERR', 'BUSY']:
+                    self._disable_sent = False
+                elif self.phase in (Phase.ACTIVE, Phase.STOPPING):
                     self._fail('firmware_error', now)
-                # ERR BUSY during stopping: later tick retries; deadline never extends.
+                # BUSY permits a later retry without extending the stopping deadline.
         except ValueError:
             if tag in ('STATE', 'VEL_VALID', 'MODE', 'OK'):
                 self._valid = False

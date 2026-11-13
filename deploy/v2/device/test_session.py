@@ -276,6 +276,55 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(self.port.sent, [])
         self.assertEqual(self.s.phase, Phase.FINISHED)
 
+    def test_fault_during_stopping_survives_disabled_ack(self):
+        self.ready()
+        self.s.start()
+        self.s.stop()
+        self.s.receive('MODE FAULT STEP_LOSS')
+        self.clock.time += .04
+        self.s.receive('VEL_VALID 1 1')
+        self.s.receive('STATE 0 0 0 0')
+        self.clock.time += .04
+        self.s.tick()
+        self.s.receive('MODE DISABLED NONE')
+        self.assertTrue(self.s.disabled_confirmed)
+        self.assertEqual(self.s.failure, 'firmware_mode')
+
+    def test_error_during_stopping_survives_disabled_ack(self):
+        self.ready()
+        self.s.start()
+        self.s.stop()
+        self.s.receive('ERR DISABLE')
+        self.clock.time += .04
+        self.s.receive('VEL_VALID 1 1')
+        self.s.receive('STATE 0 0 0 0')
+        self.clock.time += .04
+        self.s.tick()
+        self.s.receive('MODE DISABLED NONE')
+        self.assertTrue(self.s.disabled_confirmed)
+        self.assertEqual(self.s.failure, 'firmware_error')
+
+    def test_missing_calibration_value_revokes_previous_readback(self):
+        self.ready()
+        self.s.receive('OK CAL_STATE')
+        self.s.receive('VEL_VALID 1 1')
+        self.s.receive('STATE 0 0 0 0')
+        with self.assertRaisesRegex(RuntimeError, 'CAL_STATE'): self.s.start()
+
+    def test_missing_config_value_revokes_previous_readback(self):
+        self.ready()
+        self.s.receive('OK ACC_MAX')
+        self.s.receive('VEL_VALID 1 1')
+        self.s.receive('STATE 0 0 0 0')
+        with self.assertRaisesRegex(RuntimeError, 'ACC_MAX'): self.s.start()
+
+    def test_missing_active_config_value_latches_failure(self):
+        self.ready()
+        self.s.start()
+        self.s.receive('OK ACC_MAX')
+        self.assertEqual(self.s.phase, Phase.STOPPING)
+        self.assertEqual(self.s.failure, 'malformed_OK')
+
     def test_profile_adapter_uses_injected_profile(self):
         profile = {'training': {'control_hz': 450}, 'configured': {
             'target_speed_mm_s': 1000, 'acceleration_mm_s2': 8000, 'soft_limit_margin_um': 12000}}
