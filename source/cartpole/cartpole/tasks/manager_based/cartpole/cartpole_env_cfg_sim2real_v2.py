@@ -5,12 +5,15 @@
 
 """Cartpole environment config for the v2 rig (stepper motor, velocity-command actions).
 
-本文件保留参考物理模型；当前装置参数与未决量见 deploy/v2/device-profile.json
-及 training-readiness.md。模型的质量、质心与执行器参数未完成新设备辨识，不能
-将此任务输出直接标记为适配当前设备。控制周期仍为 200 Hz，与 500 Hz 遥测分开。
+本任务使用已记录的设备几何与固定500Hz策略基线。执行器动态仍是假设，
+450–500Hz策略节拍波动及固件观测滤波尚未建模，不能直接部署到真机。
 """
 
 import math
+
+from cartpole.device_profile import load_profile, model_parameters
+
+DEVICE = model_parameters(load_profile())
 
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
@@ -34,16 +37,17 @@ from .mdp.terminations import pole_angle_out_of_bounds
 
 @configclass
 class RealCartpoleV2EnvCfg(CartpoleEnvCfg):
-    """Cartpole config matched to the v2 stepper rig: velocity-command actions, 200 Hz control."""
+    """Cartpole config matched to the v2 stepper rig: velocity-command actions, 500 Hz control."""
 
     def __post_init__(self) -> None:
         super().__post_init__()
 
         self.episode_length_s = 10.0
 
-        # --- 200 Hz control: physics at 400 Hz with 2 substeps per policy step ---
-        self.sim.dt = 1 / 400
+        # 固定500Hz基线，物理积分1ms；不以动作延迟冒充策略频率波动。
+        self.sim.dt = DEVICE["policy_dt"] / 2
         self.decimation = 2
+        self.rewards.terminating.weight *= 0.005 / DEVICE["policy_dt"]
         # render_interval (set to decimation by the base class) stays 2
 
         # --- action: velocity command + bounded-acceleration tracking (see sim2real-spec.md).
@@ -53,13 +57,13 @@ class RealCartpoleV2EnvCfg(CartpoleEnvCfg):
         self.actions.joint_effort = mdp_actions.JointVelocityTrackingActionCfg(
             asset_name="robot",
             joint_names=["slider_to_cart"],
-            vel_max=0.45,  # 参考动作尺度 [m/s]，不是实测设备上限
+            vel_max=DEVICE["velocity_m_s"],  # 配置目标，不是已验证全工况上限
             tau=0.02,  # nominal tracking time constant [s]; randomized 0.010-0.040
-            acc_max=4.0,  # nominal acceleration limit [m/s^2]; randomized 3-5 (<= ACC_MAX 5)
-            delay_steps=1,
-            max_delay_steps=3,
-            servo_gain=40.0,  # N/(m/s): ~4 ms servo time constant, well inside tau
-            effort_limit=3.0,  # N: covers 2x m_eff*acc_max + pole gravity reaction
+            acc_max=DEVICE["acceleration_m_s2"],
+            delay_steps=3,
+            max_delay_steps=8,
+            servo_gain=40.0,  # N/(m/s)，未辨识的速度伺服增益
+            effort_limit=8.0,  # 未辨识的仿真伺服力上限，不是电机测得推力
         )
 
         # --- observations: noise matched to the v2 sensors per sim2real-spec.md.
@@ -90,13 +94,14 @@ class RealCartpoleV2EnvCfg(CartpoleEnvCfg):
         # avoid wasted reversals through zero speed and StallGuard transients) ---
         self.rewards.action_rate = RewTerm(
             func=action_rate_l2,
-            weight=-0.05,
+            weight=-0.05 * (0.005 / DEVICE["policy_dt"]) ** 2,
         )
 
-        # --- termination + reset: track +-0.265 m usable, soft limit 0.260, train at +-0.25 m ---
+        # 终止边界比软限位内缩130mm；仿真终止不等于物理制动。
+        train_limit = DEVICE["soft_limit_m"] - 0.13
         self.terminations.cart_out_of_bounds = DoneTerm(
             func=joint_pos_out_of_manual_limit,
-            params={"asset_cfg": SceneEntityCfg("robot", joint_names=["slider_to_cart"]), "bounds": (-0.25, 0.25)},
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=["slider_to_cart"]), "bounds": (-train_limit, train_limit)},
         )
         self.terminations.pole_out_of_bounds = DoneTerm(
             func=pole_angle_out_of_bounds,
@@ -105,8 +110,7 @@ class RealCartpoleV2EnvCfg(CartpoleEnvCfg):
                 "max_angle": math.pi / 3,
             },
         )
-        # cart reset: >= 100 mm from the +-0.25 m bounds; at 200 Hz the 1-3 step delay (max
-        # 15 ms) coasts at most 4.5 mm at the 0.3 m/s reset velocity, so resets stay recoverable
+        # 初始位置保留在轨道中部，避免从终止边界附近初始化。
         self.events.reset_cart_position = EventTerm(
             func=reset_joints_by_offset,
             mode="reset",
@@ -116,8 +120,7 @@ class RealCartpoleV2EnvCfg(CartpoleEnvCfg):
                 "velocity_range": (-0.3, 0.3),
             },
         )
-        # pole reset: hand-lift start policy — with acc_max 5 m/s^2 the recoverable tilt is
-        # roughly +-15-20 deg, so initial angles stay inside +-0.15 rad (±8.6 deg)
+        # 手扶起摆任务，初始角限制在±0.15rad；不宣称全角度可恢复。
         self.events.reset_pole_position = EventTerm(
             func=reset_joints_by_offset,
             mode="reset",
@@ -134,19 +137,18 @@ class RealCartpoleV2EnvCfg(CartpoleEnvCfg):
             mode="reset",
             params={
                 "asset_cfg": SceneEntityCfg("robot"),
-                "mass_range": {"base_link|cart": (0.0585, 0.0715)},  # 0.065 kg +-10%
+                "mass_range": {"base_link|cart": (DEVICE["cart_mass_kg"] * (1 - DEVICE["cart_mass_randomization_fraction"]), DEVICE["cart_mass_kg"] * (1 + DEVICE["cart_mass_randomization_fraction"]))},  # 0.065 kg +-10%
             },
         )
-        # pole: uniform 0.30 m rod pivoted 20 mm from the short end -> COM 0.130 m from the
-        # pivot (NOT length/2). Mass 0.108 kg +-10%, COM offset +-3%, inertia +-15%
+        # 端点均匀细杆；质量±10%、质心±3%、惯量±15%为初始随机化假设。
         self.events.randomize_pole_properties = EventTerm(
             func=mdp_events.randomize_pole_axis_properties,
             mode="reset",
             params={
                 "asset_cfg": SceneEntityCfg("robot"),
-                "mass_range": (0.097, 0.119),
-                "length": 0.30,
-                "com_offset_range": (0.1261, 0.1339),
+                "mass_range": (DEVICE["pole_mass_kg"] * 0.9, DEVICE["pole_mass_kg"] * 1.1),
+                "length": DEVICE["pole_length_m"],
+                "com_offset_range": (DEVICE["pole_com_m"] * 0.97, DEVICE["pole_com_m"] * 1.03),
                 "inertia_scale_range": (0.85, 1.15),
             },
         )
@@ -166,15 +168,14 @@ class RealCartpoleV2EnvCfg(CartpoleEnvCfg):
             mode="reset",
             params={
                 "action_name": "joint_effort",
-                "vel_max_range": (0.4, 0.5),
+                "vel_max_range": (DEVICE["velocity_m_s"], DEVICE["velocity_m_s"]),
                 "tau_range": (0.010, 0.040),
-                "acc_max_range": (3.0, 5.0),
+                "acc_max_range": (8.0, DEVICE["acceleration_m_s2"]),
             },
         )
-        # transport delay of the real loop (200 Hz stream + serial + inference): 1-3 policy
-        # steps at 200 Hz = 5-15 ms; the policy must learn to act on stale state
+        # 命令传输延迟假设6–16ms；不是观测速度滤波，也不是策略频率波动。
         self.events.randomize_motor_delay = EventTerm(
             func=mdp_events.randomize_motor_delay,
             mode="reset",
-            params={"action_name": "joint_effort", "delay_range": (1, 3)},
+            params={"action_name": "joint_effort", "delay_range": (3, 8)},
         )
