@@ -4,6 +4,9 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 from isaaclab.utils.configclass import configclass
+from cartpole.device_profile import load_profile, model_parameters
+
+V2_DT = model_parameters(load_profile())["policy_dt"]
 
 from isaaclab_rl.rsl_rl import RslRlMLPModelCfg, RslRlOnPolicyRunnerCfg, RslRlPpoAlgorithmCfg, RslRlSymmetryCfg
 
@@ -79,9 +82,14 @@ class RealCartpolePPORunnerCfg(CartpolePPORunnerCfg):
 
 @configclass
 class RealCartpoleV2PPORunnerCfg(RealCartpolePPORunnerCfg):
-    """PPO configuration for the v2 rig (stepper, velocity-command actions, 200 Hz)."""
+    """PPO configuration for the v2 rig (stepper, velocity-command actions, 500 Hz)."""
 
-    # 200 Hz steps are 3.3x shorter than v1's 60 Hz: 16 steps cover only 80 ms of dynamics,
-    # so collect longer rollout chunks per update
-    num_steps_per_env = 48
+    # 120 × 2ms = 240ms，保持原48 × 5ms的rollout时长。
+    num_steps_per_env = round(0.240 / V2_DT)
     experiment_name = "cartpole_real_v2"
+
+    def __post_init__(self):
+        # 保持单位物理时间的折扣与GAE衰减，不把周期缩短变成长时间视野。
+        self.algorithm = self.algorithm.copy()
+        self.algorithm.gamma = 0.99 ** (V2_DT / 0.005)
+        self.algorithm.lam = 0.95 ** (V2_DT / 0.005)
