@@ -34,6 +34,7 @@ setup(
     install_requires=INSTALL_REQUIRES,
     license="Apache-2.0",
     include_package_data=True,
+    package_data={"cartpole": ["data/*.json"]},
     python_requires=">=3.12",
     classifiers=[
         "Natural Language :: English",
