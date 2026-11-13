@@ -6,6 +6,7 @@ from pathlib import Path
 import time
 
 from session import Limits, Session
+from receiver import Receiver
 
 PROFILE = Path(__file__).resolve().parents[3] / 'source/cartpole/cartpole/data/device-profile.json'
 
@@ -26,24 +27,17 @@ def main():
     import serial
     profile = json.loads(PROFILE.read_text(encoding='utf-8'))
     limits = limits_from_profile(profile)
-    with serial.Serial(args.port, profile['measured']['protocol_baud'], timeout=.01, write_timeout=.1) as port:
+    with serial.Serial(args.port, profile['measured']['protocol_baud'], timeout=0, write_timeout=.1) as port:
         port.reset_input_buffer()
         session = Session(port, time.monotonic, limits)
         session.observe()
         deadline = time.monotonic() + args.seconds
-        pending = bytearray()
+        receiver = Receiver(port, session, time.monotonic)
         next_query = time.monotonic() + .5
         while time.monotonic() < deadline:
-            data = port.read(min(port.in_waiting or 1, 4096))
-            pending.extend(data)
-            while b'\n' in pending:
-                raw, _, rest = pending.partition(b'\n')
-                pending[:] = rest
-                if len(raw) > 256:
-                    raise RuntimeError('line_overflow')
-                session.receive(raw.decode('ascii'))
-            if len(pending) > 256:
-                raise RuntimeError('line_overflow')
+            if not receiver.poll():
+                break
+            time.sleep(.001)
             if time.monotonic() >= next_query:
                 session.refresh()
                 next_query = time.monotonic() + .5
@@ -52,7 +46,7 @@ def main():
                           'state': vars(session.observation) if session.observation else None,
                           'readback': {k: v[0] for k, v in session.values.items()},
                           'target_control_hz': limits.control_hz,
-                          'motion_sent': False}, ensure_ascii=False, indent=2))
+                          'receive_error': receiver.error, 'motion_sent': False}, ensure_ascii=False, indent=2))
     return 0
 
 
