@@ -6,7 +6,7 @@
 """Configuration for a joint velocity-tracking action for the stepper-driven cartpole rig (v2).
 
 The v2 rig drives the cart with a stepper motor: the policy command is a target cart velocity,
-and the firmware tracks it with a ramp (bounded acceleration). The action term models exactly
+and the firmware tracks it with a ramp (bounded acceleration). The action term approximates
 that behavior per ``deploy/v2/sim2real-spec.md``:
 
     v_cmd = clip(action, -1, 1) * vel_max          (authority scale, randomized)
@@ -47,9 +47,8 @@ class JointVelocityTrackingActionCfg(JointEffortActionCfg):
     """Authority scale [m/s]: the clipped action in [-1, 1] maps to a velocity target in
     [-vel_max, vel_max]. Randomized per-environment by ``randomize_velocity_tracking``.
     Note: the base class ``scale`` is unused (kept at 1.0); ``vel_max`` plays its role as a
-    per-environment tensor. The training upper bound must stay below the rig's
-    ISR-sustainable step rate (~0.55 m/s, onboard-measured), which is tighter than the
-    protocol clamp ``VEL_MAX`` (see deploy/v2/protocol.md)."""
+    per-environment tensor. 训练范围与部署限幅需要结合当前设备的 STEP 波形及运动试验核验，
+    协议限幅不代表实际可执行能力。"""
 
     tau: float = 0.02
     """Tracking time constant [s]: how fast the tracked velocity converges toward the target

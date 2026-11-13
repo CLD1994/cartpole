@@ -234,9 +234,8 @@ def randomize_velocity_tracking(
         env: The environment.
         env_ids: Environment indices to randomize.
         action_name: Name of the action term in the action manager.
-        vel_max_range: (min, max) authority scale [m/s]. Upper bound must stay below the
-            rig's ISR-sustainable step rate (~0.55 m/s, onboard-measured), which is tighter
-            than the protocol clamp ``VEL_MAX`` (deploy/v2/protocol.md).
+        vel_max_range: (min, max) authority scale [m/s]. 该范围是建模参数，
+            需要另行核验当前设备的实际执行能力。
         tau_range: (min, max) tracking time constant [s].
         acc_max_range: (min, max) acceleration limit [m/s^2]. Upper bound must not exceed the
             firmware session clamp ``ACC_MAX``.

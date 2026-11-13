@@ -5,21 +5,9 @@
 
 """Cartpole environment config for the v2 rig (stepper motor, velocity-command actions).
 
-Reference hardware (42SHDC3025-24B stepper + TMC2209 @ 12 V driving a 2GT 20T pulley 1:1;
-AS5600 cart encoder on the motor rear; MT6901 21-bit absolute pole encoder; ESP32-S3 motion
-board; 65 g cart, 108 g uniform 0.30 m pole pivoted 20 mm from its short end; +-0.265 m track).
-Behavior contract: ``deploy/v2/sim2real-spec.md``; link protocol: ``deploy/v2/protocol.md``.
-
-Key differences vs ``cartpole_env_cfg_sim2real.py`` (the v1 DC-motor rig):
-  - action semantics: velocity command + bounded-acceleration tracking (the stepper rig is a
-    trajectory executor, not a force-balance system) — the force gain / deadzone / viscous
-    damping model of v1 does not apply
-  - control rate 200 Hz (physics 400 Hz, decimation 2); NPU inference measured at 0.38 ms max
-  - tracking randomization upper bounds are pinned to what the rig can execute: acc_max to
-    the firmware session clamp ACC_MAX = 5000 mm/s^2, and vel_max below the measured
-    ISR-sustainable step rate (~0.55 m/s, tighter than the VEL_MAX = 1000 mm/s protocol
-    clamp; onboard-checklist 未决⑤): the training distribution must lie entirely inside
-    what the rig can execute
+本文件保留参考物理模型；当前装置参数与未决量见 deploy/v2/device-profile.json
+及 training-readiness.md。模型的质量、质心与执行器参数未完成新设备辨识，不能
+将此任务输出直接标记为适配当前设备。控制周期仍为 200 Hz，与 500 Hz 遥测分开。
 """
 
 import math
@@ -65,7 +53,7 @@ class RealCartpoleV2EnvCfg(CartpoleEnvCfg):
         self.actions.joint_effort = mdp_actions.JointVelocityTrackingActionCfg(
             asset_name="robot",
             joint_names=["slider_to_cart"],
-            vel_max=0.45,  # nominal authority scale [m/s]; randomized 0.4-0.5 (< ISR ceiling ~0.55 m/s)
+            vel_max=0.45,  # 参考动作尺度 [m/s]，不是实测设备上限
             tau=0.02,  # nominal tracking time constant [s]; randomized 0.010-0.040
             acc_max=4.0,  # nominal acceleration limit [m/s^2]; randomized 3-5 (<= ACC_MAX 5)
             delay_steps=1,
@@ -172,8 +160,7 @@ class RealCartpoleV2EnvCfg(CartpoleEnvCfg):
                 "damping_range": {"slider_to_cart": (0.0, 2.0), "cart_to_pole": (0.0, 0.01)},
             },
         )
-        # tracking dynamics (vel_max / tau / acc_max); vel bound below the ISR-sustainable
-        # step rate (~0.55 m/s, onboard-measured), acc bound at the firmware ACC_MAX clamp
+        # 参考跟踪动态范围；当前装置的速度、加速度与响应参数需要实测辨识。
         self.events.randomize_tracking = EventTerm(
             func=mdp_events.randomize_velocity_tracking,
             mode="reset",

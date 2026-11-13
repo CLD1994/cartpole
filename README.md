@@ -1,3 +1,7 @@
+## 当前倒立摆训练准备
+
+开始设备相关训练或部署前，请先阅读 [设备档案与训练准备](deploy/v2/training-readiness.md)。当前物理参数尚待补齐，不能把参考任务直接视为当前设备模型。
+
 # Template for Isaac Lab Projects
 
 ## Overview
