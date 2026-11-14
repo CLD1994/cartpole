@@ -49,4 +49,10 @@ Get-Content .\pole-swing.log -Tail 150 -Encoding utf8
 
 ## 验证状态
 
-操作者已在 OpenUSD 0.26.8 执行几何检查，杆范围约为 z=−4.8e−9..0.4900000048 m，名义质量、质心和惯量通过。云端完成 Python 语法、差异格式检查及周期判定的四项纯单元测试。PhysX 属性读回、自由摆与新模型训练仍待在 Isaac Lab 3.0 环境执行。
+操作者已在 OpenUSD 0.26.8 执行几何检查，杆范围约为 z=−4.8e−9..0.4900000048 m，名义质量、质心和惯量通过。云端完成 Python 语法、差异格式检查、周期判定的四项纯单元测试及两项配置/脚本导入边界测试。PhysX 属性读回、自由摆与新模型训练仍待在 Isaac Lab 3.0 环境执行。
+
+## USD 与启动顺序
+
+几何检查使用独立 Python 进程中的 OpenUSD。物理检查则由 `launch_simulation` 先启动 Kit，再导入场景执行模块和调用摆杆 spawner。配置加载只保留 spawner 函数引用，不应加载其 USD 执行依赖。不要在同一 Python 进程先运行几何检查或导入独立 `pxr` 再启动 Kit。
+
+物理检查在启动前打印 `pre_launch_usd_modules`；正常应为空对象。如果已经发现 `pxr.Usd/Tf/Gf/Sdf`，脚本输出其文件路径并停止，不尝试卸载已加载 DLL 或修改系统路径。遇到 Windows 程序入口点/DLL 错误时，保留完整日志与解释器路径，先核查加载来源；不要直接卸载包或删除 Isaac Sim 缓存。

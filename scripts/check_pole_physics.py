@@ -76,26 +76,35 @@ def run(args):
     import warp as wp
     wp.config.enable_backward = False
     from isaaclab.app import launch_simulation
-    from isaaclab.sim import SimulationCfg, SimulationContext
-    from isaaclab.sim.utils import clone
-    from isaaclab.utils import instantiate
+    from isaaclab.sim import SimulationCfg
     from isaaclab_physx.physics import PhysxCfg
-    from cartpole.device_profile import load_profile, model_parameters
-    from cartpole.tasks.manager_based.cartpole.cartpole_env_cfg import CartpoleSceneCfg
-    from cartpole.tasks.manager_based.cartpole.pole_spawner import spawn_v2_cartpole
 
-    model = model_parameters(load_profile())
-    cfg = CartpoleSceneCfg(num_envs=2, env_spacing=2.0)
-    cfg.ground = None
-    cfg.dome_light = None
-    cfg.robot.actuators = {}
-    cfg.robot.spawn.func = clone(spawn_fixed_cart) if args.mode == "swing" else spawn_v2_cartpole
-    if args.mode == "swing":
-        cfg.robot.init_state.joint_pos = {"cart_to_pole": math.pi + .05}
-        cfg.robot.init_state.joint_vel = {"cart_to_pole": 0.0}
     sim_cfg = SimulationCfg(physics=PhysxCfg(), dt=.001, device=args.device or "cuda:0", gravity=(0, 0, -9.81))
     report = {"mode": args.mode, "num_envs": 2, "dt_s": .001, "scope": "独立仿真检查，不是策略或真机验收"}
+    # 不主动导入 pxr；保留启动前模块来源，供诊断 Windows USD DLL 冲突。
+    import sys
+    loaded_usd = {name: getattr(module, "__file__", None) for name, module in sys.modules.items()
+                  if name in ("pxr.Usd", "pxr.Tf", "pxr.Gf", "pxr.Sdf")}
+    print(json.dumps({"pre_launch_usd_modules": loaded_usd}, ensure_ascii=False), flush=True)
+    if loaded_usd:
+        raise RuntimeError("Kit 启动前已有 USD 扩展加载；停止以避免混用 DLL，请保留模块路径")
     with launch_simulation(sim_cfg, args):
+        from isaaclab.sim import SimulationContext
+        from isaaclab.sim.utils import clone
+        from isaaclab.utils import instantiate
+        from cartpole.device_profile import load_profile, model_parameters
+        from cartpole.tasks.manager_based.cartpole.cartpole_env_cfg import CartpoleSceneCfg
+        from cartpole.tasks.manager_based.cartpole.pole_spawner import spawn_v2_cartpole
+
+        model = model_parameters(load_profile())
+        cfg = CartpoleSceneCfg(num_envs=2, env_spacing=2.0)
+        cfg.ground = None
+        cfg.dome_light = None
+        cfg.robot.actuators = {}
+        cfg.robot.spawn.func = clone(spawn_fixed_cart) if args.mode == "swing" else spawn_v2_cartpole
+        if args.mode == "swing":
+            cfg.robot.init_state.joint_pos = {"cart_to_pole": math.pi + .05}
+            cfg.robot.init_state.joint_vel = {"cart_to_pole": 0.0}
         sim = SimulationContext(sim_cfg)
         try:
             scene = instantiate(cfg)
