@@ -69,7 +69,7 @@ def apply_cartpole_visuals(stage, root_path, model):
     rod.CreateHeightAttr(model["pole_length_m"])
     half_length = model["pole_length_m"] / 2
     rod.CreateExtentAttr([Gf.Vec3f(-.004, -.004, -half_length), Gf.Vec3f(.004, .004, half_length)])
-    rod.CreateDisplayColorAttr([Gf.Vec3f(.025, .035, .05)])
+    rod.CreateDisplayColorAttr([Gf.Vec3f(.015, .16, .75)])
     apply_rod_material(stage, rod)
     xform = UsdGeom.Xformable(rod)
     xform.ClearXformOpOrder()
@@ -82,29 +82,30 @@ def apply_cartpole_visuals(stage, root_path, model):
     body.CreateDisplayColorAttr([Gf.Vec3f(.12, .17, .22)])
     xform = UsdGeom.Xformable(body)
     xform.ClearXformOpOrder()
-    xform.AddTranslateOp().Set(Gf.Vec3d(anchor[0] - .045, anchor[1], anchor[2] - .015))
-    xform.AddScaleOp().Set(Gf.Vec3f(.08, .075, .055))
+    xform.AddTranslateOp().Set(Gf.Vec3d(anchor[0] - .025, anchor[1], anchor[2] - .012))
+    xform.AddScaleOp().Set(Gf.Vec3f(.04, .05, .024))
 
     hub = UsdGeom.Cylinder.Define(stage, f"{root_path}/cart/hub_visual")
     hub.CreateVisibilityAttr(UsdGeom.Tokens.inherited)
     hub.CreateAxisAttr("X")
-    hub.CreateRadiusAttr(.012)
-    hub.CreateHeightAttr(.025)
-    hub.CreateExtentAttr([Gf.Vec3f(-.0125, -.012, -.012), Gf.Vec3f(.0125, .012, .012)])
+    hub.CreateRadiusAttr(.008)
+    hub.CreateHeightAttr(.015)
+    hub.CreateExtentAttr([Gf.Vec3f(-.0075, -.008, -.008), Gf.Vec3f(.0075, .008, .008)])
     hub.CreateDisplayColorAttr([Gf.Vec3f(.65, .68, .7)])
     xform = UsdGeom.Xformable(hub)
     xform.ClearXformOpOrder()
-    xform.AddTranslateOp().Set(Gf.Vec3d(anchor[0] - .0125, anchor[1], anchor[2]))
+    xform.AddTranslateOp().Set(Gf.Vec3d(anchor[0] - .0075, anchor[1], anchor[2]))
 
+    apply_rail_visual(stage, root_path, Gf.Vec3d(anchor[0] - .025, anchor[1], anchor[2] - .012))
 
 def apply_rod_material(stage, rod):
-    """为示意杆绑定浅背景下易辨识的深色表面；只影响渲染，不创建物理材质。"""
+    """为示意杆绑定浅背景下易辨识的蓝色表面；只影响渲染，不创建物理材质。"""
     from pxr import Gf, Sdf, UsdShade
 
     material = UsdShade.Material.Define(stage, rod.GetPath().AppendChild("RodSurface"))
     shader = UsdShade.Shader.Define(stage, material.GetPath().AppendChild("Surface"))
     shader.CreateIdAttr("UsdPreviewSurface")
-    shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(.025, .035, .05))
+    shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(.015, .16, .75))
     shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.)
     shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(.65)
     material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
@@ -127,3 +128,32 @@ def hide_render_subtree(prim):
         prim.SetInstanceable(False)
     for child in prim.GetChildren():
         hide_render_subtree(child)
+
+
+def apply_rail_visual(stage, root_path, cart_center):
+    """静态轨道纯视觉：900 mm 长，与车体底面相接，不改变滑动关节。"""
+    from pxr import Gf, UsdGeom, UsdPhysics
+
+    slider = stage.GetPrimAtPath(f"{root_path}/slider")
+    cart = stage.GetPrimAtPath(f"{root_path}/cart")
+    joint = UsdPhysics.PrismaticJoint(stage.GetPrimAtPath(f"{root_path}/slider/slider_to_cart"))
+    if not slider or slider.IsInstanceProxy() or not joint or joint.GetAxisAttr().Get() != "X":
+        raise ValueError("轨道示意需要标准 slider 和 X 轴滑动关节")
+    for child in slider.GetChildren():
+        hide_render_subtree(child)
+    cache = UsdGeom.XformCache()
+    cart_to_slider = cache.GetLocalToWorldTransform(cart) * cache.GetLocalToWorldTransform(slider).GetInverse()
+    center = cart_to_slider.Transform(cart_center)
+    vertical = cart_to_slider.TransformDir(Gf.Vec3d(0, 0, 1))
+    if (vertical - Gf.Vec3d(0, 0, 1)).GetLength() > 1e-6:
+        raise ValueError("车体与轨道竖直轴不一致，不能定位示意轨道")
+    rail = UsdGeom.Cube.Define(stage, f"{root_path}/slider/rail_visual")
+    rail.CreateVisibilityAttr(UsdGeom.Tokens.inherited)
+    rail.CreateSizeAttr(1.)
+    rail.CreateExtentAttr([Gf.Vec3f(-.5), Gf.Vec3f(.5)])
+    rail.CreateDisplayColorAttr([Gf.Vec3f(.55, .59, .63)])
+    xform = UsdGeom.Xformable(rail)
+    xform.ClearXformOpOrder()
+    xform.AddTranslateOp().Set(Gf.Vec3d(center[0], center[1], center[2] - .012 - .02))
+    xform.AddOrientOp().Set(joint.GetLocalRot0Attr().Get())
+    xform.AddScaleOp().Set(Gf.Vec3f(.9, .04, .04))
