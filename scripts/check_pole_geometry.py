@@ -54,7 +54,7 @@ def main():
         assert prim.IsActive() and UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Get() == enabled, path
     rail_bounds = cache.ComputeRelativeBound(stage.GetPrimAtPath("/cartpole/slider/rail_visual"), root).ComputeAlignedRange()
     body_bounds = cache.ComputeRelativeBound(stage.GetPrimAtPath("/cartpole/cart/body_visual"), root).ComputeAlignedRange()
-    assert abs(max(rail_bounds.GetSize()) - .9) < 1e-6, rail_bounds
+    assert abs(max(rail_bounds.GetSize()) - 1.) < 1e-6, rail_bounds
     assert abs(rail_bounds.GetMax()[2] - body_bounds.GetMin()[2]) < 1e-6, (rail_bounds, body_bounds)
     assert abs(rail_bounds.GetMidpoint()[0] - body_bounds.GetMidpoint()[0]) < 1e-6
     material, _ = UsdShade.MaterialBindingAPI(visual).ComputeBoundMaterial()

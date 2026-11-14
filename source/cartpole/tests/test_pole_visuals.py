@@ -131,7 +131,8 @@ class VisualTests(unittest.TestCase):
         body = self.stage.prims['/r/cart/body_visual'].attrs
         rail = self.stage.prims['/r/slider/rail_visual'].attrs
         self.assertEqual(body['Scale'].value, (.04, .05, .024))
-        self.assertEqual(rail['Scale'].value, (.9, .04, .04))
+        self.assertEqual(rail['Scale'].value, (1., .04, .04))
+        self.assertEqual(rail['DisplayColor'].value, [(.75, .5, .08)])
         self.assertAlmostEqual(body['Translate'].value[2] - .012, rail['Translate'].value[2] + .02)
         self.assertEqual(body['Translate'].value[0], rail['Translate'].value[0])
 

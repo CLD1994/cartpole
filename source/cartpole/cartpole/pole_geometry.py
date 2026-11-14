@@ -131,7 +131,7 @@ def hide_render_subtree(prim):
 
 
 def apply_rail_visual(stage, root_path, cart_center):
-    """静态轨道纯视觉：900 mm 长，与车体底面相接，不改变滑动关节。"""
+    """静态轨道纯视觉：1000 mm 长，与车体底面相接，不改变滑动关节。"""
     from pxr import Gf, UsdGeom, UsdPhysics
 
     slider = stage.GetPrimAtPath(f"{root_path}/slider")
@@ -151,9 +151,9 @@ def apply_rail_visual(stage, root_path, cart_center):
     rail.CreateVisibilityAttr(UsdGeom.Tokens.inherited)
     rail.CreateSizeAttr(1.)
     rail.CreateExtentAttr([Gf.Vec3f(-.5), Gf.Vec3f(.5)])
-    rail.CreateDisplayColorAttr([Gf.Vec3f(.55, .59, .63)])
+    rail.CreateDisplayColorAttr([Gf.Vec3f(.75, .5, .08)])
     xform = UsdGeom.Xformable(rail)
     xform.ClearXformOpOrder()
     xform.AddTranslateOp().Set(Gf.Vec3d(center[0], center[1], center[2] - .012 - .02))
     xform.AddOrientOp().Set(joint.GetLocalRot0Attr().Get())
-    xform.AddScaleOp().Set(Gf.Vec3f(.9, .04, .04))
+    xform.AddScaleOp().Set(Gf.Vec3f(1., .04, .04))
