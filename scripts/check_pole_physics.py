@@ -70,9 +70,43 @@ def read_properties(robot, model):
             "com_pose_xyzw": com.tolist(), "inertia_com_kg_m2": inertia.tolist(), "passed": True}
 
 
+def prepare_free_swing(robot):
+    """通过公开关节接口设置无驱动自由摆；所有写入均为设备上二维 float32。"""
+    import torch
+
+    if robot.backend_joint_names != ["cart_to_pole"] or robot.num_joints != 1:
+        raise ValueError(f"固定小车后必须只剩杆转轴：{robot.backend_joint_names}")
+    if robot.num_instances < 1:
+        raise ValueError("自由摆检查至少需要一个环境")
+    shape = (robot.num_instances, robot.num_joints)
+    zeros = torch.zeros(shape, dtype=torch.float32, device=robot.device)
+    position = torch.full(shape, math.pi + .05, dtype=torch.float32, device=robot.device)
+    robot.write_joint_stiffness_to_sim_index(stiffness=zeros)
+    robot.write_joint_damping_to_sim_index(damping=zeros)
+    robot.write_joint_armature_to_sim_index(armature=zeros)
+    robot.write_joint_friction_coefficient_to_sim_index(
+        joint_friction_coeff=zeros, joint_dynamic_friction_coeff=zeros,
+        joint_viscous_friction_coeff=zeros)
+    robot.write_joint_state_to_sim_index(position=position, velocity=zeros)
+
+
+def check_free_joint_properties(view):
+    """从物理后端独立确认自由摆约束参数，不使用应用写入缓存。"""
+    import numpy as np
+
+    values = {
+        "stiffness": view.get_dof_stiffnesses().numpy(),
+        "damping": view.get_dof_dampings().numpy(),
+        "armature": view.get_dof_armatures().numpy(),
+        "friction_static_dynamic_viscous": view.get_dof_friction_properties().numpy(),
+    }
+    for name, value in values.items():
+        np.testing.assert_allclose(value, 0.0, atol=1e-8, err_msg=name)
+    return {name: value.tolist() for name, value in values.items()}
+
+
 def run(args):
     import numpy as np
-    import torch
     import warp as wp
     wp.config.enable_backward = False
     from isaaclab.app import launch_simulation
@@ -112,30 +146,20 @@ def run(args):
             robot = scene["robot"]
             report["properties"] = read_properties(robot, model)
             if args.mode == "swing":
-                # No policy/events/actuators: zero physical joint damping, friction and armature.
-                robot.write_joint_stiffness_to_sim_index(stiffness=0.0)
-                robot.write_joint_damping_to_sim_index(damping=0.0)
-                robot.write_joint_armature_to_sim_index(armature=0.0)
-                robot.write_joint_friction_coefficient_to_sim_index(
-                    joint_friction_coeff=0.0, joint_dynamic_friction_coeff=0.0,
-                    joint_viscous_friction_coeff=0.0)
-                robot.write_joint_state_to_sim_index(
-                    position=torch.full((2, 1), math.pi + .05, device=robot.device),
-                    velocity=torch.zeros((2, 1), device=robot.device))
+                prepare_free_swing(robot)
                 scene.reset()
                 view = robot.root_view
-                if robot.backend_joint_names != ["cart_to_pole"]:
-                    raise RuntimeError(f"固定小车后必须只剩杆转轴：{robot.backend_joint_names}")
+                report["free_joint_properties"] = check_free_joint_properties(view)
                 cart_index = robot.backend_body_names.index("cart")
                 origin = view.get_link_transforms().numpy()[:, cart_index, :3].copy()
-                times, angles = [], [[], []]
+                times, angles = [], [[] for _ in range(robot.num_instances)]
                 drift = 0.0
                 for step in range(round(args.seconds / sim_cfg.dt)):
                     sim.step(render=False)
                     scene.update(sim_cfg.dt)
                     q = view.get_dof_positions().numpy()[:, 0]
                     times.append((step + 1) * sim_cfg.dt)
-                    for n in range(2):
+                    for n in range(robot.num_instances):
                         angles[n].append(math.atan2(math.sin(float(q[n]) - math.pi), math.cos(float(q[n]) - math.pi)))
                     drift = max(drift, float(np.max(abs(view.get_link_transforms().numpy()[:, cart_index, :3] - origin))))
                 expected = 2 * math.pi * math.sqrt(2 * model["pole_length_m"] / (3 * 9.81))
