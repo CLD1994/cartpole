@@ -112,7 +112,7 @@ def randomize_pole_properties(
         e = int(env_ids[0])
         com_b = [round(float(x), 4) for x in asset.data.body_com_pose_b[e, pole_ids[0]]]
         inertia_b = [round(float(x), 4) for x in asset.data.body_inertia[e, pole_ids[0]]]
-        mass = float(asset.data._body_mass.numpy()[e, pole_ids[0]])
+        mass = float(asset.data.body_mass.torch[e, pole_ids[0]])
         _write_diag(f"pole[{pole_names[0]}] AFTER set: mass={mass:.4f}kg com_body={com_b} inertia={inertia_b}")
 
 
@@ -214,7 +214,7 @@ def randomize_pole_axis_properties(
         e = int(env_ids[0])
         com_b = [round(float(x), 4) for x in asset.data.body_com_pose_b[e, pole_ids[0]]]
         inertia_b = [round(float(x), 4) for x in asset.data.body_inertia[e, pole_ids[0]]]
-        mass = float(asset.data._body_mass.numpy()[e, pole_ids[0]])
+        mass = float(asset.data.body_mass.torch[e, pole_ids[0]])
         _write_diag(f"v2 pole[{pole_names[0]}] AFTER set: mass={mass:.4f}kg com_body={com_b} inertia={inertia_b}")
 
 

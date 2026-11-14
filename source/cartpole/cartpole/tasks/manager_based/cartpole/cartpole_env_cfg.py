@@ -5,7 +5,14 @@
 
 import math
 
-from isaaclab_newton.physics import KaminoSolverCfg, MJWarpSolverCfg, NewtonCfg
+from isaaclab_newton.physics import (
+    KaminoCollisionDetectorCfg,
+    KaminoConstraintsCfg,
+    KaminoPADMMCfg,
+    KaminoPADMMSolverCfg,
+    MJWarpSolverCfg,
+    NewtonCfg,
+)
 from isaaclab_physx.physics import PhysxCfg
 
 import isaaclab.sim as sim_utils
@@ -52,23 +59,26 @@ class CartpolePhysicsCfg(PresetCfg):
         use_cuda_graph=True,
     )
     newton_kamino: NewtonCfg = NewtonCfg(
-        solver_cfg=KaminoSolverCfg(
+        solver_cfg=KaminoPADMMSolverCfg(
             integrator="moreau",
             use_collision_detector=True,
             sparse_jacobian=True,
-            constraints_alpha=0.1,
-            padmm_max_iterations=100,
-            padmm_primal_tolerance=1e-4,
-            padmm_dual_tolerance=1e-4,
-            padmm_compl_tolerance=1e-4,
-            padmm_rho_0=0.05,
-            padmm_eta=1e-5,
-            padmm_use_acceleration=True,
-            padmm_warmstart_mode="containers",
-            padmm_contact_warmstart_method="geom_pair_net_force",
-            padmm_use_graph_conditionals=False,
-            collision_detector_pipeline="unified",
-            collision_detector_max_contacts_per_pair=8,
+            constraints=KaminoConstraintsCfg(alpha=0.1),
+            dynamics_solver_cfg=KaminoPADMMCfg(
+                max_iterations=100,
+                primal_tolerance=1e-4,
+                dual_tolerance=1e-4,
+                compl_tolerance=1e-4,
+                rho_0=0.05,
+                eta=1e-5,
+                use_acceleration=True,
+                warmstart_mode="containers",
+                contact_warmstart_method="geom_pair_net_force",
+                use_graph_conditionals=False,
+            ),
+            collision_detector=KaminoCollisionDetectorCfg(
+                pipeline="unified", max_contacts_per_pair=8,
+            ),
         ),
         num_substeps=1,
         debug_mode=False,
