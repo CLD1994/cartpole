@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 from contextlib import contextmanager
 import hashlib
 import json
@@ -23,6 +24,10 @@ def parse_args(argv=None, *, add_launcher_args):
     parser.add_argument('--seeds', type=int, nargs='+', default=[101, 202, 303, 404, 505])
     parser.add_argument('--horizon-s', type=float, help='仅评估实例的回合时长；默认保留训练配置')
     parser.add_argument('--render-interval', type=int, default=None)
+    parser.add_argument('--initial-cart-velocity-range',type=float,nargs=2,metavar=('LOW','HIGH'),
+                        help='仅评估的小车初速度范围[m/s]；不指定则保留训练范围')
+    parser.add_argument('--initial-pole-velocity-range',type=float,nargs=2,metavar=('LOW','HIGH'),
+                        help='仅评估的摆杆初角速度范围[rad/s]；不指定则保留训练范围')
     parser.add_argument('--output-dir', type=Path, default=Path('logs/evaluation'))
     add_launcher_args(parser)
     args = parser.parse_args(argv)
@@ -33,6 +38,9 @@ def parse_args(argv=None, *, add_launcher_args):
         parser.error('horizon-s 必须为有限正数')
     if args.render_interval is not None and args.render_interval <= 0:
         parser.error('render-interval 必须为正')
+    for value in (args.initial_cart_velocity_range,args.initial_pole_velocity_range):
+        if value is not None and (not all(math.isfinite(v) for v in value) or value[0]>value[1]):
+            parser.error('初速度范围必须为有限数值，且 LOW <= HIGH')
     return args
 
 
@@ -49,8 +57,8 @@ def make_recorder_type(base, *, snapshot, consume, before_reset=lambda ids: None
     return EvaluationRecorder
 
 
-def snapshot_environment(env):
-    """读取真实状态而非有噪声观测；只接受当前 v2 两关节语义。"""
+def snapshot_state(env):
+    """只读取无噪声关节状态；不计算观测，不采样随机数或推进仿真。"""
     import torch
     robot = env.scene['robot']
     cart_ids, _ = robot.find_joints('slider_to_cart')
@@ -61,15 +69,47 @@ def snapshot_environment(env):
     positions, velocities = robot.data.joint_pos.torch, robot.data.joint_vel.torch
     theta = torch.remainder(positions[:, pole] + math.pi, 2*math.pi) - math.pi
     state = torch.stack((positions[:,cart],theta,velocities[:,cart],velocities[:,pole]),dim=1)
+    return state.detach().cpu().tolist()
+
+
+def snapshot_environment(env):
+    states = snapshot_state(env)
     actions = env.action_manager.action
     if actions.shape[1] != 1:
         raise ValueError('评估器要求一个速度指令动作')
     manager = env.termination_manager
-    return dict(states=state.detach().cpu().tolist(), actions=actions[:,0].detach().cpu().tolist(),
+    return dict(states=states, actions=actions[:,0].detach().cpu().tolist(),
                 terminated=manager.terminated.detach().cpu().tolist(),
                 truncated=manager.time_outs.detach().cpu().tolist(),
                 reasons={name:manager.get_term(name).detach().cpu().tolist() for name in manager.active_terms})
 
+
+
+def snapshot_initial_conditions(env):
+    """在显式reset返回后且第一控制步之前读取状态和实际抽样的跟踪参数。"""
+    states = snapshot_state(env)
+    tracking = env.action_manager.get_term('joint_effort')
+    values = {key:getattr(tracking,attr).detach().cpu().tolist() for key,attr in
+              [('velocity_limit_m_s','vel_max'),('tau_s','tau'),('acceleration_limit_m_s2','acc_max'),
+               ('delay_steps','delay_steps')]}
+    parameters = []
+    for i in range(len(states)):
+        item = {key:value[i] for key,value in values.items()}
+        item['delay_s'] = item['delay_steps'] * env.step_dt
+        parameters.append(item)
+    return dict(states=states,tracking_parameters=parameters)
+
+
+def configure_initial_velocities(env_cfg, *, cart_range=None, pole_range=None):
+    """只改评估配置副本；不改变默认训练范围或位置初始化。"""
+    result = copy.deepcopy(env_cfg)
+    for term,value in ((result.events.reset_cart_position,cart_range),
+                       (result.events.reset_pole_position,pole_range)):
+        if value is not None:
+            if len(value)!=2 or not all(math.isfinite(v) for v in value) or value[0]>value[1]:
+                raise ValueError('初速度范围必须是有序有限区间')
+            term.params['velocity_range'] = tuple(value)
+    return result
 
 def write_report(path, report):
     temporary = path.with_suffix('.tmp')
@@ -154,7 +194,7 @@ def main(argv=None):
     digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
     output = args.output_dir.resolve() / ('evaluation-'+uuid.uuid4().hex)
     output.mkdir(parents=True,exist_ok=False)
-    report = dict(schema_version=1,status='starting',checkpoint=str(checkpoint),checkpoint_sha256=digest,
+    report = dict(schema_version=2,status='starting',checkpoint=str(checkpoint),checkpoint_sha256=digest,
                   task=args.task,seeds=args.seeds,num_envs=args.num_envs,cohorts=[],
                   scope='当前配置下的独立仿真评估；不是旧训练环境重建、性能基准或真机验收',
                   sample_scope='每槽位从显式reset起的第一个回合；状态在自动reset前、每控制步末采样',
@@ -170,6 +210,14 @@ def main(argv=None):
     active = [None]
     try:
         env_cfg,agent_cfg = resolve_task_config(args.task,'rsl_rl_cfg_entry_point',play_mode=False,overrides=[])
+        env_cfg = configure_initial_velocities(env_cfg,cart_range=args.initial_cart_velocity_range,
+                                               pole_range=args.initial_pole_velocity_range)
+        report['reset_conditions'] = {
+            'cart_position_range_m':env_cfg.events.reset_cart_position.params['position_range'],
+            'cart_velocity_range_m_s':env_cfg.events.reset_cart_position.params['velocity_range'],
+            'pole_angle_range_rad':env_cfg.events.reset_pole_position.params['position_range'],
+            'pole_velocity_range_rad_s':env_cfg.events.reset_pole_position.params['velocity_range']}
+        report['initial_sample_scope'] = '显式reset完成后、首个env.step之前；直接关节状态，不含观测噪声'
         agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg,check_rsl_rl_version())
         env_cfg.scene.num_envs = args.num_envs
         env_cfg.sim.device = args.device
@@ -218,6 +266,7 @@ def main(argv=None):
                         metrics = EpisodeMetrics(num_envs=args.num_envs,seed=seed,dt=dt)
                         def reset(seed):
                             raw.reset(seed=seed)
+                            metrics.set_initial_conditions(**snapshot_initial_conditions(env.unwrapped))
                             policy.reset(torch.ones(args.num_envs,dtype=torch.bool,device=env.unwrapped.device))
                         def step_factory():
                             obs = env.get_observations()

@@ -1,5 +1,6 @@
 """每个向量槽位只采集首个完整回合，避免短失败回合被重复加权。"""
 import math
+import copy
 
 
 class EpisodeMetrics:
@@ -13,9 +14,22 @@ class EpisodeMetrics:
             raise ValueError('num_envs 和 dt 必须为正')
         self.num_envs, self.seed, self.dt = num_envs, seed, dt
         self.episodes = {}
+        self.initial_conditions = None
         self.accumulators = [dict(steps=0, theta_sq=0.0, max_abs_x_m=0.0,
                                  max_abs_theta_rad=0.0, max_abs_action=0.0)
                              for _ in range(num_envs)]
+
+    def set_initial_conditions(self, *, states, tracking_parameters):
+        """只接受首步之前的一次reset快照，初态不计入步数或RMS。"""
+        if self.initial_conditions is not None or any(a['steps'] for a in self.accumulators):
+            raise ValueError('初态必须在首步前且只能记录一次')
+        if len(states)!=self.num_envs or len(tracking_parameters)!=self.num_envs:
+            raise ValueError('初态数量与num_envs不符')
+        if any(len(s)!=4 or not all(math.isfinite(v) for v in s) for s in states):
+            raise ValueError('初态必须包含四个有限数值')
+        self.initial_conditions = [dict(env_id=i,state=list(states[i]),
+                                        tracking_parameters=copy.deepcopy(tracking_parameters[i]))
+                                   for i in range(self.num_envs)]
 
     @property
     def complete(self):
@@ -44,6 +58,7 @@ class EpisodeMetrics:
                     success=bool(truncated[i] and not terminated[i]),
                     terminated=bool(terminated[i]), truncated=bool(truncated[i]),
                     termination_reasons=[name for name, values in reasons.items() if values[i]],
+                    initial_state=(self.initial_conditions[i]['state'] if self.initial_conditions else None),
                     terminal_state=state, theta_rms_rad=math.sqrt(item['theta_sq']/item['steps']),
                     **{name: item[name] for name in ('max_abs_x_m','max_abs_theta_rad','max_abs_action')})
 
@@ -64,7 +79,7 @@ class EpisodeMetrics:
                     requested=self.num_envs, completed=len(episodes), successes=successes,
                     success_rate=successes/self.num_envs if self.complete else None,
                     incomplete_env_ids=[i for i in range(self.num_envs) if i not in self.episodes],
-                    episodes=episodes)
+                    initial_conditions=copy.deepcopy(self.initial_conditions),episodes=episodes)
 
 
 def run_cohort(metrics, *, step, max_steps):
