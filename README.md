@@ -143,3 +143,16 @@ Some examples of packages that can likely be excluded are:
 "<path-to-isaac-sim>/extscache/omni.services.*"     // Services tools
 ...
 ```
+
+### 官方任务与项目任务的零动作性能对照
+
+`env_step_rtf.py` 不加载策略，向环境重复提交同一份设备上的零动作。它只修改本次运行的配置对象，固定 PhysX 和一个环境；默认物理步长为 0.001 秒、每两个物理步推进一次控制。奖励、终止条件、观察和自动重置仍由任务执行。预热不计入耗时，测量结束包含 GPU 完成同步，不在每步额外同步。
+
+在 Isaac Lab 3.0 环境中分别运行：
+
+```powershell
+python .\scripts\diagnostics\env_step_rtf.py --task Isaac-Cartpole --device cuda:0 --viz none --info
+python .\scripts\diagnostics\env_step_rtf.py --task Hexchip-Cartpole-Real-V2-v0 --device cuda:0 --viz none --info
+```
+
+比较两次 `ENV_STEP_TIMING`，确认 `physics_dt_s=0.001`、`step_dt_s=0.002`、`num_envs=1` 和 `device=cuda:0`。两者都是完整环境的零动作基线，不包含模型推理，也不使用 RSL-RL 包装器。不同任务的动力学、动作含义、终止条件和重置次数可能不同，因此差值不是某一函数的精确成本，更不能等同于相同策略的性能差距。该对照用于决定下一步优先检查框架公共路径还是项目额外逻辑，不衡量控制效果。
