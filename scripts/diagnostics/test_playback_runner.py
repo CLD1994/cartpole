@@ -1,7 +1,28 @@
 """策略加载边界测试；不导入 Isaac Lab、不访问模型文件。"""
 import unittest
 from types import SimpleNamespace
-from playback_rtf import load_policy
+from playback_rtf import load_policy, parse_args
+
+
+class DiagnosticArgumentsTests(unittest.TestCase):
+    def parse(self, *extra):
+        return parse_args(['--checkpoint', 'existing.pt', *extra],
+                          add_launcher_args=lambda parser: None)
+
+    def test_render_interval_preserves_task_default(self):
+        self.assertIsNone(self.parse().render_interval)
+
+    def test_render_interval_accepts_positive_integer(self):
+        self.assertEqual(self.parse('--render-interval', '20').render_interval, 20)
+
+    def test_render_interval_rejects_invalid_values(self):
+        from contextlib import redirect_stderr
+        from io import StringIO
+        for value in ('0', '-1', '1.5', 'invalid'):
+            with self.subTest(value=value), redirect_stderr(StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    self.parse('--render-interval', value)
+                self.assertEqual(error.exception.code, 2)
 
 
 class PolicyLoadingTests(unittest.TestCase):

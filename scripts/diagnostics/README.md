@@ -13,7 +13,7 @@ python .\scripts\diagnostics\playback_rtf.py --checkpoint <模型完整路径> -
 python .\scripts\diagnostics\playback_rtf.py --checkpoint <同一模型完整路径> --viz none --info --seed 42
 ```
 
-默认预热500步，测量5000步，单环境。物理后端固定为 Isaac Sim PhysX；两组只改变是否启用界面。实际物理步长、控制周期、渲染间隔会随结果输出，不修改这些配置。
+默认预热500步，测量5000步，单环境。物理后端固定为 Isaac Sim PhysX；两组只改变是否启用界面。实际物理步长、控制周期、渲染间隔会随结果输出。默认保留任务配置。
 
 默认不 sleep，测量可达到的回放速度。追加 `--real-time` 才模拟官方 play 的补 sleep 节拍；慢于实时则不补 sleep，也不跳步追赶。两种模式必须分别比较。
 
@@ -42,3 +42,15 @@ python -m unittest discover -s scripts/diagnostics -p "test_*.py"
 GPU执行是异步的：某调用可能只提交工作，后续调用才等待前面的GPU结果。因此这些值不能称为GPU核耗时，也不能把环境调用的等待全部归咎物理。工具不在各阶段强制同步。`completion_sync_s`仅表示循环结束时仍需等待的工作，并不是全部GPU时间。`step_loop_wall_s`加`completion_sync_s`等于总墙钟时间。
 
 GUI/无GUI对照须使用相同模型、种子、步数、预热和节拍模式。可先用 `--steps 1000 --warmup 500 --breakdown` 缩短诊断轮次，再依据数据决定是否需要更深入的独立短时性能跟踪；不要修改物理步长、控制频率或模型来掩盖吞吐不足。
+
+## 显示间隔对照
+
+`--render-interval` 指定每隔多少个物理步更新显示，必须为正整数；省略时保留任务默认值。
+例如物理步长为 0.001 秒时，`--render-interval 20` 表示每 0.02 秒模拟时间更新一次显示。
+这不改变物理步长、控制周期或模型，也不保证现实时间内恒定 50 帧。
+
+```powershell
+python .\scripts\diagnostics\playback_rtf.py --checkpoint <模型完整路径> --device cpu --viz kit --info --render-interval 20
+```
+
+与基线保持相同设备、模型、种子、步数和预热，只改变显示间隔。核对输出中的 `render_interval`，同时观察界面响应与 RTF。
