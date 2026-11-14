@@ -12,6 +12,7 @@
 import math
 
 from cartpole.device_profile import load_profile, model_parameters
+from cartpole.training_parameters import validate_training_ranges
 
 DEVICE = model_parameters(load_profile())
 
@@ -98,7 +99,13 @@ class RealCartpoleV2EnvCfg(CartpoleEnvCfg):
         )
 
         # 终止边界比软限位内缩130mm；仿真终止不等于物理制动。
-        train_limit = DEVICE["soft_limit_m"] - 0.13
+        initial_position_range = (-0.15, 0.15)
+        acceleration_range = (8.0, DEVICE["acceleration_m_s2"])
+        train_limit = validate_training_ranges(
+            soft_limit_m=DEVICE["soft_limit_m"], boundary_inset_m=0.13,
+            initial_position_range=initial_position_range,
+            acceleration_range=acceleration_range,
+        )
         self.terminations.cart_out_of_bounds = DoneTerm(
             func=joint_pos_out_of_manual_limit,
             params={"asset_cfg": SceneEntityCfg("robot", joint_names=["slider_to_cart"]), "bounds": (-train_limit, train_limit)},
@@ -116,7 +123,7 @@ class RealCartpoleV2EnvCfg(CartpoleEnvCfg):
             mode="reset",
             params={
                 "asset_cfg": SceneEntityCfg("robot", joint_names=["slider_to_cart"]),
-                "position_range": (-0.15, 0.15),
+                "position_range": initial_position_range,
                 "velocity_range": (-0.3, 0.3),
             },
         )
@@ -170,7 +177,7 @@ class RealCartpoleV2EnvCfg(CartpoleEnvCfg):
                 "action_name": "joint_effort",
                 "vel_max_range": (DEVICE["velocity_m_s"], DEVICE["velocity_m_s"]),
                 "tau_range": (0.010, 0.040),
-                "acc_max_range": (8.0, DEVICE["acceleration_m_s2"]),
+                "acc_max_range": acceleration_range,
             },
         )
         # 命令传输延迟假设6–16ms；不是观测速度滤波，也不是策略频率波动。

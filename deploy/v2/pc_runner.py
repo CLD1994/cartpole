@@ -18,7 +18,7 @@ deploy/v2/edge（C610 端侧 C 程序）的控制环：同一套会话建立、�
     若在 DISABLED：先用固件配套工具查询 calib-status。有持久化标定时在
     同一左参考点 confirm-left；无有效记录时才做两点标定。现场确认后再 enable。
     --dry-run 不发送 VEL，但仍推送运行限幅和看门狗参数，不是只读模式。
-    实验 VEL_VALID 协议尚未适配，不得用本程序驱动该实验固件。
+    当前固件的 VEL_VALID 有效性协议尚未适配，本旧入口不能直接部署新模型。
 
 依赖：pyserial、onnxruntime（含 numpy）。ONNX 由训练机
 scripts/rsl_rl/play.py 跑一次 v2 任务导出（checkpoint 同目录 exported/
