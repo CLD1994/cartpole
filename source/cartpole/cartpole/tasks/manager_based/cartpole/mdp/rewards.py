@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from isaaclab.managers import ManagerTermBase, RewardTermCfg, SceneEntityCfg
+from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.math import wrap_to_pi
 
 if TYPE_CHECKING:
@@ -59,26 +59,3 @@ def joint_boundary_l2(
     position = asset.data.joint_pos.torch[:, asset_cfg.joint_ids]
     excess = torch.clamp(torch.abs(position) - free_radius, min=0.0)
     return torch.sum(torch.square(excess / (limit - free_radius)), dim=1)
-
-
-class survival_success_rate(ManagerTermBase):
-    """Tracks episode survival as the success metric.
-
-    Returns zero reward (pure metric tracking). Flushes ``Metrics/success_rate``
-    into ``extras["log"]`` on episode reset, where success = timed out without
-    early termination.
-    """
-
-    def __init__(self, env: ManagerBasedRLEnv, cfg: RewardTermCfg):
-        super().__init__(cfg, env)
-
-    def reset(self, env_ids: torch.Tensor):
-        manager = self._env.termination_manager
-        survived = manager.time_outs[env_ids] & ~manager.terminated[env_ids]
-        # 初始化或空重置没有可统计的回合，不发布空均值。
-        if survived.numel() == 0:
-            return
-        self._env.extras.setdefault("log", {})["Metrics/success_rate"] = survived.float().mean().item()
-
-    def __call__(self, env: ManagerBasedRLEnv) -> torch.Tensor:
-        return torch.zeros(env.num_envs, device=env.device)

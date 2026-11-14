@@ -24,6 +24,16 @@ def main(argv: list[str] | None = None, *, run_cli: Callable[[list[str]], int] |
 
         run_cli = run_train_cli
     args = list(sys.argv[1:] if argv is None else argv)
+    # 项目任务使用公开 Gym entry_point 子类记录完整回合；不替换上游 runner/logger。
+    task = next((a.split("=", 1)[1] for a in args if a.startswith("--task=")), "")
+    if "--task" in args:
+        index = args.index("--task")
+        if index + 1 < len(args):
+            task = args[index + 1]
+    if task.startswith("Hexchip-Cartpole") and not any(
+        a.startswith("env.training_episode_log_window_s=") for a in args
+    ):
+        args.append("env.training_episode_log_window_s=1.0")
     return run_cli(["--rl_library", "rsl_rl", *args])
 
 

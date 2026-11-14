@@ -14,7 +14,7 @@ from . import agents
 
 gym.register(
     id="Hexchip-Cartpole-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    entry_point=f"{__name__}.training_metrics_env:TrainingMetricsEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.cartpole_env_cfg:CartpoleEnvCfg",
@@ -25,7 +25,7 @@ gym.register(
 
 gym.register(
     id="Hexchip-Cartpole-Real-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    entry_point=f"{__name__}.training_metrics_env:TrainingMetricsEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.cartpole_env_cfg_sim2real:RealCartpoleEnvCfg",
@@ -35,7 +35,7 @@ gym.register(
 
 gym.register(
     id="Hexchip-Cartpole-Real-V2-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    entry_point=f"{__name__}.training_metrics_env:TrainingMetricsEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.cartpole_env_cfg_sim2real_v2:RealCartpoleV2EnvCfg",
