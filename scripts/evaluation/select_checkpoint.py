@@ -22,6 +22,83 @@ def save(path, data):
     tmp.replace(path)
 
 
+def nominate_complete_episodes(run, checkpoints, candidates, window):
+    """新run以逐iteration原始计数为权威；缺失整套日志才交给旧日志提名。"""
+    episode_file = run/'training-episodes.jsonl'
+    checkpoint_file = run/'training-checkpoints.jsonl'
+    if not episode_file.exists() and not checkpoint_file.exists():
+        return None
+    if not episode_file.is_file() or not checkpoint_file.is_file():
+        raise ValueError('新回合日志只有一份，不能回退旧标量；请恢复完整文件或显式指定候选')
+    rows = [json.loads(line) for line in episode_file.read_text(encoding='utf-8').splitlines() if line.strip()]
+    saves = [json.loads(line) for line in checkpoint_file.read_text(encoding='utf-8').splitlines() if line.strip()]
+    if not rows or not saves:
+        raise ValueError('新回合日志为空，不能用于自动提名')
+    def integer(value):
+        return isinstance(value,int) and not isinstance(value,bool) and value>=0
+    by_iteration = {}
+    previous = None
+    for row in rows:
+        if row.get('schema_version')!=2 or row.get('rank')!=0 or Path(row['run_dir']).resolve()!=run:
+            raise ValueError('回合日志schema/rank/run_dir不匹配；请显式指定候选')
+        fields = ['iteration','start_iteration','window_start_step','window_end_step','completed','successes','failures']
+        if not all(integer(row[k]) for k in fields) or row['successes']+row['failures']!=row['completed']:
+            raise ValueError('回合日志计数无效')
+        if row['window_end_step']<=row['window_start_step'] or row['iteration'] in by_iteration:
+            raise ValueError('回合窗口无效或iteration重复')
+        if previous is None:
+            if row['iteration']!=row['start_iteration'] or row['window_start_step']!=0:
+                raise ValueError('回合日志缺失首个窗口')
+        elif (row['iteration']!=previous['iteration']+1 or row['start_iteration']!=previous['start_iteration']
+              or row['window_start_step']!=previous['window_end_step']):
+            raise ValueError('回合日志窗口不连续，不能混合恢复运行或缺失样本')
+        by_iteration[row['iteration']]=row
+        previous=row
+    bindings = {}
+    for record in saves:
+        if record.get('schema_version')!=1:
+            raise ValueError('未知checkpoint日志schema')
+        path = str(Path(record['checkpoint']).resolve())
+        iteration = record['saved_after_update_iteration']
+        if not integer(iteration) or iteration not in by_iteration or record['training_iteration_metrics']!=by_iteration[iteration]:
+            raise ValueError('checkpoint保存记录与iteration计数不一致')
+        if Path(path).parent!=run:
+            raise ValueError('checkpoint保存记录不属于同一run')
+        bindings[path]=iteration  # 最终保存可重复同一路径，按生产者约定取最后一条。
+    mapped=[]
+    for candidate in checkpoints:
+        row=dict(candidate)
+        if candidate['path'] not in bindings or bindings[candidate['path']]!=candidate['iteration']:
+            row.update(eligible=False, reason='no_matching_save_record')
+        else:
+            samples=[v for i,v in by_iteration.items() if candidate['iteration']-window+1<=i<=candidate['iteration']]
+            completed=sum(v['completed'] for v in samples)
+            successes=sum(v['successes'] for v in samples)
+            row.update(eligible=completed>0, reason=None if completed else 'no_complete_episodes',
+                       completed=completed,successes=successes,
+                       success_rate=successes/completed if completed else None,
+                       iterations=[v['iteration'] for v in samples],
+                       window_start_step=samples[0]['window_start_step'],window_end_step=samples[-1]['window_end_step'])
+        mapped.append(row)
+    available=[r for r in mapped if r['eligible']]
+    if not available:
+        raise ValueError('没有已完成回合且保存记录可关联的候选；不能按零样本排名，请显式指定候选')
+    selected=[]
+    groups=min(candidates,len(available))
+    for group in range(groups):
+        segment=available[group*len(available)//groups:(group+1)*len(available)//groups]
+        best=max(segment,key=lambda r:(r['success_rate'],r['completed'],-r['iteration']))
+        selected.append(next(c for c in checkpoints if c['path']==best['path']))
+    final=checkpoints[-1]
+    if final not in selected:
+        selected.append(final)
+    return selected,dict(method='temporal_groups_complete_episode_counts',window_iterations=window,
+        mapping=mapped,requested_groups=candidates,final_checkpoint_included_for_coverage=True,
+        source_files=[dict(path=str(p),sha256=digest(p)) for p in (episode_file,checkpoint_file)],
+        ranking_rule='每时段按窗口sum(successes)/sum(completed)提名；同分取样本更多者，再取较早iter；零分母不排名，末checkpoint额外纳入覆盖。',
+        warning='仅rank 0训练回合，回合可能跨策略更新；窗口截至保存iteration，不使用未来样本。checkpoint为更新后权重，不代表冻结评估成绩。')
+
+
 def nominate(run, candidates, window, manual):
     """文件编号只用于映射日志横轴和时段，不作为模型质量分数。"""
     import torch
@@ -47,6 +124,9 @@ def nominate(run, candidates, window, manual):
         if missing:
             raise ValueError(f'手动候选不属于该训练目录的有效checkpoint: {sorted(missing)}')
         return selected, dict(method='manual', checkpoints=checkpoints)
+    complete_episode_nomination = nominate_complete_episodes(run, checkpoints, candidates, window)
+    if complete_episode_nomination is not None:
+        return complete_episode_nomination
     events = sorted(run.glob('events.out.tfevents.*'))
     if not events:
         raise ValueError('缺少同目录TensorBoard日志；请用--checkpoints显式指定候选，不自动伪造训练排名')
@@ -88,6 +168,7 @@ def nominate(run, candidates, window, manual):
     if final not in selected:
         selected.append(final)
     return selected, dict(method='temporal_groups_smoothed_training_reward', window_iterations=window,
+        fallback_reason='同一run没有training-episodes.jsonl及training-checkpoints.jsonl，使用旧训练奖励/长度；不能追溯新成功计数',
         requested_groups=candidates, mapping=mapped, event_files=[dict(path=str(p),sha256=digest(p)) for p in events],
         warning='日志均值是更新前采集且可跨策略版本的最近100个结束回合；model_it为更新后权重。这里只提名，不是冻结checkpoint成绩；旧Metrics/success_rate不参与。')
 
