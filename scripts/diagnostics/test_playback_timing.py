@@ -33,6 +33,8 @@ class TimingTests(unittest.TestCase):
         result = measure_playback(c.step, dt=.002, warmup=5, steps=10,
                                   clock=c.clock, sleep=c.sleep, synchronize=synchronize)
         self.assertAlmostEqual(result['wall_s'], .043)
+        self.assertAlmostEqual(result['step_loop_wall_s'], .040)
+        self.assertAlmostEqual(result['completion_sync_s'], .003)
         self.assertAlmostEqual(result['sim_s'], .020)
 
     def test_bad_duration_rejected(self):

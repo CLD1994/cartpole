@@ -28,3 +28,17 @@ python .\scripts\diagnostics\playback_rtf.py --checkpoint <同一模型完整路
 ```text
 python -m unittest discover -s scripts/diagnostics -p "test_*.py"
 ```
+
+## 调用分段
+
+追加 `--breakdown` 可观察耗时集中在哪个主机调用：
+
+- `policy`：策略推理的主机调用。
+- `environment`：整个环境步进，包括物理、观测、奖励、回合重置及可能的渲染。
+- `policy_recurrent_reset`：策略循环状态重置，不是环境回合重置。
+
+每项输出次数、累计、平均、p50、p95、最大耗时。统计不含预热，分位数为最近秩定义。排序和JSON输出在计时外执行。记录每次主机调用增加少量时钟读取和列表写入；需要与同条件不带 `--breakdown` 的RTF对照，不能把诊断开销当成模型变化。
+
+GPU执行是异步的：某调用可能只提交工作，后续调用才等待前面的GPU结果。因此这些值不能称为GPU核耗时，也不能把环境调用的等待全部归咎物理。工具不在各阶段强制同步。`completion_sync_s`仅表示循环结束时仍需等待的工作，并不是全部GPU时间。`step_loop_wall_s`加`completion_sync_s`等于总墙钟时间。
+
+GUI/无GUI对照须使用相同模型、种子、步数、预热和节拍模式。可先用 `--steps 1000 --warmup 500 --breakdown` 缩短诊断轮次，再依据数据决定是否需要更深入的独立短时性能跟踪；不要修改物理步长、控制频率或模型来掩盖吞吐不足。

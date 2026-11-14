@@ -4,7 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 
-from playback_timing import measure_playback
+from playback_timing import HostPhaseTimer, measure_playback
 
 
 def load_policy(env, agent_cfg, checkpoint, *, create_runner):
@@ -36,6 +36,7 @@ def main(argv=None):
     parser.add_argument('--steps', type=int, default=5000)
     parser.add_argument('--warmup', type=int, default=500)
     parser.add_argument('--real-time', action='store_true')
+    parser.add_argument('--breakdown', action='store_true', help='记录主机调用分段耗时，不等于GPU核耗时')
     add_launcher_args(parser)
     args = parser.parse_args(argv)
     # 显式固定同一物理后端，不能让有无界面改变物理实现。
@@ -61,10 +62,16 @@ def main(argv=None):
             env = RslRlVecEnvWrapper(raw_env, clip_actions=agent_cfg.clip_actions)
             policy = load_policy(env, agent_cfg, checkpoint, create_runner=create_rsl_rl_runner)
             obs = env.get_observations()
+            phases = HostPhaseTimer()
             def step():
                 nonlocal obs
-                obs, _, dones, _ = env.step(policy(obs))
-                policy.reset(dones)
+                if args.breakdown:
+                    action = phases.call('policy', policy, obs)
+                    obs, _, dones, _ = phases.call('environment', env.step, action)
+                    phases.call('policy_recurrent_reset', policy.reset, dones)
+                else:
+                    obs, _, dones, _ = env.step(policy(obs))
+                    policy.reset(dones)
             device = torch.device(env.unwrapped.device)
             def synchronize():
                 if device.type == 'cuda':
@@ -72,13 +79,16 @@ def main(argv=None):
             with torch.inference_mode():
                 result = measure_playback(step, dt=env.unwrapped.step_dt,
                     steps=args.steps, warmup=args.warmup, real_time=args.real_time,
-                    synchronize=synchronize)
+                    synchronize=synchronize, on_measurement_start=phases.clear)
             result.update(checkpoint=str(checkpoint), checkpoint_sha256=digest,
                 task=args.task, seed=args.seed, num_envs=1,
                 physics_dt_s=env.unwrapped.physics_dt,
                 render_interval=env_cfg.sim.render_interval,
                 visualization=getattr(args, 'visualizer', None), device=str(device),
                 physics_backend=type(env_cfg.sim.physics).__name__)
+            if args.breakdown:
+                result['host_call_timings'] = phases.summary()
+                result['timing_scope'] = 'host calls; environment includes physics, episode reset and rendering; not GPU kernel attribution'
             print('PLAYBACK_TIMING ' + json.dumps(result, ensure_ascii=False))
         finally:
             raw_env.close()
