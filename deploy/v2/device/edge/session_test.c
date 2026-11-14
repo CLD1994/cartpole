@@ -51,6 +51,17 @@ static void test_action_maps_profile_velocity(void) {
     assert(device_session_start(s, 1)); assert(device_session_action(s, 1, 1.01));
     assert(!strcmp(w.lines[0], "VEL 1250\n")); device_session_destroy(s);
 }
+static void test_action_rounds_half_units_away_from_zero(void) {
+    struct wire w = {0}; device_session *s = create(&w); prepare(s);
+    assert(device_session_start(s, 1));
+    const double actions[] = {0.0004, -0.0004, 0.002, -0.002, 0.00039, -0.00039};
+    const char *expected[] = {"VEL 1\n", "VEL -1\n", "VEL 3\n", "VEL -3\n", "VEL 0\n", "VEL 0\n"};
+    for (size_t i = 0; i < sizeof(actions) / sizeof(actions[0]); ++i) {
+        assert(device_session_action(s, actions[i], 1));
+        assert(!strcmp(w.lines[i], expected[i]));
+    }
+    device_session_destroy(s);
+}
 static void test_action_outward_at_boundary_is_zero(void) {
     struct wire w = {0}; device_session *s = create(&w); prepare(s);
     assert(device_session_start(s, 1));
@@ -64,10 +75,13 @@ static void test_action_inward_at_boundary_is_allowed(void) {
     assert(!strcmp(w.lines[0], "VEL -1250\n")); device_session_destroy(s);
 }
 static void test_nonfinite_action_latches_failure(void) {
-    struct wire w = {0}; device_session *s = create(&w); prepare(s);
-    assert(device_session_start(s, 1)); assert(!device_session_action(s, NAN, 1));
-    assert(device_session_snapshot(s).error == DEVICE_INVALID_ACTION);
-    assert(!strcmp(w.lines[0], "VEL 0\n")); device_session_destroy(s);
+    const double actions[] = {NAN, INFINITY, -INFINITY};
+    for (size_t i = 0; i < sizeof(actions) / sizeof(actions[0]); ++i) {
+        struct wire w = {0}; device_session *s = create(&w); prepare(s);
+        assert(device_session_start(s, 1)); assert(!device_session_action(s, actions[i], 1));
+        assert(device_session_snapshot(s).error == DEVICE_INVALID_ACTION);
+        assert(!strcmp(w.lines[0], "VEL 0\n")); device_session_destroy(s);
+    }
 }
 static void test_invalid_measurement_clears_cache(void) {
     struct wire w = {0}; device_session *s = create(&w); prepare(s);
@@ -298,6 +312,7 @@ static void test_stopping_error_survives_disabled_ack(void) {
 int main(void) {
     test_create_is_inert(); test_refresh_only_queries(); test_start_requires_complete_metadata();
     test_start_is_not_enable(); test_action_maps_profile_velocity();
+    test_action_rounds_half_units_away_from_zero();
     test_action_outward_at_boundary_is_zero(); test_action_inward_at_boundary_is_allowed();
     test_nonfinite_action_latches_failure(); test_invalid_measurement_clears_cache();
     test_validity_recovery_requires_new_state(); test_active_failure_cannot_resume();
@@ -318,5 +333,5 @@ int main(void) {
     test_missing_calibration_value_revokes_readback();
     test_missing_config_value_revokes_readback(); test_missing_active_config_value_latches();
     test_stopping_fault_survives_disabled_ack(); test_stopping_error_survives_disabled_ack();
-    puts("device session: 41 public-contract unit cases passed");
+    puts("device session: 42 public-contract unit cases passed");
 }
