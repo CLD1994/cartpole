@@ -99,8 +99,12 @@ static bool integer(const char *p, int64_t *value) {
 static bool finite_positive(double x) { return isfinite(x) && x > 0; }
 
 device_session *device_session_create(device_limits l, device_send_fn send, void *context) {
-    if (!send || l.speed_mm_s <= 0 || l.acceleration_mm_s2 <= 0 ||
-        l.soft_margin_um <= 0 || l.watchdog_ms <= 0 || l.watchdog_decel_mm_s2 <= 0 ||
+    /* CONFIG protocol ranges; these are not measured mechanical limits. */
+    if (!send || l.speed_mm_s < 1 || l.speed_mm_s > 2000 ||
+        l.acceleration_mm_s2 < 100 || l.acceleration_mm_s2 > 30000 ||
+        l.soft_margin_um < 1000 || l.soft_margin_um > 50000 ||
+        l.watchdog_ms < 10 || l.watchdog_ms > 1000 ||
+        l.watchdog_decel_mm_s2 < 100 || l.watchdog_decel_mm_s2 > 30000 ||
         !finite_positive(l.state_timeout_s) || !finite_positive(l.validity_timeout_s) ||
         !finite_positive(l.metadata_timeout_s) || !finite_positive(l.stop_timeout_s)) return NULL;
     device_session *s = calloc(1, sizeof(*s));
@@ -136,7 +140,8 @@ bool device_session_feed(device_session *s, const char *line, double now) {
         bool valid = !strcmp(words[1], "1") && !strcmp(words[2], "1");
         if (!valid) {
             invalidate(s);
-            if (s->view.phase == DEVICE_ACTIVE) fail(s, DEVICE_INVALID_MEASUREMENT);
+            if (s->view.phase == DEVICE_ACTIVE || s->view.phase == DEVICE_STOPPING)
+                fail(s, DEVICE_INVALID_MEASUREMENT);
         } else {
             /* 无效后必须重新收到STATE，不能复用旧缓存。 */
             s->valid_known = true; s->view.validity = true; s->valid_at = now;

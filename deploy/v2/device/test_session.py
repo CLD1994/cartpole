@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 
 from session import Limits, Phase, Session
 from check import limits_from_profile
@@ -337,6 +338,52 @@ class SessionTests(unittest.TestCase):
         self.s.receive('OK ACC_MAX')
         self.assertEqual(self.s.phase, Phase.STOPPING)
         self.assertEqual(self.s.failure, 'malformed_OK')
+
+    def test_invalid_measurement_during_stop_preserves_failure(self):
+        self.ready()
+        self.s.start()
+        self.s.stop()
+        self.s.receive('VEL_VALID 0 1')
+        self.clock.time += .04
+        self.s.receive('VEL_VALID 1 1')
+        self.s.receive('STATE 0 0 0 0')
+        self.clock.time += .04
+        self.s.tick()
+        self.s.receive('MODE DISABLED NONE')
+        self.assertTrue(self.s.disabled_confirmed)
+        self.assertEqual(self.s.failure, 'measurement_invalid')
+
+    def test_invalid_measurement_preserves_existing_failure_and_stop_deadline(self):
+        self.ready()
+        self.s.start()
+        with self.assertRaises(ValueError): self.s.command(2)
+        self.clock.time += .5
+        self.s.receive('VEL_VALID 0 1')
+        self.clock.time += .51
+        self.s.tick()
+        self.assertEqual(self.s.phase, Phase.FINISHED)
+        self.assertEqual(self.s.failure, 'invalid_action')
+        self.assertFalse(self.s.disabled_confirmed)
+
+    def test_limits_reject_invalid_integer_fields(self):
+        ranges = {'speed_mm_s': (1, 2000), 'acceleration_mm_s2': (100, 30000),
+                  'margin_um': (1000, 50000), 'watchdog_ms': (10, 1000),
+                  'watchdog_decel': (100, 30000)}
+        for name, (low, high) in ranges.items():
+            for value in (True, '100', None, 100.5, float('nan'), low - 1, high + 1):
+                with self.subTest(name=name, value=value):
+                    with self.assertRaisesRegex(ValueError, name):
+                        replace(self.limits, **{name: value})
+            for value in (low, high):
+                self.assertEqual(getattr(replace(self.limits, **{name: value}), name), value)
+
+    def test_limits_reject_invalid_continuous_fields(self):
+        for name in ('control_hz', 'state_timeout_s', 'validity_timeout_s',
+                     'preflight_timeout_s', 'stop_timeout_s'):
+            for value in (True, '1', None, 0, -1, float('nan'), float('inf')):
+                with self.subTest(name=name, value=value):
+                    with self.assertRaisesRegex(ValueError, name):
+                        replace(self.limits, **{name: value})
 
     def test_profile_adapter_uses_injected_profile(self):
         profile = {'training': {'control_hz': 450}, 'configured': {

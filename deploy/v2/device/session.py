@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 import math
-from numbers import Real
+from numbers import Integral, Real
 from typing import Callable, Protocol
 
 
@@ -33,8 +33,18 @@ class Limits:
     stop_timeout_s: float = 1.
 
     def __post_init__(self):
-        if any(not math.isfinite(v) or v <= 0 for v in vars(self).values()):
-            raise ValueError('会话限制必须是有限正数')
+        # These integer limits match the firmware CONFIG protocol, not measured capacity.
+        integer_ranges = {'speed_mm_s': (1, 2000), 'acceleration_mm_s2': (100, 30000),
+                          'margin_um': (1000, 50000), 'watchdog_ms': (10, 1000),
+                          'watchdog_decel': (100, 30000)}
+        for name, value in vars(self).items():
+            if name in integer_ranges:
+                low, high = integer_ranges[name]
+                if isinstance(value, bool) or not isinstance(value, Integral) or not low <= value <= high:
+                    raise ValueError(f'{name} 必须是 [{low}, {high}] 范围内的整数')
+            elif (isinstance(value, bool) or not isinstance(value, Real)
+                  or not math.isfinite(value) or value <= 0):
+                raise ValueError(f'{name} 必须是有限正数')
 
     @property
     def config(self):

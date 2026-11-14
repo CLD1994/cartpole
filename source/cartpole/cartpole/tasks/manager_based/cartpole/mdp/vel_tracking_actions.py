@@ -55,9 +55,8 @@ class JointVelocityTrackingActionCfg(JointEffortActionCfg):
     within the acceleration bound. Randomized per-environment."""
 
     acc_max: float = 4.0
-    """Acceleration limit [m/s^2]: the policy's true authority ceiling (the pole is steered by
-    cart acceleration). Randomized per-environment. Training upper bound must not exceed the
-    firmware session clamp ``ACC_MAX``."""
+    """参考速度变化率上限 [m/s²]，不是物理关节实际加速度的硬上限。
+    力伺服与摆杆反作用共同决定实际加速度，训练范围需结合实测辨识。"""
 
     delay_steps: int = 1
     """Command transport delay [policy steps]. The velocity command is held for this many steps
@@ -74,6 +73,4 @@ class JointVelocityTrackingActionCfg(JointEffortActionCfg):
     faster than ``tau`` so the modeled dynamics dominate."""
 
     effort_limit: float = 3.0
-    """Effort cap [N]. Safety net only (the acceleration limit is enforced by the tracking
-    law itself); must comfortably exceed m_eff * acc_max (0.19 kg * 5 m/s^2 = 0.95 N) plus
-    the pole gravity reaction (~0.9 N at 60 deg tilt)."""
+    """施加到关节的力上限 [N]；是待辨识的模型参数，不是实测电机推力。"""

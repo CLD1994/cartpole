@@ -12,6 +12,7 @@
 import math
 
 from cartpole.device_profile import load_profile, model_parameters
+from cartpole.training_parameters import validate_training_ranges
 
 DEVICE = model_parameters(load_profile())
 
@@ -66,11 +67,11 @@ class RealCartpoleV2EnvCfg(CartpoleEnvCfg):
             effort_limit=8.0,  # 未辨识的仿真伺服力上限，不是电机测得推力
         )
 
-        # --- observations: noise matched to the v2 sensors per sim2real-spec.md.
-        # joint order for positions: [cart (m), pole (rad)]; for velocities: [m/s, rad/s].
-        # x: sigma 0.05 mm (AS5600 9.77 um quantization + multiturn accumulation, relaxed);
-        # theta: sigma 1 mrad (MT6901 3 urad resolution, relaxed to magnetic-encoder noise);
-        # vx: sigma 5 mm/s, vth: sigma 10 mrad/s (firmware velocity-estimator targets). ---
+        # 两路实物编码器均为 MT6835；以下噪声是建模假设，不是实测或器件精度。
+        # 关节顺序为 [小车, 摆杆]；位置单位 [m, rad]，速度单位 [m/s, rad/s]。
+        # 标准差依次为 0.05 mm、1 mrad、5 mm/s、10 mrad/s。
+        # 速度观测仍来自仿真瞬时关节速度，未复现固件采样窗口与无效状态。
+        # 观测边界见 deploy/v2/sim2real-spec.md。
         self.observations.policy.joint_pos_rel.noise = GaussianNoiseCfg(
             func=gaussian_noise_from_list, mean=0.0, std=[5.0e-5, 1.0e-3]
         )
@@ -98,7 +99,13 @@ class RealCartpoleV2EnvCfg(CartpoleEnvCfg):
         )
 
         # 终止边界比软限位内缩130mm；仿真终止不等于物理制动。
-        train_limit = DEVICE["soft_limit_m"] - 0.13
+        initial_position_range = (-0.15, 0.15)
+        acceleration_range = (8.0, DEVICE["acceleration_m_s2"])
+        train_limit = validate_training_ranges(
+            soft_limit_m=DEVICE["soft_limit_m"], boundary_inset_m=0.13,
+            initial_position_range=initial_position_range,
+            acceleration_range=acceleration_range,
+        )
         self.terminations.cart_out_of_bounds = DoneTerm(
             func=joint_pos_out_of_manual_limit,
             params={"asset_cfg": SceneEntityCfg("robot", joint_names=["slider_to_cart"]), "bounds": (-train_limit, train_limit)},
@@ -116,7 +123,7 @@ class RealCartpoleV2EnvCfg(CartpoleEnvCfg):
             mode="reset",
             params={
                 "asset_cfg": SceneEntityCfg("robot", joint_names=["slider_to_cart"]),
-                "position_range": (-0.15, 0.15),
+                "position_range": initial_position_range,
                 "velocity_range": (-0.3, 0.3),
             },
         )
@@ -170,7 +177,7 @@ class RealCartpoleV2EnvCfg(CartpoleEnvCfg):
                 "action_name": "joint_effort",
                 "vel_max_range": (DEVICE["velocity_m_s"], DEVICE["velocity_m_s"]),
                 "tau_range": (0.010, 0.040),
-                "acc_max_range": (8.0, DEVICE["acceleration_m_s2"]),
+                "acc_max_range": acceleration_range,
             },
         )
         # 命令传输延迟假设6–16ms；不是观测速度滤波，也不是策略频率波动。

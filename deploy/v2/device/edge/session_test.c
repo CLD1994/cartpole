@@ -309,7 +309,50 @@ static void test_stopping_error_survives_disabled_ack(void) {
     assert(device_session_snapshot(s).disabled_confirmed);
     assert(device_session_snapshot(s).error == DEVICE_FIRMWARE_FAULT); device_session_destroy(s);
 }
+static void test_stopping_invalid_measurement_survives_disabled_ack(void) {
+    struct wire w = {0}; device_session *s = create(&w); prepare(s);
+    assert(device_session_start(s, 1)); assert(device_session_stop(s, 1));
+    assert(!device_session_feed(s, "VEL_VALID 0 1", 1));
+    assert(!device_session_feed(s, "VEL_VALID 1 1", 1.04));
+    assert(!device_session_feed(s, "STATE 0 0 0 0", 1.04));
+    device_session_tick(s, 1.08);
+    assert(!device_session_feed(s, "MODE DISABLED NONE", 1.08));
+    assert(device_session_snapshot(s).disabled_confirmed);
+    assert(device_session_snapshot(s).error == DEVICE_INVALID_MEASUREMENT);
+    device_session_destroy(s);
+}
+static void test_invalid_measurement_preserves_existing_error_and_deadline(void) {
+    struct wire w = {0}; device_session *s = create(&w); prepare(s);
+    assert(device_session_start(s, 1)); assert(!device_session_action(s, 2, 1));
+    assert(!device_session_feed(s, "VEL_VALID 0 1", 1.5));
+    device_session_tick(s, 2.01);
+    assert(device_session_snapshot(s).phase == DEVICE_FINISHED);
+    assert(device_session_snapshot(s).error == DEVICE_INVALID_ACTION);
+    assert(!device_session_snapshot(s).disabled_confirmed);
+    device_session_destroy(s);
+}
+static void test_limits_match_firmware_ranges(void) {
+    struct wire w = {0};
+    device_limits l = {1250, 10000, 10000, 100, 5000, .1, .3, 1, 1};
+    int *fields[] = {&l.speed_mm_s, &l.acceleration_mm_s2, &l.soft_margin_um,
+                    &l.watchdog_ms, &l.watchdog_decel_mm_s2};
+    const int lows[] = {1, 100, 1000, 10, 100};
+    const int highs[] = {2000, 30000, 50000, 1000, 30000};
+    for (int i = 0; i < 5; ++i) {
+        int saved = *fields[i];
+        *fields[i] = lows[i] - 1; assert(!device_session_create(l, send_line, &w));
+        *fields[i] = highs[i] + 1; assert(!device_session_create(l, send_line, &w));
+        *fields[i] = lows[i]; device_session *s = device_session_create(l, send_line, &w);
+        assert(s); device_session_destroy(s);
+        *fields[i] = highs[i]; s = device_session_create(l, send_line, &w);
+        assert(s); device_session_destroy(s); *fields[i] = saved;
+    }
+    assert(w.count == 0);
+}
 int main(void) {
+    test_stopping_invalid_measurement_survives_disabled_ack();
+    test_limits_match_firmware_ranges();
+    test_invalid_measurement_preserves_existing_error_and_deadline();
     test_create_is_inert(); test_refresh_only_queries(); test_start_requires_complete_metadata();
     test_start_is_not_enable(); test_action_maps_profile_velocity();
     test_action_rounds_half_units_away_from_zero();
@@ -333,5 +376,5 @@ int main(void) {
     test_missing_calibration_value_revokes_readback();
     test_missing_config_value_revokes_readback(); test_missing_active_config_value_latches();
     test_stopping_fault_survives_disabled_ack(); test_stopping_error_survives_disabled_ack();
-    puts("device session: 42 public-contract unit cases passed");
+    puts("device session: 45 public-contract unit cases passed");
 }
