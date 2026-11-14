@@ -174,8 +174,8 @@ static int run_policy(int argc, char **argv, int first)
     }
 
     if (mode != FW_READY) {
-        fprintf(stderr, "[edge] firmware in %s; calibrate first "
-                "(console 'calib'), or RESET a FAULT\n",
+        fprintf(stderr, "[edge] firmware in %s; use firmware host tools to verify calibration "
+                "and left reference before explicit ENABLE\n",
                 proto_mode_name(mode));
         return 1;
     }

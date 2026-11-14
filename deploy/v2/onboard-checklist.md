@@ -1,3 +1,5 @@
+> 本页为对应版本的历史验收记录，不是当前设备参数或当前固件操作清单。当前准备入口见 [训练准备](training-readiness.md)。
+
 # cartpole 上板执行清单（固件改造收尾，由台位操作者亲自执行）
 
 固件源码：`tmp/PD-STEP`（分支 `cartpole`）。线协议权威：
@@ -75,14 +77,9 @@ idf.py -B build flash
 | C9 | 看门狗 | `py wdt-test` | ~100 ms 减速到 0；QUERY 回 READY NONE；恢复发送继续跟踪 | | QUERY → ('READY','NONE')，模式不变、恢复跟踪 ✓ |
 | C10 | 丢步/拔线/长稳 | READY 中手推小车 ≥3 mm（STEP_LOSS）；拔 AS5600（再拔 MT6835）；`py state --secs 600` | 手推 ≤ T/|v| 内 FAULT STEP_LOSS；拔线 ≤15 ms FAULT 对应 reason、EN 关、STATE 流不断；200 Hz 无 reboot | 手推耗时: 拔线耗时: | 三项全过：手推 FAULT STEP_LOSS 力矩消失、reset→enable 标定保留；拔线 FAULT AS5600、STATE 不断；长稳 199–201 Hz、UNKNOWN 0 ✓。附：B3 乱码测试窗口捕获一次自然 STEP_LOSS（E 跳变或外力），保护真实触发 |
 
-## 阶段 D：标定值写回端侧
+## 阶段 D：历史标定记录
 
-C3–C6 结果写入 `deploy/v2/edge/config.h`（会话推送值）：
-`POLE_ZERO_URAD = 1655229 / POLE_INV = 1`（已写入 `CFG_FW_PARAMS`，
-2026-09-26；X_INV 默认 0 不推送）。若实测微调 `STEP_LOSS_UM`、
-`X_MARGIN_UM`，一并加入推送集。随后按 `docs/reviews/T10-acceptance.md`
-走端到端五用例（含 PC 端侧程序经 CH343P 直连的全形态 CLI）。
-若 PC 侧串口设备名与 `CFG_SERIAL_PORT` 不符，一并更新。
+本页 C3–C6 记录属于对应历史台位。当前部署不自动写入这些零点或方向参数；当前设备标定与重启参考确认见 [训练准备](training-readiness.md)。
 
 ## 未决事项出口（本清单完成时逐项关闭）
 
@@ -92,13 +89,6 @@ C3–C6 结果写入 `deploy/v2/edge/config.h`（会话推送值）：
 3. `STEP_LOSS_UM` 初值 → C10 手推实测：3000 µm 初值有效
    （≥3 mm 即触发），关闭。
 4. 460800 联调 → A8 + C10 长稳均过（199–201 Hz、UNKNOWN 0），关闭。
-5. 步进 ISR 吞吐上限 vs VEL_MAX（默认 1000 mm/s ≈ 40 kHz 步频）：
-   第四轮均值已回填——ISR avg ≈ 11k cycles ≈ 46 µs（三段均摊），
-   **可持续 ≈ 22 kHz ≈ 550 mm/s（40 steps/mm）**；max 19.5k（81 µs，
-   离群）。阶段 B/C（≤200 mm/s = 8 kHz）裕量充足，不受影响。
-   控制器需要 >550 mm/s（摆上/急回收）之前，做 ISR 直写寄存器
-   优化（GPIO W1TS/W1TC + 定时器 alarm 直写，预估合计 ~20 µs ≈
-   50 kHz ≈ 1.25 m/s）；间隔采样自测为安全网。优化完成后本条关闭
-   并记录实测新上限。
+5. STEP 输出能力待测：已有 ISR 耗时记录不能证明持续步频上限。需要隔离动力路径后，测量实际引脚频率、脉宽、抖动和计数，再在生产任务负载下复验。
 6. 标定重复性 → C8 关闭：同点散布 0 µm（传感器噪声级远超达标）；
    手推端点定位重复性 ~5 mm 记录在案（C8 记录列），软限位余量覆盖。

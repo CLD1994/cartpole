@@ -1,3 +1,7 @@
+## 当前倒立摆训练准备
+
+开始设备相关训练或部署前，请先阅读 [设备档案与训练准备](deploy/v2/training-readiness.md)。设备几何、质量与固定 500Hz 训练基线已有配置；执行器动态仍需辨识，固件观测窗口与可变策略周期尚未接入，不能直接将训练结果部署到真机。
+
 # Template for Isaac Lab Projects
 
 ## Overview

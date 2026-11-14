@@ -13,8 +13,12 @@ deploy/v2/edge（C610 端侧 C 程序）的控制环：同一套会话建立、�
     py pc_runner.py --port COM6 --onnx policy.onnx --duration 30 # 30 s 后自动停
 
 前置条件（COM 口独占，须先于本程序用 host 工具完成）：
-    固件已标定并 ENABLE（MODE READY）。若在 FAULT：先 reset 再 enable；
-    若在 DISABLED：mark-left -> 推右端 -> mark-right -> enable。
+    固件已标定并 ENABLE（MODE READY）。若在 FAULT：先排查故障原因，
+    检查供电、标定和现场状态，再决定清障及是否重新使能；
+    若在 DISABLED：先用固件配套工具查询 calib-status。有持久化标定时在
+    同一左参考点 confirm-left；无有效记录时才做两点标定。现场确认后再 enable。
+    --dry-run 不发送 VEL，但仍推送运行限幅和看门狗参数，不是只读模式。
+    当前固件的 VEL_VALID 有效性协议尚未适配，本旧入口不能直接部署新模型。
 
 依赖：pyserial、onnxruntime（含 numpy）。ONNX 由训练机
 scripts/rsl_rl/play.py 跑一次 v2 任务导出（checkpoint 同目录 exported/
@@ -571,7 +575,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--state-timeout-s", type=float, default=None)
     parser.add_argument("--duration", type=float, default=None, help="运行秒数（默认直到 Ctrl+C）")
     parser.add_argument(
-        "--dry-run", action="store_true", help="只组装观测跑推理打印动作，不发 VEL"
+        "--dry-run", action="store_true", help="不发 VEL，但仍推送运行配置并进行推理（不是只读）"
     )
     parser.add_argument(
         "--no-frame-fix",
@@ -647,8 +651,8 @@ def main(argv=None) -> int:
         if rig.mode != "READY" and not args.dry_run:
             print(
                 "[pc] 固件在 %s，未就绪。先完成（host 工具，COM 口独占须在本程序外）：\n"
-                "     FAULT -> py tools/cartpole_host.py --port %s reset 再 enable；\n"
-                "     DISABLED -> mark-left -> 推右端 -> mark-right -> enable"
+                "     FAULT -> 先排查原因并核验供电、标定和现场状态，再决定清障与使能（端口 %s）；\n"
+                "     DISABLED -> 用固件工具 calib-status 核验；已有标定时左端 confirm-left，再现场确认 enable"
                 % (rig.mode, args.port),
                 file=sys.stderr,
             )

@@ -6,7 +6,7 @@
 """Configuration for a joint velocity-tracking action for the stepper-driven cartpole rig (v2).
 
 The v2 rig drives the cart with a stepper motor: the policy command is a target cart velocity,
-and the firmware tracks it with a ramp (bounded acceleration). The action term models exactly
+and the firmware tracks it with a ramp (bounded acceleration). The action term approximates
 that behavior per ``deploy/v2/sim2real-spec.md``:
 
     v_cmd = clip(action, -1, 1) * vel_max          (authority scale, randomized)
@@ -47,18 +47,16 @@ class JointVelocityTrackingActionCfg(JointEffortActionCfg):
     """Authority scale [m/s]: the clipped action in [-1, 1] maps to a velocity target in
     [-vel_max, vel_max]. Randomized per-environment by ``randomize_velocity_tracking``.
     Note: the base class ``scale`` is unused (kept at 1.0); ``vel_max`` plays its role as a
-    per-environment tensor. The training upper bound must stay below the rig's
-    ISR-sustainable step rate (~0.55 m/s, onboard-measured), which is tighter than the
-    protocol clamp ``VEL_MAX`` (see deploy/v2/protocol.md)."""
+    per-environment tensor. 训练范围与部署限幅需要结合当前设备的 STEP 波形及运动试验核验，
+    协议限幅不代表实际可执行能力。"""
 
     tau: float = 0.02
     """Tracking time constant [s]: how fast the tracked velocity converges toward the target
     within the acceleration bound. Randomized per-environment."""
 
     acc_max: float = 4.0
-    """Acceleration limit [m/s^2]: the policy's true authority ceiling (the pole is steered by
-    cart acceleration). Randomized per-environment. Training upper bound must not exceed the
-    firmware session clamp ``ACC_MAX``."""
+    """参考速度变化率上限 [m/s²]，不是物理关节实际加速度的硬上限。
+    力伺服与摆杆反作用共同决定实际加速度，训练范围需结合实测辨识。"""
 
     delay_steps: int = 1
     """Command transport delay [policy steps]. The velocity command is held for this many steps
@@ -75,6 +73,4 @@ class JointVelocityTrackingActionCfg(JointEffortActionCfg):
     faster than ``tau`` so the modeled dynamics dominate."""
 
     effort_limit: float = 3.0
-    """Effort cap [N]. Safety net only (the acceleration limit is enforced by the tracking
-    law itself); must comfortably exceed m_eff * acc_max (0.19 kg * 5 m/s^2 = 0.95 N) plus
-    the pole gravity reaction (~0.9 N at 60 deg tilt)."""
+    """施加到关节的力上限 [N]；是待辨识的模型参数，不是实测电机推力。"""

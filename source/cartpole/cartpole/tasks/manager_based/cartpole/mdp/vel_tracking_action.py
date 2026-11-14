@@ -30,13 +30,13 @@ class JointVelocityTrackingAction(JointEffortAction):
     """Velocity-tracking action implementing the v2 rig's stepper execution model.
 
     The rig's firmware receives a target cart velocity and tracks it with a bounded-acceleration
-    ramp (see deploy/v2/protocol.md). This term reproduces that exact law so the policy trains
-    against the behavior the firmware will execute:
+    ramp (see deploy/v2/protocol.md). This term approximates the actuator response; its tracking time constant and
+    effort limit still require identification on the target rig:
 
     1. the raw action is delayed by ``delay_steps`` policy steps (transport latency),
     2. clipped to [-1, 1] and scaled by the per-env ``vel_max`` into a velocity target,
     3. tracked by an internal velocity reference that converges with first-order time constant
-       ``tau`` and per-step increment bounded by ``acc_max * step_dt`` (the ramp),
+       ``tau`` and per-step increment bounded by ``acc_max * physics_dt`` (the ramp),
     4. realized on the joint by a stiff effort servo ``clip(servo_gain * (v_ref - v_actual),
        +-effort_limit)``.
 
@@ -47,6 +47,11 @@ class JointVelocityTrackingAction(JointEffortAction):
     cfg: JointVelocityTrackingActionCfg
 
     def __init__(self, cfg: JointVelocityTrackingActionCfg, env: ManagerBasedEnv) -> None:
+        if env.sim.physics_manager.handles_decimation():
+            raise ValueError(
+                "速度跟踪动作要求逐物理子步调用 apply_actions；"
+                "后端自行处理 decimation 的路径尚未适配，请使用 PhysX。"
+            )
         super().__init__(cfg, env)
         # authority scale / tracking dynamics per environment, randomized by event terms
         self.vel_max = torch.full((self.num_envs,), cfg.vel_max, device=self.device)
@@ -64,21 +69,26 @@ class JointVelocityTrackingAction(JointEffortAction):
         )
         # tracked velocity reference (the output of the ramp law; the servo realizes it)
         self._vel_ref = torch.zeros_like(self.processed_actions)
+        self._delayed_actions = torch.zeros_like(self.processed_actions)
 
-    def apply_actions(self):
+    def process_actions(self, actions: torch.Tensor):
+        """每个策略步只推进一次动作历史；各物理子步共享延迟目标。"""
+        super().process_actions(actions)
         # push the newest raw command at the front of the history (transport delay happens
         # before the firmware ramp)
         self._action_history = torch.cat([self.processed_actions.unsqueeze(0), self._action_history[:-1]], dim=0)
         # gather each environment's command from ``delay_steps`` steps ago
         env_ids = torch.arange(self.num_envs, device=self.device)
-        delayed_actions = self._action_history[self.delay_steps, env_ids]
+        self._delayed_actions = self._action_history[self.delay_steps, env_ids]
 
+    def apply_actions(self):
+        """PhysX 每个物理子步调用；积分使用物理步长而非策略周期。"""
         # velocity target: clip to [-1, 1] and scale by the per-env authority
-        v_cmd = torch.clamp(delayed_actions, -1.0, 1.0) * self.vel_max.unsqueeze(-1)
+        v_cmd = torch.clamp(self._delayed_actions, -1.0, 1.0) * self.vel_max.unsqueeze(-1)
 
         # ramp law: first-order convergence toward the target, per-step increment bounded by
-        # acc_max * step_dt (dv = v * dt / (dt + tau), saturated at +-a_max * dt)
-        step_dt = self._env.step_dt
+        # acc_max * physics_dt，参考速度增量按物理步长限制
+        step_dt = self._env.physics_dt
         k = (step_dt / (step_dt + self.tau)).unsqueeze(-1)
         acc_cap = self.acc_max.unsqueeze(-1) * step_dt
         dv = torch.clamp((v_cmd - self._vel_ref) * k, -acc_cap, acc_cap)
@@ -95,3 +105,4 @@ class JointVelocityTrackingAction(JointEffortAction):
         super().reset(env_ids)
         self._vel_ref[env_ids] = 0.0
         self._action_history[:, env_ids] = 0.0
+        self._delayed_actions[env_ids] = 0.0

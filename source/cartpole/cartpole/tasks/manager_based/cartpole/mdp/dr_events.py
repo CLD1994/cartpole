@@ -169,11 +169,9 @@ def randomize_pole_axis_properties(
 ) -> None:
     """Set the pole's mass, COM and inertia for a uniform rod pivoted off-center (v2 rig).
 
-    The v2 rig's pole is a uniform 0.30 m rod pivoted 20 mm from its short end, so the COM sits
-    0.130 m from the pivot axis — not at length/2 like the v1 (end-pivoted) rod. Transverse
-    inertia about the COM stays ``m*L^2/12`` for a uniform rod regardless of the pivot position.
-    The COM offset and the inertia magnitude are randomized independently of the mass so each
-    uncertainty (assembly position, uniformity assumption) is sampled on its own axis.
+    质量、长度和转轴到质心距离由设备档案传入。绕质心横向惯量按
+    ``m*L^2/12`` 计算；平行轴项由刚体质心偏移处理，不重复加到这里。
+    质量、质心与惯量比例按各自配置范围随机化。
 
     Args:
         env: The environment.
@@ -234,9 +232,8 @@ def randomize_velocity_tracking(
         env: The environment.
         env_ids: Environment indices to randomize.
         action_name: Name of the action term in the action manager.
-        vel_max_range: (min, max) authority scale [m/s]. Upper bound must stay below the
-            rig's ISR-sustainable step rate (~0.55 m/s, onboard-measured), which is tighter
-            than the protocol clamp ``VEL_MAX`` (deploy/v2/protocol.md).
+        vel_max_range: (min, max) authority scale [m/s]. 该范围是建模参数，
+            需要另行核验当前设备的实际执行能力。
         tau_range: (min, max) tracking time constant [s].
         acc_max_range: (min, max) acceleration limit [m/s^2]. Upper bound must not exceed the
             firmware session clamp ``ACC_MAX``.
