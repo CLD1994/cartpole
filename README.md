@@ -2,23 +2,11 @@
 
 开始设备相关训练或部署前，请先阅读 [设备档案与训练准备](deploy/v2/training-readiness.md)。设备几何、质量与固定 500Hz 训练基线已有配置；执行器动态仍需辨识，固件观测窗口与可变策略周期尚未接入，不能直接将训练结果部署到真机。
 
-## 仿真训练入口（Isaac Lab 3.0）
+## Isaac Lab 3.0 使用说明
 
-使用已安装 Isaac Lab 的 Python 环境运行本项目，不要在项目根目录运行 `uv sync` 来重建训练环境。`scripts/rsl_rl/train.py` 和 `play.py` 负责注册本项目任务并转发到 Isaac Lab 的公开 RSL-RL 入口；仿真启动、参数解析、训练和资源关闭由 Isaac Lab 管理。
+训练环境、入口、参数和验证顺序统一见 [Isaac Lab 3.0 仿真工作流](deploy/v2/isaaclab-3-workflow.md)。该说明针对官方 `v3.0.0`（`e3f7d9ff1`），不是当前上游 main。
 
-```powershell
-python scripts/rsl_rl/train.py --task Hexchip-Cartpole-Real-V2-v0 --num_envs 64 --max_iterations 10 --headless
-```
-
-这是有限迭代的仿真启动检查，不连接串口，也不控制真机。成功标准是完成 10 次训练迭代并生成模型检查点，而不是仅通过导入。回放使用 `python scripts/rsl_rl/play.py --task Hexchip-Cartpole-Real-V2-v0 --checkpoint <模型路径>`。其他参数以对应命令的 `--help` 为准。
-
-入口以官方 `v3.0.0`（`e3f7d9ff1`，Python 包 `isaaclab==28.0.0`）的公开接口为依据。命令转发单元测试不启动仿真器：
-
-```text
-python -m unittest discover -s scripts/rsl_rl -p test_entrypoints.py -v
-```
-
-其他诊断脚本不在这次入口兼容范围内；本说明不表示它们已在 Isaac Lab 3.0 下完成验证。
+本项目通过 `scripts/rsl_rl/train.py` 和 `play.py` 注册任务并调用官方公开入口。无交互窗口使用 `--viz none`，不接受旧参数 `--headless`。当前仍需完成真实仿真启动、有限迭代与模型回放验证；代码核查和单测通过不等于训练成功。
 
 # Template for Isaac Lab Projects
 

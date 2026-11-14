@@ -12,7 +12,7 @@ class EntrypointsTest(unittest.TestCase):
                 def dispatch(args):
                     calls.append(args)
                     return 7
-                args = ["--task", "Hexchip-Cartpole-Real-V2-v0", "--headless", "env.seed=42"]
+                args = ["--task", "Hexchip-Cartpole-Real-V2-v0", "--viz", "none", "env.seed=42"]
                 original = args.copy()
                 self.assertEqual(entrypoint(args, run_cli=dispatch), 7)
                 self.assertEqual(calls, [["--rl_library", "rsl_rl", *original]])
@@ -25,6 +25,23 @@ class EntrypointsTest(unittest.TestCase):
             return 0
         self.assertEqual(train.main(["--help"], run_cli=dispatch), 0)
         self.assertEqual(calls, [["--rl_library", "rsl_rl", "--help"]])
+
+    def test_play_forwards_checkpoint_and_visualizer(self):
+        calls = []
+        def dispatch(args):
+            calls.append(args)
+            return 0
+        args = ["--task", "Hexchip-Cartpole-Real-V2-v0", "--checkpoint", "model.pt", "--viz", "kit"]
+        self.assertEqual(play.main(args, run_cli=dispatch), 0)
+        self.assertEqual(calls, [["--rl_library", "rsl_rl", *args]])
+
+    def test_unknown_options_are_not_silently_translated(self):
+        calls = []
+        def dispatch(args):
+            calls.append(args)
+            return 2
+        self.assertEqual(train.main(["--headless"], run_cli=dispatch), 2)
+        self.assertEqual(calls, [["--rl_library", "rsl_rl", "--headless"]])
 
 
 if __name__ == "__main__":
