@@ -2,6 +2,12 @@
 
 开始设备相关训练或部署前，请先阅读 [设备档案与训练准备](deploy/v2/training-readiness.md)。设备几何、质量与固定 500Hz 训练基线已有配置；执行器动态仍需辨识，固件观测窗口与可变策略周期尚未接入，不能直接将训练结果部署到真机。
 
+## Isaac Lab 3.0 使用说明
+
+训练环境、入口、参数和验证顺序统一见 [Isaac Lab 3.0 仿真工作流](deploy/v2/isaaclab-3-workflow.md)。该说明针对官方 `v3.0.0`（`e3f7d9ff1`），不是当前上游 main。
+
+本项目通过 `scripts/rsl_rl/train.py` 和 `play.py` 注册任务并调用官方公开入口。无交互窗口使用 `--viz none`，不接受旧参数 `--headless`。当前仍需完成真实仿真启动、有限迭代与模型回放验证；代码核查和单测通过不等于训练成功。
+
 # Template for Isaac Lab Projects
 
 ## Overview
