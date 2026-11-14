@@ -12,9 +12,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from isaaclab.managers import SceneEntityCfg
-
 if TYPE_CHECKING:
+    from isaaclab.managers import SceneEntityCfg
     from isaaclab.envs import ManagerBasedEnv
 
 _logger = logging.getLogger(__name__)
@@ -32,9 +31,18 @@ def _write_diag(message: str) -> None:
         f.write(message + "\n")
 
 
+def _selected_env_ids(env: ManagerBasedEnv, env_ids: torch.Tensor | slice | None) -> torch.Tensor:
+    """将事件选择器统一为设备索引；保留切片顺序，空选择不触发写入。"""
+    if env_ids is None:
+        env_ids = slice(None)
+    if isinstance(env_ids, slice):
+        return torch.tensor(range(env.num_envs)[env_ids], dtype=torch.long, device=env.device)
+    return env_ids
+
+
 def randomize_body_mass(
     env: ManagerBasedEnv,
-    env_ids: torch.Tensor,
+    env_ids: torch.Tensor | slice | None,
     asset_cfg: SceneEntityCfg,
     mass_range: dict[str, tuple[float, float]],
 ) -> None:
@@ -44,10 +52,13 @@ def randomize_body_mass(
 
     Args:
         env: The environment.
-        env_ids: Environment indices to randomize.
+        env_ids: Device indices, a slice, or None for all environments.
         asset_cfg: The asset (articulation) whose bodies are randomized.
         mass_range: Mapping from body name (regex) to (min, max) mass [kg].
     """
+    env_ids = _selected_env_ids(env, env_ids)
+    if env_ids.numel() == 0:
+        return
     asset = env.scene[asset_cfg.name]
     for body_key, (lo, hi) in mass_range.items():
         body_ids, body_names = asset.find_bodies(body_key)
@@ -71,7 +82,7 @@ def randomize_body_mass(
 
 def randomize_pole_properties(
     env: ManagerBasedEnv,
-    env_ids: torch.Tensor,
+    env_ids: torch.Tensor | slice | None,
     asset_cfg: SceneEntityCfg,
     mass_range: tuple[float, float],
     length: float,
@@ -84,6 +95,9 @@ def randomize_pole_properties(
     ``m*L^2/12`` about the COM, negligible axial inertia. The pole body frame has the rod along z
     (confirmed by a readback diagnostic of the USD geometry).
     """
+    env_ids = _selected_env_ids(env, env_ids)
+    if env_ids.numel() == 0:
+        return
     asset = env.scene[asset_cfg.name]
     pole_ids, pole_names = asset.find_bodies("pole")
     if not pole_ids:
@@ -118,7 +132,7 @@ def randomize_pole_properties(
 
 def randomize_joint_damping(
     env: ManagerBasedEnv,
-    env_ids: torch.Tensor,
+    env_ids: torch.Tensor | slice | None,
     asset_cfg: SceneEntityCfg,
     damping_range: dict[str, tuple[float, float]],
 ) -> None:
@@ -128,10 +142,13 @@ def randomize_joint_damping(
 
     Args:
         env: The environment.
-        env_ids: Environment indices to randomize.
+        env_ids: Device indices, a slice, or None for all environments.
         asset_cfg: The asset (articulation) whose joints are randomized.
         damping_range: Mapping from joint name (regex) to (min, max) damping.
     """
+    env_ids = _selected_env_ids(env, env_ids)
+    if env_ids.numel() == 0:
+        return
     asset = env.scene[asset_cfg.name]
     for joint_key, (lo, hi) in damping_range.items():
         joint_ids, _ = asset.find_joints(joint_key)
@@ -141,7 +158,7 @@ def randomize_joint_damping(
 
 def randomize_motor_lag(
     env: ManagerBasedEnv,
-    env_ids: torch.Tensor,
+    env_ids: torch.Tensor | slice | None,
     action_name: str,
     tau_range: tuple[float, float],
 ) -> None:
@@ -149,10 +166,13 @@ def randomize_motor_lag(
 
     Args:
         env: The environment.
-        env_ids: Environment indices to randomize.
+        env_ids: Device indices, a slice, or None for all environments.
         action_name: Name of the action term in the action manager.
         tau_range: (min, max) motor time constant [s].
     """
+    env_ids = _selected_env_ids(env, env_ids)
+    if env_ids.numel() == 0:
+        return
     term = env.action_manager.get_term(action_name)
     lo, hi = tau_range
     term.tau[env_ids] = torch.rand(len(env_ids), device=env.device) * (hi - lo) + lo
@@ -160,7 +180,7 @@ def randomize_motor_lag(
 
 def randomize_pole_axis_properties(
     env: ManagerBasedEnv,
-    env_ids: torch.Tensor,
+    env_ids: torch.Tensor | slice | None,
     asset_cfg: SceneEntityCfg,
     mass_range: tuple[float, float],
     length: float,
@@ -175,13 +195,16 @@ def randomize_pole_axis_properties(
 
     Args:
         env: The environment.
-        env_ids: Environment indices to randomize.
+        env_ids: Device indices, a slice, or None for all environments.
         asset_cfg: The asset (articulation) whose pole body is modified.
         mass_range: (min, max) pole mass [kg].
         length: Total rod length [m] (fixed).
         com_offset_range: (min, max) pivot-to-COM distance [m].
         inertia_scale_range: (min, max) multiplier applied to the uniform-rod inertia.
     """
+    env_ids = _selected_env_ids(env, env_ids)
+    if env_ids.numel() == 0:
+        return
     asset = env.scene[asset_cfg.name]
     pole_ids, pole_names = asset.find_bodies("pole")
     if not pole_ids:
@@ -220,7 +243,7 @@ def randomize_pole_axis_properties(
 
 def randomize_velocity_tracking(
     env: ManagerBasedEnv,
-    env_ids: torch.Tensor,
+    env_ids: torch.Tensor | slice | None,
     action_name: str,
     vel_max_range: tuple[float, float],
     tau_range: tuple[float, float],
@@ -230,7 +253,7 @@ def randomize_velocity_tracking(
 
     Args:
         env: The environment.
-        env_ids: Environment indices to randomize.
+        env_ids: Device indices, a slice, or None for all environments.
         action_name: Name of the action term in the action manager.
         vel_max_range: (min, max) authority scale [m/s]. 该范围是建模参数，
             需要另行核验当前设备的实际执行能力。
@@ -238,6 +261,9 @@ def randomize_velocity_tracking(
         acc_max_range: (min, max) acceleration limit [m/s^2]. Upper bound must not exceed the
             firmware session clamp ``ACC_MAX``.
     """
+    env_ids = _selected_env_ids(env, env_ids)
+    if env_ids.numel() == 0:
+        return
     term = env.action_manager.get_term(action_name)
     num = len(env_ids)
     lo, hi = vel_max_range
@@ -250,7 +276,7 @@ def randomize_velocity_tracking(
 
 def randomize_motor_delay(
     env: ManagerBasedEnv,
-    env_ids: torch.Tensor,
+    env_ids: torch.Tensor | slice | None,
     action_name: str,
     delay_range: tuple[int, int],
 ) -> None:
@@ -258,11 +284,14 @@ def randomize_motor_delay(
 
     Args:
         env: The environment.
-        env_ids: Environment indices to randomize.
+        env_ids: Device indices, a slice, or None for all environments.
         action_name: Name of the action term in the action manager.
         delay_range: (min, max) delay [policy steps], both inclusive. Clamped to the
             action term's ``max_delay_steps`` buffer capacity.
     """
+    env_ids = _selected_env_ids(env, env_ids)
+    if env_ids.numel() == 0:
+        return
     term = env.action_manager.get_term(action_name)
     lo, hi = delay_range
     delays = torch.randint(lo, hi + 1, (len(env_ids),), device=env.device)
