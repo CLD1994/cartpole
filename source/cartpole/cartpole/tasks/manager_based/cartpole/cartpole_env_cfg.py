@@ -219,9 +219,6 @@ class TerminationsCfg:
 class CartpoleEnvCfg(ManagerBasedRLEnvCfg):
     """Configuration for the cartpole environment."""
 
-    # 仅训练入口启用；play/evaluation 不额外记录或同步。
-    training_episode_log_window_s: float = 0.0
-
     # Scene settings
     scene: CartpoleSceneCfg = CartpoleSceneCfg(num_envs=12288, env_spacing=4.0, clone_in_fabric=True)
     # Basic settings

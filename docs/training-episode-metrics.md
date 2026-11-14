@@ -1,51 +1,34 @@
-# 训练完整回合统计
+# 训练完整回合指标
 
-通过 `scripts/rsl_rl/train.py --task Hexchip-Cartpole-Real-V2-v0 ...` 启动的新进程自动启用统计。不改变正在运行的进程；直接使用 Isaac Lab 官方训练入口时，需加 `env.training_episode_log_window_s=1.0`。
+使用 `scripts/rsl_rl/train.py --task Hexchip-Cartpole-Real-V2-v0 ...` 启动训练，`Metrics/success_rate` 出现在原有 PPO 指标列表并实时写入原训练 TensorBoard，横轴是 PPO iteration。
 
-## 统计契约
+## 统计口径
 
-每个环境推进约 1 仿真秒输出一行 `[TRAIN EPISODES]` 和一行 `TRAIN_EPISODES` JSON。窗口按控制步划分，与 PPO iteration 无关；默认 500 Hz 时为 500 步。改频率后按 `round(window_s / step_dt)` 取整。停止并正常关闭环境时输出未满窗口的部分结果。
+- `Metrics/completed_episodes`：本 iteration 的 rollout 中结束的完整回合数。
+- `Metrics/successful_episodes`：这些回合中 timeout 为真且 terminated 为假的数量。
+- `Metrics/failed_episodes`：完整回合数减成功数。timeout 和 terminated 同时发生算失败。
+- `Metrics/success_rate`：成功数量 / 完整回合数量，范围 0 到 1。
+- 零完成回合时不写 success_rate 标量，表格后的提示显示 N/A；`completed_episodes=0` 和 `success_rate_defined=0` 照常写入。不能把缺失点当成成功或失败，也不沿用上一轮值。
+- 一帧结束多个环境分别计数；同槽位多次结束分别计数；跨 iteration 的回合只在结束的 iteration 计一次。
+- 开启 `init_at_random_ep_len` 时，每槽位首次结束排除，计入 `excluded_partial_episodes`，防止随机缩短的初始回合被当成完整存活。关闭该选项时首回合正常计入。
+- `cumulative_success_rate` 是本次训练调用完整成功数之和 / 完整结束数之和，不是各 iteration 成功率的简单平均。恢复 checkpoint 后重新累计。
 
-- `completed` 是本窗口结束的完整回合数，不是环境数、控制步数或 reset 批次数。
-- `successes`：timeout 为真且 terminated 为假。两者同时发生算失败；`failures = completed - successes`。
-- `success_rate = successes / completed`。没有完整结束回合时为 JSON `null`，短行显示 `N/A`，不是 0%，也不沿用上一窗口。
-- 一次结束多个槽位，分别计数；一个槽位在窗口内结束多回合，分别计数。跨窗口回合在其结束窗口计一次。
-- 每槽位首次结束排除，列为 `excluded_first_episodes`。因为 runner 可随机缩短初始 episode 长度，这样不把不足一个完整时限的 timeout 当成功。即使关闭初始长度随机化，首回合仍统一排除。
-- 累计项只覆盖当前进程、当前 rank 已观测到的完整回合。恢复 checkpoint 后重新计数，不恢复旧日志计数。多个 rank 分别输出，未跨 GPU 汇总。
-- 正常训练不要在 Kit 中手动 reset。上游将 UI reset 标记为 terminated，因此会按失败记录；显式调用环境 `reset()` 则重新排除各槽位首回合。
+默认 120 个控制步、每步 2 ms，因此一轮统计覆盖 0.24 仿真秒；它不是 10 秒回合时限。短窗口可能只有失败结束，也可能无回合结束。跨多个 iteration 比较时应累计成功数、完成数后相除，不能平均不同分母的比例。
 
-统计仅在设备上累加整数，每个窗口统一转主机一次。正常关闭时可能额外转移一次部分窗口。它不替换动作、奖励、reset、采样或优化逻辑；它仍有少量张量运算与日志开销，不是零成本。`env.training_episode_log_window_s=0` 可关闭。play 和 evaluation 默认不启用。
+训练回合可能跨多次策略更新，采用随机动作；这些指标用于训练趋势和 checkpoint 候选筛选，不是固定 checkpoint 的独立评估。多 GPU 时与原 RSL Logger 一致，只输出 rank 0 的统计，不宣称所有 rank 的全局成功率。Kit 手动 reset 被上游标为 terminated，计为失败；统计训练时不要手动 reset。
 
-## 如何阅读
+## 机读结果与 checkpoint
 
-`success=95.0% (190/200), failures=10` 表示这个窗口结束了 200 个完整回合，其中 190 个成功。窗口内没有结束的回合不会进入分母。
+每次 iteration 日志同时追加到本次 run 的 `training-episodes.jsonl`，包含 schema_version=2、绝对 run 目录、实际 iteration/start_iteration、控制步窗口、成功/失败/完整数量和累计量。没有完成回合时 JSON 成功率为 null。
 
-窗口短于 10 秒回合时，早失败和 timeout 可能集中在不同窗口，应结合累计分母及连续多个窗口观察。累计结果包含此前不同训练阶段的策略，不能表示最新 checkpoint 的独立成功率。训练采用随机动作，且一个回合可跨多次参数更新；正式验收仍使用固定 checkpoint 的独立评估。
+`training-checkpoints.jsonl` 由真实 `save_model(path, it)` 回调写入，记录文件绝对路径、保存完成的真实 iteration 和该轮训练统计。最终 checkpoint 可能与周期保存重复写入同一路径，消费端应按路径取最后一条。恢复训练时使用 runner 实际的迭代编号，例如载入 iter=999 后首新迭代仍可能是 999，不能自行加一。
 
-RSL 的 `Mean reward` / `Mean episode length` 仍是最近 100 个结束回合的缓冲均值；`Episode_Termination/*` 仍由 Isaac Lab 定义。这些窗口与本日志不同，不应互相当分母。完整回合统计直接输出控制台/重定向日志，并追加到本次 run 目录的 `training-episodes.jsonl`，不通过 RSL 的标量平均。每条记录包含绝对 run 目录和控制步窗口。
+checkpoint 在本轮策略更新后保存，而指标来自更新之前的 rollout，且完整回合还可能跨更早的策略版本。关联表示保存前可用的训练证据，不代表保存后的策略已经取得该成功率。未完成或强制中断的 rollout 不补报成完整 iteration。
 
-## 接口与验证范围
+## 实现边界与副作用
 
-实现继承公开 `ManagerBasedRLEnv`，通过 Gym `entry_point` 注册；使用 `step()` 返回的 terminated/truncated。已核对 Isaac Lab v3.0.0 与 RSL-RL v5.5.1 源码，无安装目录修改。轻量语法和差异检查不代表已在 Windows GPU 后端验证，首次使用需现场联调。
+项目训练 backend 的生命周期取自 Isaac Lab v3.0.0，复用其环境、启动、配置、保存与清理函数。项目只在 runner 构造后、writer 初始化前接入 Logger 子类；不修改 Isaac Lab 或 RSL-RL 安装文件，不修改奖励、采样、物理模型、策略更新或 checkpoint 内容。环境注册恢复官方 ManagerBasedRLEnv，play/evaluation 不参与统计。
 
-## TensorBoard 与 checkpoint 筛选输入
+Logger 适配明确限定 rsl-rl-lib 5.5.1；升级需要复核接口，不静默兼容。统计每步在设备上累计整数，每次 iteration 统一新增一次设备到主机传输；保留原 RSL Logger 自身同步和日志行为。有少量计算、文件写入和输出成本，不是零开销。原 TensorBoard 的默认写入缓冲仍有效。
 
-训练结束后，以明确的 run 目录执行：
-
-```powershell
-python .\scripts\rsl_rl\index_training_metrics.py `
-  --run-dir ".\logs\rsl_rl\cartpole_real_v2\实际运行目录" `
-  --start-iteration 0
-```
-
-这会创建 `episode_metrics_index/`：
-
-- `tensorboard/`：`Metrics/success_rate`、`completed`、`successes`、`failures`、`success_rate_defined` 等。横轴是本次训练控制步数，不是 PPO iteration。零分母不写成功率点，可结合 defined=0 判断空窗口。
-- `windows.jsonl`：每窗口计数以及其覆盖的采集 iteration 起止。映射使用本次落盘 `params/agent.yaml` 的实际 rollout 长度。
-- `checkpoints.json`：安全读取每个 checkpoint 的实际 `iter`，关联保存前最后一个完整落盘窗口、分母和窗口距保存点的步数。没有窗口时保留 null，不使用保存之后的结果。可据此筛选训练趋势候选，但不能当作该 checkpoint 的独立成功率。
-
-原 TensorBoard 的训练标量仍使用 iteration 轴，与新增窗口指标分目录，避免混淆。可以用 TensorBoard 指向整个 run 目录同时查看。工具不改变旧 checkpoint 或原训练记录；索引目录已存在时停止，防止重复写点。
-
-新训练使用 `--start-iteration 0`。resume 必须同时给出实际起始 iteration 和 `--resume-checkpoint`，工具校验其 `iter`，且只支持 `agent.yaml` 记录了实际载入文件绝对路径的情况。目录选择器、latest、正则路径或缺失来源一律停止，不猜映射。旧运行没有 `training-episodes.jsonl` 时不能从旧标量恢复准确分母，不能伪造对应索引。
-
-日志只记录完成回合，尚未结束的回合不进入分母。每窗口结果可实时从控制台看；TensorBoard/索引转换在训练正常结束后执行，不要求更换上游 Logger，不影响正在训练的进程。
+已做语法和差异检查，未增加测试或声称完成 Windows GPU 验证。现场使用独立 run 联调。旧训练没有准确回合计数时不能从旧标量反推或伪造这些文件。
