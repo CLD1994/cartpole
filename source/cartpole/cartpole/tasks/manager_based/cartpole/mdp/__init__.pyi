@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 __all__ = [
+    "joint_boundary_l2",
     "joint_pos_target_l2",
     "survival_success_rate",
 ]
@@ -11,4 +12,4 @@ __all__ = [
 # Forward stable MDP terms lazily, then override with environment-specific terms below.
 from isaaclab.envs.mdp import *  # noqa: F401, F403
 
-from .rewards import joint_pos_target_l2, survival_success_rate
+from .rewards import joint_boundary_l2, joint_pos_target_l2, survival_success_rate
