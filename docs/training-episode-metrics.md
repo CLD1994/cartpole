@@ -22,8 +22,30 @@
 
 窗口短于 10 秒回合时，早失败和 timeout 可能集中在不同窗口，应结合累计分母及连续多个窗口观察。累计结果包含此前不同训练阶段的策略，不能表示最新 checkpoint 的独立成功率。训练采用随机动作，且一个回合可跨多次参数更新；正式验收仍使用固定 checkpoint 的独立评估。
 
-RSL 的 `Mean reward` / `Mean episode length` 仍是最近 100 个结束回合的缓冲均值；`Episode_Termination/*` 仍由 Isaac Lab 定义。这些窗口与本日志不同，不应互相当分母。完整回合统计直接输出控制台/重定向日志，不通过 RSL 的标量平均，也不写入 TensorBoard。
+RSL 的 `Mean reward` / `Mean episode length` 仍是最近 100 个结束回合的缓冲均值；`Episode_Termination/*` 仍由 Isaac Lab 定义。这些窗口与本日志不同，不应互相当分母。完整回合统计直接输出控制台/重定向日志，并追加到本次 run 目录的 `training-episodes.jsonl`，不通过 RSL 的标量平均。每条记录包含绝对 run 目录和控制步窗口。
 
 ## 接口与验证范围
 
 实现继承公开 `ManagerBasedRLEnv`，通过 Gym `entry_point` 注册；使用 `step()` 返回的 terminated/truncated。已核对 Isaac Lab v3.0.0 与 RSL-RL v5.5.1 源码，无安装目录修改。轻量语法和差异检查不代表已在 Windows GPU 后端验证，首次使用需现场联调。
+
+## TensorBoard 与 checkpoint 筛选输入
+
+训练结束后，以明确的 run 目录执行：
+
+```powershell
+python .\scripts\rsl_rl\index_training_metrics.py `
+  --run-dir ".\logs\rsl_rl\cartpole_real_v2\实际运行目录" `
+  --start-iteration 0
+```
+
+这会创建 `episode_metrics_index/`：
+
+- `tensorboard/`：`Metrics/success_rate`、`completed`、`successes`、`failures`、`success_rate_defined` 等。横轴是本次训练控制步数，不是 PPO iteration。零分母不写成功率点，可结合 defined=0 判断空窗口。
+- `windows.jsonl`：每窗口计数以及其覆盖的采集 iteration 起止。映射使用本次落盘 `params/agent.yaml` 的实际 rollout 长度。
+- `checkpoints.json`：安全读取每个 checkpoint 的实际 `iter`，关联保存前最后一个完整落盘窗口、分母和窗口距保存点的步数。没有窗口时保留 null，不使用保存之后的结果。可据此筛选训练趋势候选，但不能当作该 checkpoint 的独立成功率。
+
+原 TensorBoard 的训练标量仍使用 iteration 轴，与新增窗口指标分目录，避免混淆。可以用 TensorBoard 指向整个 run 目录同时查看。工具不改变旧 checkpoint 或原训练记录；索引目录已存在时停止，防止重复写点。
+
+新训练使用 `--start-iteration 0`。resume 必须同时给出实际起始 iteration 和 `--resume-checkpoint`，工具校验其 `iter`，且只支持 `agent.yaml` 记录了实际载入文件绝对路径的情况。目录选择器、latest、正则路径或缺失来源一律停止，不猜映射。旧运行没有 `training-episodes.jsonl` 时不能从旧标量恢复准确分母，不能伪造对应索引。
+
+日志只记录完成回合，尚未结束的回合不进入分母。每窗口结果可实时从控制台看；TensorBoard/索引转换在训练正常结束后执行，不要求更换上游 Logger，不影响正在训练的进程。

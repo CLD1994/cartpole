@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+from pathlib import Path
 
 import torch
 from isaaclab.envs import ManagerBasedRLEnv
@@ -22,7 +23,13 @@ class TrainingMetricsEnv(ManagerBasedRLEnv):
         self._metrics_steps = 0
         self._metrics_total_steps = 0
         self._metrics_cumulative = [0, 0, 0]
+        self._metrics_file = None
         if self._metrics_interval:
+            if not self.cfg.log_dir:
+                raise ValueError("episode metrics require cfg.log_dir")
+            directory = Path(self.cfg.log_dir)
+            directory.mkdir(parents=True, exist_ok=True)
+            self._metrics_file = (directory / "training-episodes.jsonl").open("x", encoding="utf-8")
             # 首回合可能被 runner 随机缩短。每个槽位的首次结束只建立完整起点。
             self._metrics_ready = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
             self._metrics_counts = torch.zeros((3, self.num_envs), dtype=torch.int64, device=self.device)
@@ -58,6 +65,8 @@ class TrainingMetricsEnv(ManagerBasedRLEnv):
             self._metrics_cumulative[i] += count
         total, total_successes, total_excluded = self._metrics_cumulative
         payload = {
+            "schema_version": 1,
+            "run_dir": str(Path(self.cfg.log_dir).resolve()),
             "rank": int(os.environ.get("RANK", "0")),
             "window_start_step": self._metrics_total_steps - self._metrics_steps,
             "window_end_step": self._metrics_total_steps,
@@ -77,11 +86,17 @@ class TrainingMetricsEnv(ManagerBasedRLEnv):
         rate = f"{successes / completed:.1%}" if completed else "N/A"
         print(f"[TRAIN EPISODES] success={rate} ({successes}/{completed}), failures={completed-successes}, "
               f"window={payload['window_sim_s_per_env']:.3f} simulation seconds/env")
-        print("TRAIN_EPISODES " + json.dumps(payload, allow_nan=False))
+        serialized = json.dumps(payload, allow_nan=False)
+        self._metrics_file.write(serialized + "\n")
+        self._metrics_file.flush()
+        print("TRAIN_EPISODES " + serialized)
         self._metrics_counts.zero_()
         self._metrics_steps = 0
 
     def close(self):
         if getattr(self, "_metrics_interval", 0) and self._metrics_steps:
             self._flush_episode_metrics(partial=True)
+        if getattr(self, "_metrics_file", None) is not None:
+            self._metrics_file.close()
+            self._metrics_file = None
         super().close()

@@ -195,7 +195,6 @@ class RewardsCfg:
         weight=-0.005,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=["cart_to_pole"])},
     )
-    # (6) Success rate tracking (zero-weight, metric only)
 
 
 @configclass
