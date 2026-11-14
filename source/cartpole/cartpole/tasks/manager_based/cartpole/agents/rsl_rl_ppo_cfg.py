@@ -3,6 +3,8 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+import math
+
 from isaaclab.utils.configclass import configclass
 from cartpole.device_profile import load_profile, model_parameters
 
@@ -89,7 +91,8 @@ class RealCartpoleV2PPORunnerCfg(RealCartpolePPORunnerCfg):
     experiment_name = "cartpole_real_v2"
 
     def __post_init__(self):
-        # 保持单位物理时间的折扣与GAE衰减，不把周期缩短变成长时间视野。
+        # 回报折扣的e折时间为2秒：兼顾慢漂移后果与critic估计难度。
+        # 保持λ不变；gamma×λ的衰减时间会变化，后续价值依赖bootstrap。
         self.algorithm = self.algorithm.copy()
-        self.algorithm.gamma = 0.99 ** (V2_DT / 0.005)
+        self.algorithm.gamma = math.exp(-V2_DT / 2.0)
         self.algorithm.lam = 0.95 ** (V2_DT / 0.005)

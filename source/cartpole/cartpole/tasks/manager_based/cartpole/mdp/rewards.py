@@ -43,6 +43,24 @@ def joint_pos_target_l2(
     # compute the reward
     return torch.sum(torch.square(joint_pos - target), dim=1)
 
+def joint_boundary_l2(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    free_radius: float,
+    limit: float,
+) -> torch.Tensor:
+    """对称边界缓冲：内区为零，到终止边界归一化为一；距离单位为米。
+
+    只用于直线关节。越界后仍保持单调增长，不裁剪为零，也不提供制动保证。
+    """
+    if not 0.0 <= free_radius < limit:
+        raise ValueError("boundary reward requires 0 <= free_radius < limit")
+    asset: Articulation = env.scene[asset_cfg.name]
+    position = asset.data.joint_pos.torch[:, asset_cfg.joint_ids]
+    excess = torch.clamp(torch.abs(position) - free_radius, min=0.0)
+    return torch.sum(torch.square(excess / (limit - free_radius)), dim=1)
+
+
 class survival_success_rate(ManagerTermBase):
     """Tracks episode survival as the success metric.
 

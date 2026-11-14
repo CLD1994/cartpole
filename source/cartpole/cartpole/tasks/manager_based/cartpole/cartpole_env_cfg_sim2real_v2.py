@@ -29,7 +29,7 @@ from .cartpole_env_cfg_sim2real import gaussian_noise_from_list
 from .mdp import (
     action_rate_l2,
     joint_pos_out_of_manual_limit,
-    joint_pos_target_l2,
+    joint_boundary_l2,
     reset_joints_by_offset,
 )
 from .mdp import dr_events as mdp_events
@@ -82,17 +82,8 @@ class RealCartpoleV2EnvCfg(CartpoleEnvCfg):
         )
         self.observations.policy.enable_corruption = True
 
-        # --- reward: keep the cart near the track center (inherited shaping from v1) ---
-        self.rewards.cart_pos = RewTerm(
-            func=joint_pos_target_l2,
-            weight=-0.5,
-            # wrap=False: slider_to_cart is prismatic, its position [m] must not be angle-wrapped
-            params={
-                "asset_cfg": SceneEntityCfg("robot", joint_names=["slider_to_cart"]),
-                "target": 0.0,
-                "wrap": False,
-            },
-        )
+        # 静止目标使用实际车速，不约束稳定位置；速度项保持温和，允许恢复动作。
+        self.rewards.cart_vel.weight = -0.1
         # --- reward: penalize velocity-command chattering (smooth commands on the stepper rig
         # avoid wasted reversals through zero speed and StallGuard transients) ---
         self.rewards.action_rate = RewTerm(
@@ -107,6 +98,17 @@ class RealCartpoleV2EnvCfg(CartpoleEnvCfg):
             soft_limit_m=DEVICE["soft_limit_m"], boundary_inset_m=0.13,
             initial_position_range=initial_position_range,
             acceleration_range=acceleration_range,
+        )
+        # 内部70%行程没有位置惩罚；外侧30%平滑加强对称边界保护。
+        # 这是奖励塑形，不是硬件制动或安全保证。
+        self.rewards.cart_boundary = RewTerm(
+            func=joint_boundary_l2,
+            weight=-0.5,
+            params={
+                "asset_cfg": SceneEntityCfg("robot", joint_names=["slider_to_cart"]),
+                "free_radius": 0.7 * train_limit,
+                "limit": train_limit,
+            },
         )
         self.terminations.cart_out_of_bounds = DoneTerm(
             func=joint_pos_out_of_manual_limit,
