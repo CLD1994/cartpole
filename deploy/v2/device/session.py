@@ -316,7 +316,11 @@ class Session:
         if not valid_action:
             self._fail('invalid_action', self._now())
             raise ValueError('invalid_action')
-        velocity = round(action * self.limits.speed_mm_s)
+        # 整数 mm/s，恰好半单位时远离零，与 C 的 lround 一致。
+        fraction, whole = math.modf(action * self.limits.speed_mm_s)
+        velocity = int(whole)
+        if abs(fraction) >= 0.5:
+            velocity += 1 if fraction > 0 else -1
         if abs(self.observation.x_um) >= self.track_limit_um and self.observation.x_um * velocity > 0:
             velocity = 0
         if not self._write(f'VEL {velocity}'):

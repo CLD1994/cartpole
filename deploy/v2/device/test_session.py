@@ -72,6 +72,16 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(self.s.command(.8), 1000)
         self.assertEqual(self.port.sent, [b'VEL 1000\n'])
 
+    def test_action_rounds_half_units_away_from_zero(self):
+        self.ready()
+        self.s.start()
+        for action, expected in [(0.0004, 1), (-0.0004, -1),
+                                 (0.002, 3), (-0.002, -3),
+                                 (0.00039, 0), (-0.00039, 0)]:
+            with self.subTest(action=action):
+                self.assertEqual(self.s.command(action), expected)
+                self.assertEqual(self.port.sent[-1], f'VEL {expected}\n'.encode())
+
     def test_invalidity_stops_and_latches(self):
         self.ready()
         self.s.start()
@@ -121,11 +131,14 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(self.s.failure, 'malformed_STATE')
         self.assertIsNone(self.s.observation)
 
-    def test_nan_action_stops(self):
-        self.ready()
-        self.s.start()
-        with self.assertRaises(ValueError): self.s.command(float('nan'))
-        self.assertEqual(self.port.sent, [b'VEL 0\n'])
+    def test_nonfinite_action_stops(self):
+        for action in [float('nan'), float('inf'), -float('inf')]:
+            with self.subTest(action=action):
+                self.setUp()
+                self.ready()
+                self.s.start()
+                with self.assertRaises(ValueError): self.s.command(action)
+                self.assertEqual(self.port.sent, [b'VEL 0\n'])
 
     def test_transport_failure_latches(self):
         self.ready()
