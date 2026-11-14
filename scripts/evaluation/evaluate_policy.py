@@ -194,7 +194,7 @@ def main(argv=None):
     digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
     output = args.output_dir.resolve() / ('evaluation-'+uuid.uuid4().hex)
     output.mkdir(parents=True,exist_ok=False)
-    report = dict(schema_version=2,status='starting',checkpoint=str(checkpoint),checkpoint_sha256=digest,
+    report = dict(schema_version=3,status='starting',checkpoint=str(checkpoint),checkpoint_sha256=digest,
                   task=args.task,seeds=args.seeds,num_envs=args.num_envs,cohorts=[],
                   scope='当前配置下的独立仿真评估；不是旧训练环境重建、性能基准或真机验收',
                   sample_scope='每槽位从显式reset起的第一个回合；状态在自动reset前、每控制步末采样',

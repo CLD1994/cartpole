@@ -15,7 +15,7 @@ class EpisodeMetrics:
         self.num_envs, self.seed, self.dt = num_envs, seed, dt
         self.episodes = {}
         self.initial_conditions = None
-        self.accumulators = [dict(steps=0, theta_sq=0.0, max_abs_x_m=0.0,
+        self.accumulators = [dict(steps=0, theta_sq=0.0, speed_abs=0.0, speed_sq=0.0, max_abs_x_m=0.0,
                                  max_abs_theta_rad=0.0, max_abs_action=0.0)
                              for _ in range(num_envs)]
 
@@ -49,6 +49,8 @@ class EpisodeMetrics:
             item = self.accumulators[i]
             item['steps'] += 1
             item['theta_sq'] += state[1] ** 2
+            item['speed_abs'] += abs(state[2])
+            item['speed_sq'] += state[2] ** 2
             item['max_abs_x_m'] = max(item['max_abs_x_m'], abs(state[0]))
             item['max_abs_theta_rad'] = max(item['max_abs_theta_rad'], abs(state[1]))
             item['max_abs_action'] = max(item['max_abs_action'], abs(action))
@@ -59,6 +61,11 @@ class EpisodeMetrics:
                     terminated=bool(terminated[i]), truncated=bool(truncated[i]),
                     termination_reasons=[name for name, values in reasons.items() if values[i]],
                     initial_state=(self.initial_conditions[i]['state'] if self.initial_conditions else None),
+                    cart_mean_abs_velocity_m_s=item['speed_abs']/item['steps'],
+                    cart_rms_velocity_m_s=math.sqrt(item['speed_sq']/item['steps']),
+                    cart_travel_m=item['speed_abs']*self.dt,
+                    cart_net_displacement_m=(state[0]-self.initial_conditions[i]['state'][0]
+                                             if self.initial_conditions else None),
                     terminal_state=state, theta_rms_rad=math.sqrt(item['theta_sq']/item['steps']),
                     **{name: item[name] for name in ('max_abs_x_m','max_abs_theta_rad','max_abs_action')})
 

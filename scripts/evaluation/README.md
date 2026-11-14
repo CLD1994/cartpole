@@ -61,3 +61,43 @@ python -m unittest discover -s scripts/evaluation -v
 ```
 
 测试隔离仿真器并通过公开接口注入数据/回调；没有新增集成测试。真实 Isaac Lab / GPU 的运行结果应另行记录，单元测试不能替代它。
+
+## 训练结束后选择检查点
+
+`select_checkpoint.py` 只处理一个已经结束的训练目录。先从同目录 TensorBoard 日志提名少量检查点，再用冻结策略完整回合评估排名，最后用不同种子复核第一名。它不会覆盖模型，也不会控制训练进程。操作期间不要继续向该训练目录写入模型或切换评估代码。
+
+```powershell
+$env:PYTHONIOENCODING = 'utf-8'
+$run = 'C:\Users\cldus\workspace\cartpole\logs\rsl_rl\cartpole_real_v2\你的训练目录'
+python .\scripts\evaluation\select_checkpoint.py `
+  --run-dir "$run" --candidates 3 --window 20 `
+  --num_envs 32 --seeds 101 202 --holdout-seeds 1001 2002 `
+  --device cuda:0 *> .\checkpoint-selection.log
+"退出码: $LASTEXITCODE"
+Get-Content .\checkpoint-selection.log -Tail 30 -Encoding utf8
+```
+
+批量评估固定 `--viz none`，使用 GPU PhysX。默认最多提名4个检查点，每个64回合，第一名再复核64回合。评估条件沿用当前代码，可用 `--horizon-s` 和两个初速度区间参数显式覆盖；每个候选使用相同条件，不改变训练奖励、随机化配置文件。
+
+### 提名与排名规则
+
+1. 安全读取检查点中的 `iter`，用它关联日志横轴，不把文件编号或文件时间当作质量分数。只接受当前用户训练的标准 RSL-RL 权重格式，不使用任意 pickle 兼容回退。
+2. 将可匹配日志的检查点按时间顺序分成 `--candidates` 个时段。每个时段根据检查点迭代前 `--window` 轮（含本轮）的 `Train/mean_reward` 平均值提名一个，平分时比较 `Train/mean_episode_length`。额外保留最后保存的检查点并去重。报告保存每个窗口的样本数和确切步数。
+3. 训练日志只用于提名：RSL-RL 5.5.1 的回报和长度是最近100个已结束回合的均值，回合可能跨越策略更新；日志迭代的采样发生在更新前，`model_it` 则在更新后保存。这里不是精确的冻结权重成绩。旧 `Metrics/success_rate` 不参与排名，新统计无法追溯补进旧日志。
+4. 候选独立评估后严格按成功率降序排列。成功率相同时，依次比较**成功回合**平均绝对车速、绝对首尾位移，较小者优先；仍相同时取较早迭代。它不奖励回到中心，也不会让短时间失败因车程小而获得优势。速度指标包含整个回合，尚未单独划分捕获直立与稳定保持阶段。
+5. 仅对第一名运行 `--holdout-seeds`，不再用复核结果重新选模型。复核失败率照实展示，没有预设“可上真机”门槛。所有候选均无成功回合时不推荐模型。
+
+结果只称为**已评估候选中的最佳**。提名可能漏掉更好的模型；只按保存的有限检查点比较也不能证明训练过程全局最优。选择种子与复核种子必须互不重复；反复针对复核集合调参后，应换用新的保留种子。相同初始种子不保证不同策略后续自动重置消耗完全相同的随机流，质量/惯量等全部抽样目前也未逐回合记录。
+
+缺少日志/必要标签、重复日志步数、评估异常或报告不完整均明确报错，不静默替代成功率。也可绕过提名，人工指定同一个训练目录里的候选：
+
+```powershell
+python .\scripts\evaluation\select_checkpoint.py `
+  --run-dir "$run" `
+  --checkpoints "$run\model_400.pt" "$run\model_800.pt" "$run\model_999.pt" `
+  --num_envs 32 --seeds 101 202 --holdout-seeds 1001 2002 --device cuda:0
+```
+
+输出位于独立的 `logs/checkpoint-selection/selection-<编号>/selection.json`，包含提名映射、日志及模型哈希、逐模型报告路径、排名、独立复核和错误信息。子进程的原始日志和配置也保留在该目录。顶层 `status=complete` 只表示流程完成，不表示成功率达到可用标准。提名与冻结评估为独立函数，后续可用有明确口径的新训练统计替换提名，不猜测未知标签格式。
+
+评估报告 schema 3 增加 `cart_mean_abs_velocity_m_s`、`cart_rms_velocity_m_s`、`cart_travel_m` 和 `cart_net_displacement_m`。行程是控制步末绝对速度的矩形积分；首尾位移是终态位置减实际初态位置，两者都不是回中心误差。
