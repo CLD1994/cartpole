@@ -57,22 +57,30 @@ def apply_cartpole_visuals(stage, root_path, model):
         raise ValueError("标准 Cartpole 缺少车体视觉或转轴，无法创建示意外观")
     if cart.IsInstanceProxy() or original.IsInstanceProxy():
         raise ValueError("车体视觉是实例代理，不能独立定义示意外观")
-    # visibility 不影响物理形状；不能禁用含有碰撞的原始子树。
-    UsdGeom.Imageable(original).CreateVisibilityAttr(UsdGeom.Tokens.invisible)
+    # 碰撞网格也可能可见。隐藏所有原有可渲染子树，而不禁用任何物理 prim。
+    for child in cart.GetChildren():
+        imageable = UsdGeom.Imageable(child)
+        if imageable:
+            if child.IsInstanceProxy():
+                raise ValueError("车体几何是实例代理，不能独立设置可见性")
+            imageable.CreateVisibilityAttr(UsdGeom.Tokens.invisible)
     anchor = joint.GetLocalPos0Attr().Get()
 
     rod = UsdGeom.Cylinder.Define(stage, f"{root_path}/pole/rod_visual")
+    rod.CreateVisibilityAttr(UsdGeom.Tokens.inherited)
     rod.CreateAxisAttr("Z")
     rod.CreateRadiusAttr(.004)
     rod.CreateHeightAttr(model["pole_length_m"])
     half_length = model["pole_length_m"] / 2
     rod.CreateExtentAttr([Gf.Vec3f(-.004, -.004, -half_length), Gf.Vec3f(.004, .004, half_length)])
-    rod.CreateDisplayColorAttr([Gf.Vec3f(.72, .76, .8)])
+    rod.CreateDisplayColorAttr([Gf.Vec3f(.025, .035, .05)])
+    apply_rod_material(stage, rod)
     xform = UsdGeom.Xformable(rod)
     xform.ClearXformOpOrder()
     xform.AddTranslateOp().Set(Gf.Vec3d(0, 0, model["pole_length_m"] / 2))
 
     body = UsdGeom.Cube.Define(stage, f"{root_path}/cart/body_visual")
+    body.CreateVisibilityAttr(UsdGeom.Tokens.inherited)
     body.CreateSizeAttr(1.)
     body.CreateExtentAttr([Gf.Vec3f(-.5), Gf.Vec3f(.5)])
     body.CreateDisplayColorAttr([Gf.Vec3f(.12, .17, .22)])
@@ -82,6 +90,7 @@ def apply_cartpole_visuals(stage, root_path, model):
     xform.AddScaleOp().Set(Gf.Vec3f(.08, .075, .055))
 
     hub = UsdGeom.Cylinder.Define(stage, f"{root_path}/cart/hub_visual")
+    hub.CreateVisibilityAttr(UsdGeom.Tokens.inherited)
     hub.CreateAxisAttr("X")
     hub.CreateRadiusAttr(.012)
     hub.CreateHeightAttr(.025)
@@ -90,3 +99,17 @@ def apply_cartpole_visuals(stage, root_path, model):
     xform = UsdGeom.Xformable(hub)
     xform.ClearXformOpOrder()
     xform.AddTranslateOp().Set(Gf.Vec3d(anchor[0] - .0125, anchor[1], anchor[2]))
+
+
+def apply_rod_material(stage, rod):
+    """为示意杆绑定浅背景下易辨识的深色表面；只影响渲染，不创建物理材质。"""
+    from pxr import Gf, Sdf, UsdShade
+
+    material = UsdShade.Material.Define(stage, rod.GetPath().AppendChild("RodSurface"))
+    shader = UsdShade.Shader.Define(stage, material.GetPath().AppendChild("Surface"))
+    shader.CreateIdAttr("UsdPreviewSurface")
+    shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(.025, .035, .05))
+    shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.)
+    shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(.65)
+    material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
+    UsdShade.MaterialBindingAPI.Apply(rod.GetPrim()).Bind(material)

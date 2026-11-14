@@ -19,8 +19,10 @@ class BBoxBindingTests(unittest.TestCase):
             if ignore_visibility:
                 raise ConstructorReached
             return Mock()
-        usd = SimpleNamespace(Usd=Mock(), Gf=Mock(), UsdPhysics=Mock(),
-                              UsdGeom=SimpleNamespace(BBoxCache=bbox))
+        usd = SimpleNamespace(Usd=Mock(), Gf=Mock(), UsdPhysics=Mock(), UsdShade=Mock(),
+                              UsdGeom=SimpleNamespace(BBoxCache=bbox, Imageable=Mock()))
+        usd.Usd.Stage.CreateInMemory.return_value.GetPrimAtPath.return_value.GetChildren.return_value = []
+        usd.Usd.PrimRange.return_value = [Mock()]
         profile = SimpleNamespace(load_profile=lambda: {}, model_parameters=lambda _: {})
         geometry = SimpleNamespace(apply_pole_geometry=lambda *args: None)
         modules = {'pxr': usd, 'cartpole': Mock(), 'cartpole.device_profile': profile,

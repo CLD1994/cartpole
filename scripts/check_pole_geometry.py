@@ -2,7 +2,7 @@
 import argparse
 import json
 
-from pxr import Gf, Usd, UsdGeom, UsdPhysics
+from pxr import Gf, Usd, UsdGeom, UsdPhysics, UsdShade
 
 from cartpole.device_profile import load_profile, model_parameters
 from cartpole.pole_geometry import apply_pole_geometry
@@ -17,6 +17,11 @@ def main():
     root.GetReferences().AddReference(args.usd)
     joint = UsdPhysics.RevoluteJoint(stage.GetPrimAtPath("/cartpole/cart/cart_to_pole"))
     before = (joint.GetLocalPos0Attr().Get(), joint.GetLocalPos1Attr().Get(), joint.GetAxisAttr().Get())
+    cart = stage.GetPrimAtPath("/cartpole/cart")
+    old_render_paths = [child.GetPath() for child in cart.GetChildren() if UsdGeom.Imageable(child)]
+    collision_states = {prim.GetPath(): UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Get()
+                        for prim in Usd.PrimRange(cart, Usd.TraverseInstanceProxies()) if prim.HasAPI(UsdPhysics.CollisionAPI)}
+    assert collision_states, "标准车体未找到碰撞体，不能确认物理保持"
     model = model_parameters(load_profile())
     apply_pole_geometry(stage, "/cartpole", model)
     cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), ["default", "render", "proxy", "guide"])
@@ -36,10 +41,18 @@ def main():
     assert abs(visual_range.GetMax()[2] - model["pole_length_m"]) < 1e-6
     for path in ("pole/rod_visual", "cart/body_visual", "cart/hub_visual"):
         prim = stage.GetPrimAtPath(f"/cartpole/{path}")
+        assert UsdGeom.Imageable(prim).ComputeVisibility() == "inherited", path
         assert not prim.HasAPI(UsdPhysics.CollisionAPI), path
         assert not prim.HasAPI(UsdPhysics.RigidBodyAPI), path
         assert not prim.HasAPI(UsdPhysics.MassAPI), path
     assert UsdGeom.Imageable(stage.GetPrimAtPath("/cartpole/cart/visuals")).GetVisibilityAttr().Get() == "invisible"
+    for path in old_render_paths:
+        assert UsdGeom.Imageable(stage.GetPrimAtPath(path)).ComputeVisibility() == "invisible", path
+    for path, enabled in collision_states.items():
+        prim = stage.GetPrimAtPath(path)
+        assert prim.IsActive() and UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Get() == enabled, path
+    material, _ = UsdShade.MaterialBindingAPI(visual).ComputeBoundMaterial()
+    assert material and material.GetPath() == visual.GetPath().AppendChild("RodSurface"), "杆须使用指定深色表面"
     mass = UsdPhysics.MassAPI(stage.GetPrimAtPath("/cartpole/pole"))
     assert abs(mass.GetMassAttr().Get() - model["pole_mass_kg"]) < 1e-6
     assert abs(mass.GetCenterOfMassAttr().Get()[2] - model["pole_com_m"]) < 1e-6
@@ -47,6 +60,8 @@ def main():
     print(json.dumps({"bounds_m": [list(low), list(high)], "mass_kg": mass.GetMassAttr().Get(),
                       "com_m": list(mass.GetCenterOfMassAttr().Get()),
                       "inertia_com_kg_m2": list(mass.GetDiagonalInertiaAttr().Get()),
+                      "cart_collision_count": len(collision_states),
+                      "hidden_cart_subtrees": [str(path) for path in old_render_paths],
                       "scope": "OpenUSD 创建检查通过；不是物理后端或运动验证"}, indent=2, ensure_ascii=False))
 
 

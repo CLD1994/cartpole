@@ -4,7 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 source = Path(__file__).parents[1] / 'cartpole/pole_geometry.py'
 spec = importlib.util.spec_from_file_location('pole_geometry', source)
@@ -27,6 +27,9 @@ class Shape:
                 return self.attrs[name[6:-4]]
             return create
         raise AttributeError(name)
+    def GetChildren(self): return self.children
+    def GetPath(self): return Mock()
+    def GetPrim(self): return self
     def IsInstanceProxy(self): return False
     def ClearXformOpOrder(self): pass
     def AddTranslateOp(self): self.attrs['Translate'] = Attr(); return self.attrs['Translate']
@@ -36,7 +39,8 @@ class Shape:
 
 class Stage:
     def __init__(self):
-        self.prims = {f'/r/cart{suffix}': Shape() for suffix in ('', '/visuals', '/cart_to_pole')}
+        self.prims = {f'/r/cart{suffix}': Shape() for suffix in ('', '/visuals', '/collisions', '/cart_to_pole')}
+        self.prims['/r/cart'].children = [self.prims['/r/cart/visuals'], self.prims['/r/cart/collisions']]
     def GetPrimAtPath(self, path): return self.prims.get(path)
     def define(self, path):
         self.prims[path] = Shape()
@@ -52,9 +56,9 @@ class VisualTests(unittest.TestCase):
         factory = SimpleNamespace(Define=lambda stage, path: stage.define(path))
         self.usd = SimpleNamespace(Gf=SimpleNamespace(Vec3f=vector, Vec3d=vector),
             UsdGeom=SimpleNamespace(Cube=factory, Cylinder=factory, Xformable=lambda p:p,
-                Imageable=lambda p:p, Tokens=SimpleNamespace(invisible='invisible')),
+                Imageable=lambda p:p, Tokens=SimpleNamespace(invisible='invisible', inherited='inherited')),
             # No mutation APIs: any attempt to create collision/mass/rigid bodies fails.
-            UsdPhysics=SimpleNamespace(RevoluteJoint=lambda p:p))
+            UsdPhysics=SimpleNamespace(RevoluteJoint=lambda p:p), Sdf=Mock(), UsdShade=Mock())
     def apply(self):
         with patch.dict(sys.modules, {'pxr': self.usd}):
             module.apply_cartpole_visuals(self.stage, '/r', {'pole_length_m': .49})
@@ -73,9 +77,19 @@ class VisualTests(unittest.TestCase):
         self.assertEqual(hub['Axis'].value, 'X')
         self.assertAlmostEqual(hub['Translate'].value[0] + hub['Height'].value / 2, .12)
         self.assertEqual(self.stage.prims['/r/cart/visuals'].attrs['Visibility'].value, 'invisible')
+    def test_collision_rendering_hidden_without_removing_physics(self):
+        collision = self.stage.prims['/r/cart/collisions']
+        collision.attrs['CollisionEnabled'] = Attr(True)
+        self.apply()
+        self.assertIs(self.stage.prims['/r/cart/collisions'], collision)
+        self.assertTrue(collision.attrs['CollisionEnabled'].value)
+        self.assertEqual(collision.attrs['Visibility'].value, 'invisible')
+        for path in ('/r/cart/body_visual', '/r/cart/hub_visual', '/r/pole/rod_visual'):
+            self.assertEqual(self.stage.prims[path].attrs['Visibility'].value, 'inherited')
+
     def test_missing_cart_visual_fails_before_editing(self):
         del self.stage.prims['/r/cart/visuals']
         with self.assertRaises(ValueError): self.apply()
-        self.assertEqual(set(self.stage.prims), {'/r/cart', '/r/cart/cart_to_pole'})
+        self.assertEqual(set(self.stage.prims), {'/r/cart', '/r/cart/collisions', '/r/cart/cart_to_pole'})
 
 if __name__ == '__main__': unittest.main()
