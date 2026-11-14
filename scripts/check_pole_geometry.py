@@ -20,7 +20,8 @@ def main():
     model = model_parameters(load_profile())
     apply_pole_geometry(stage, "/cartpole", model)
     cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), ["default", "render", "proxy", "guide"])
-    bounds = cache.ComputeRelativeBound(stage.GetPrimAtPath("/cartpole/pole/rod"), stage.GetPrimAtPath("/cartpole/pole")).ComputeAlignedRange()
+    collision_cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), ["default", "render", "proxy", "guide"], ignoreVisibility=True)
+    bounds = collision_cache.ComputeRelativeBound(stage.GetPrimAtPath("/cartpole/pole/rod"), stage.GetPrimAtPath("/cartpole/pole")).ComputeAlignedRange()
     low, high = bounds.GetMin(), bounds.GetMax()
     assert abs(low[2]) < 1e-6 and abs(high[2] - model["pole_length_m"]) < 1e-6, (low, high)
     assert (joint.GetLocalPos0Attr().Get(), joint.GetLocalPos1Attr().Get(), joint.GetAxisAttr().Get()) == before
@@ -28,6 +29,17 @@ def main():
     assert not stage.GetPrimAtPath("/cartpole/pole/collisions").IsActive()
     rod = stage.GetPrimAtPath("/cartpole/pole/rod")
     assert UsdPhysics.CollisionAPI(rod).GetCollisionEnabledAttr().Get()
+    assert UsdGeom.Imageable(rod).GetVisibilityAttr().Get() == "invisible"
+    visual = stage.GetPrimAtPath("/cartpole/pole/rod_visual")
+    visual_range = cache.ComputeRelativeBound(visual, stage.GetPrimAtPath("/cartpole/pole")).ComputeAlignedRange()
+    assert abs(visual_range.GetMin()[2]) < 1e-6
+    assert abs(visual_range.GetMax()[2] - model["pole_length_m"]) < 1e-6
+    for path in ("pole/rod_visual", "cart/body_visual", "cart/hub_visual"):
+        prim = stage.GetPrimAtPath(f"/cartpole/{path}")
+        assert not prim.HasAPI(UsdPhysics.CollisionAPI), path
+        assert not prim.HasAPI(UsdPhysics.RigidBodyAPI), path
+        assert not prim.HasAPI(UsdPhysics.MassAPI), path
+    assert UsdGeom.Imageable(stage.GetPrimAtPath("/cartpole/cart/visuals")).GetVisibilityAttr().Get() == "invisible"
     mass = UsdPhysics.MassAPI(stage.GetPrimAtPath("/cartpole/pole"))
     assert abs(mass.GetMassAttr().Get() - model["pole_mass_kg"]) < 1e-6
     assert abs(mass.GetCenterOfMassAttr().Get()[2] - model["pole_com_m"]) < 1e-6
