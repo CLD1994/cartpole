@@ -127,6 +127,15 @@ def reported_run(path, report, *, active, emit=print):
             raise SystemExit(1)
 
 
+
+def run_seed_cohort(metrics, *, reset, step_factory, inference_context, max_steps):
+    """运行一个独立种子，复位和步进共用推理上下文。"""
+    with inference_context():
+        reset(metrics.seed)
+        step = step_factory()
+        return run_cohort(metrics,step=step,max_steps=max_steps)
+
+
 def main(argv=None):
     import warp as wp
     wp.config.enable_backward = False
@@ -206,17 +215,21 @@ def main(argv=None):
                                   render_interval=env_cfg.sim.render_interval)
                     for seed in args.seeds:
                         active[0] = None
-                        raw.reset(seed=seed)
-                        policy.reset(torch.ones(args.num_envs,dtype=torch.bool,device=env.unwrapped.device))
-                        obs = env.get_observations()
                         metrics = EpisodeMetrics(num_envs=args.num_envs,seed=seed,dt=dt)
-                        active[0] = metrics
-                        def step():
-                            nonlocal obs
-                            obs,_,dones,_ = env.step(policy(obs))
-                            policy.reset(dones)
-                        with torch.inference_mode():
-                            cohort = run_cohort(metrics,step=step,max_steps=math.ceil(env_cfg.episode_length_s/dt)+2)
+                        def reset(seed):
+                            raw.reset(seed=seed)
+                            policy.reset(torch.ones(args.num_envs,dtype=torch.bool,device=env.unwrapped.device))
+                        def step_factory():
+                            obs = env.get_observations()
+                            active[0] = metrics
+                            def step():
+                                nonlocal obs
+                                obs,_,dones,_ = env.step(policy(obs))
+                                policy.reset(dones)
+                            return step
+                        cohort = run_seed_cohort(metrics,reset=reset,step_factory=step_factory,
+                            inference_context=torch.inference_mode,
+                            max_steps=math.ceil(env_cfg.episode_length_s/dt)+2)
                         active[0] = None
                         report['cohorts'].append(cohort)
                         persist_progress(output/'report.json',report)
