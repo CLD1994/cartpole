@@ -20,7 +20,7 @@ def main():
     model = model_parameters(load_profile())
     apply_pole_geometry(stage, "/cartpole", model)
     cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), ["default", "render", "proxy", "guide"])
-    collision_cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), ["default", "render", "proxy", "guide"], ignoreVisibility=True)
+    collision_cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), ["default", "render", "proxy", "guide"], False, True)
     bounds = collision_cache.ComputeRelativeBound(stage.GetPrimAtPath("/cartpole/pole/rod"), stage.GetPrimAtPath("/cartpole/pole")).ComputeAlignedRange()
     low, high = bounds.GetMin(), bounds.GetMax()
     assert abs(low[2]) < 1e-6 and abs(high[2] - model["pole_length_m"]) < 1e-6, (low, high)
