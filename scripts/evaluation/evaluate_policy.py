@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import math
@@ -76,6 +77,56 @@ def write_report(path, report):
     temporary.replace(path)
 
 
+
+def refresh_summary(report, status):
+    """全局状态覆盖局部cohort状态；部分种子完成不能发布完整成功率。"""
+    summary = summarize(report['cohorts'])
+    summary['status'] = status
+    if status != 'complete':
+        summary.update(success_rate=None,wilson_95_low=None,wilson_95_high=None)
+    report.update(status=status,summary=summary)
+
+
+def persist_progress(path, report):
+    refresh_summary(report,'running')
+    write_report(path,report)
+
+
+def persist_error(path, report, active, error):
+    if active[0] is not None:
+        report['interrupted_cohort'] = active[0].report()
+    refresh_summary(report,'error')
+    report['error'] = dict(type=type(error).__name__,message=str(error))
+    write_report(path,report)
+
+
+@contextmanager
+def reported_run(path, report, *, active, emit=print):
+    """必须嵌套在launch_simulation内部，确保Kit可能退出进程前已落盘。
+
+    退出码只表示采集完整；不可用cohort局部完成替代全部请求种子完成。
+    """
+    try:
+        yield
+    except BaseException as error:
+        persist_error(path,report,active,error)
+        if isinstance(error,SystemExit) and error.code in (None,0):
+            raise SystemExit(1) from error
+        raise
+    else:
+        cohorts = report['cohorts']
+        complete = ([c['seed'] for c in cohorts] == report['seeds']
+                    and all(c['status']=='complete'
+                            and c['requested']==report['num_envs']
+                            and c['completed']==report['num_envs']
+                            and len(c['episodes'])==report['num_envs'] for c in cohorts))
+        refresh_summary(report,'complete' if complete else 'incomplete')
+        write_report(path,report)
+        emit('POLICY_EVALUATION '+json.dumps(report['summary'],ensure_ascii=False))
+        if not complete:
+            raise SystemExit(1)
+
+
 def main(argv=None):
     import warp as wp
     wp.config.enable_backward = False
@@ -120,71 +171,69 @@ def main(argv=None):
         if args.render_interval is not None:
             env_cfg.sim.render_interval = args.render_interval
         with launch_simulation(env_cfg,args):
-            # 保存解析后的物理配置，不把诊断recorder写成训练模型的一部分。
-            dump_yaml(str(output/'env.yaml'),env_cfg)
-            def consume(data):
-                if active[0] is not None:
-                    active[0].record(**data)
-            def before_reset(env_ids):
-                if active[0] is not None:
-                    if hasattr(env_ids, 'detach'):
-                        env_ids = env_ids.detach().cpu().tolist()
-                    active[0].check_reset(env_ids)
-            recorder_type = make_recorder_type(RecorderTerm,snapshot=snapshot_environment,
-                                               consume=consume,before_reset=before_reset)
-            recorder_cfg = RecorderManagerBaseCfg()
-            recorder_cfg.dataset_export_mode = DatasetExportMode.EXPORT_NONE
-            recorder_cfg.export_in_record_pre_reset = False
-            recorder_cfg.export_in_close = False
-            recorder_cfg.evaluation = RecorderTermCfg(class_type=recorder_type)
-            env_cfg.recorders = recorder_cfg
-            raw = gym.make(args.task,cfg=env_cfg)
-            try:
-                env = RslRlVecEnvWrapper(raw,clip_actions=agent_cfg.clip_actions)
-                agent_cfg.device = str(env.unwrapped.device)
-                dump_yaml(str(output/'agent.yaml'),agent_cfg)
-                runner = create_rsl_rl_runner(env,agent_cfg,log_dir=None)
-                runner.load(str(checkpoint))
-                policy = runner.get_inference_policy(device=env.unwrapped.device)
-                dt = env.unwrapped.step_dt
-                report.update(step_dt_s=dt,physics_dt_s=env.unwrapped.physics_dt,
-                              horizon_s=env_cfg.episode_length_s,device=str(env.unwrapped.device),
-                              physics_backend=type(env_cfg.sim.physics).__name__,
-                              visualization=getattr(args,'visualizer',None),
-                              render_interval=env_cfg.sim.render_interval)
-                for seed in args.seeds:
-                    active[0] = None
-                    raw.reset(seed=seed)
-                    policy.reset(torch.ones(args.num_envs,dtype=torch.bool,device=env.unwrapped.device))
-                    obs = env.get_observations()
-                    metrics = EpisodeMetrics(num_envs=args.num_envs,seed=seed,dt=dt)
-                    active[0] = metrics
-                    def step():
-                        nonlocal obs
-                        obs,_,dones,_ = env.step(policy(obs))
-                        policy.reset(dones)
-                    with torch.inference_mode():
-                        cohort = run_cohort(metrics,step=step,max_steps=math.ceil(env_cfg.episode_length_s/dt)+2)
-                    active[0] = None
-                    report['cohorts'].append(cohort)
-                    report['summary'] = summarize(report['cohorts'])
-                    report['status'] = 'running'
-                    write_report(output/'report.json',report)
-                    print(f"[SEED {seed}] {cohort['completed']}/{args.num_envs} complete, successes={cohort['successes']}",flush=True)
-                    if cohort['status'] != 'complete':
-                        break
-            finally:
-                raw.close()
-        report['status'] = ('complete' if len(report['cohorts']) == len(args.seeds)
-                            and report['summary']['status'] == 'complete' else 'incomplete')
-        write_report(output/'report.json',report)
-        print('POLICY_EVALUATION '+json.dumps(report['summary'],ensure_ascii=False))
-        return 0 if report['status'] == 'complete' else 1
+            with reported_run(output/'report.json',report,active=active,emit=lambda text:print(text,flush=True)):
+                # 保存解析后的物理配置，不把诊断recorder写成训练模型的一部分。
+                dump_yaml(str(output/'env.yaml'),env_cfg)
+                def consume(data):
+                    if active[0] is not None:
+                        active[0].record(**data)
+                def before_reset(env_ids):
+                    if active[0] is not None:
+                        if hasattr(env_ids, 'detach'):
+                            env_ids = env_ids.detach().cpu().tolist()
+                        active[0].check_reset(env_ids)
+                recorder_type = make_recorder_type(RecorderTerm,snapshot=snapshot_environment,
+                                                   consume=consume,before_reset=before_reset)
+                recorder_cfg = RecorderManagerBaseCfg()
+                recorder_cfg.dataset_export_mode = DatasetExportMode.EXPORT_NONE
+                recorder_cfg.export_in_record_pre_reset = False
+                recorder_cfg.export_in_close = False
+                recorder_cfg.evaluation = RecorderTermCfg(class_type=recorder_type)
+                env_cfg.recorders = recorder_cfg
+                raw = gym.make(args.task,cfg=env_cfg)
+                try:
+                    env = RslRlVecEnvWrapper(raw,clip_actions=agent_cfg.clip_actions)
+                    agent_cfg.device = str(env.unwrapped.device)
+                    dump_yaml(str(output/'agent.yaml'),agent_cfg)
+                    runner = create_rsl_rl_runner(env,agent_cfg,log_dir=None)
+                    runner.load(str(checkpoint))
+                    policy = runner.get_inference_policy(device=env.unwrapped.device)
+                    dt = env.unwrapped.step_dt
+                    report.update(step_dt_s=dt,physics_dt_s=env.unwrapped.physics_dt,
+                                  horizon_s=env_cfg.episode_length_s,device=str(env.unwrapped.device),
+                                  physics_backend=type(env_cfg.sim.physics).__name__,
+                                  visualization=getattr(args,'visualizer',None),
+                                  render_interval=env_cfg.sim.render_interval)
+                    for seed in args.seeds:
+                        active[0] = None
+                        raw.reset(seed=seed)
+                        policy.reset(torch.ones(args.num_envs,dtype=torch.bool,device=env.unwrapped.device))
+                        obs = env.get_observations()
+                        metrics = EpisodeMetrics(num_envs=args.num_envs,seed=seed,dt=dt)
+                        active[0] = metrics
+                        def step():
+                            nonlocal obs
+                            obs,_,dones,_ = env.step(policy(obs))
+                            policy.reset(dones)
+                        with torch.inference_mode():
+                            cohort = run_cohort(metrics,step=step,max_steps=math.ceil(env_cfg.episode_length_s/dt)+2)
+                        active[0] = None
+                        report['cohorts'].append(cohort)
+                        persist_progress(output/'report.json',report)
+                        print(f"[SEED {seed}] {cohort['completed']}/{args.num_envs} complete, successes={cohort['successes']}",flush=True)
+                        if cohort['status'] != 'complete':
+                            break
+                finally:
+                    raw.close()
+        return 0
     except BaseException as error:
-        if active[0] is not None:
-            report['interrupted_cohort'] = active[0].report()
-        report.update(status='error',error=dict(type=type(error).__name__,message=str(error)))
-        write_report(output/'report.json',report)
+        # Kit may raise SystemExit during shutdown. Never overwrite a terminal report
+        # with that expected exit; ordinary startup/shutdown failures still count as errors.
+        expected_exit = (isinstance(error,SystemExit)
+                         and ((report['status']=='complete' and error.code in (None,0))
+                              or (report['status']=='incomplete' and error.code==1)))
+        if not expected_exit and report['status'] != 'error':
+            persist_error(output/'report.json',report,active,error)
         raise
 
 
