@@ -54,3 +54,19 @@ python .\scripts\diagnostics\playback_rtf.py --checkpoint <模型完整路径> -
 ```
 
 与基线保持相同设备、模型、种子、步数和预热，只改变显示间隔。核对输出中的 `render_interval`，同时观察界面响应与 RTF。
+
+## 预热后的短窗口函数采样
+
+`--profile <输出文件>` 使用 Python 标准库 cProfile，仅采样预热后的 `--steps` 个控制步。
+默认不启用，无需安装额外依赖。启动、模型加载、预热、最终设备同步和输出文件写入不在采样窗口内。
+采样包含控制循环自身与调用的主机函数。步进失败时停止采样并传播异常，不生成成功报告。
+输出父目录须已存在；指定的同名文件会被覆盖。
+
+```powershell
+python .\scripts\diagnostics\playback_rtf.py --checkpoint <模型完整路径> --device cpu --viz newton_gl --render-interval 20 --steps 500 --warmup 500 --seed 42 --info --profile .\playback-cpu-gl.prof
+python -c "import pstats; pstats.Stats('playback-cpu-gl.prof').strip_dirs().sort_stats('cumulative').print_stats(60)" *> .\playback-cpu-gl-summary.txt
+```
+
+cProfile 会增加主机调用开销，报告中的 RTF 不能作为正常运行性能基线。
+累计时间包含子调用，不能把各行累计时间直接相加。先用累计时间定位显示、状态传输或窗口呈现路径，再结合自身时间判断。
+它不能区分 GPU 内核执行与驱动等待，也不覆盖其他线程中的完整工作。结果仅用于定位下一次针对性实验，不能据此改变训练、物理步长或控制频率。

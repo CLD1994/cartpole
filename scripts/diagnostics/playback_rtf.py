@@ -25,6 +25,8 @@ def parse_args(argv=None, *, add_launcher_args):
     parser.add_argument('--warmup', type=int, default=500)
     parser.add_argument('--real-time', action='store_true')
     parser.add_argument('--breakdown', action='store_true', help='记录主机调用分段耗时，不等于GPU核耗时')
+    parser.add_argument('--profile', type=Path, default=None,
+                        help='保存预热后 steps 个控制步的 cProfile 数据；会增加运行耗时')
     add_launcher_args(parser)
     parser.add_argument('--render-interval', type=int, default=None,
                         help='每隔多少个物理步更新显示；默认保留任务配置，不改变物理或控制周期')
@@ -88,10 +90,14 @@ def main(argv=None):
             def synchronize():
                 if device.type == 'cuda':
                     torch.cuda.synchronize(device)
+            profiler = None
+            if args.profile is not None:
+                import cProfile
+                profiler = cProfile.Profile()
             with torch.inference_mode():
                 result = measure_playback(step, dt=env.unwrapped.step_dt,
                     steps=args.steps, warmup=args.warmup, real_time=args.real_time,
-                    synchronize=synchronize, on_measurement_start=phases.clear)
+                    synchronize=synchronize, on_measurement_start=phases.clear, profiler=profiler)
             result.update(checkpoint=str(checkpoint), checkpoint_sha256=digest,
                 task=args.task, seed=args.seed, num_envs=1,
                 physics_dt_s=env.unwrapped.physics_dt,
@@ -101,6 +107,10 @@ def main(argv=None):
             if args.breakdown:
                 result['host_call_timings'] = phases.summary()
                 result['timing_scope'] = 'host calls; environment includes physics, episode reset and rendering; not GPU kernel attribution'
+            if profiler is not None:
+                profiler.dump_stats(str(args.profile))
+                result['profile'] = dict(path=str(args.profile.resolve()), steps=args.steps,
+                    scope='post-warmup host calls; includes profiler overhead; not GPU kernel attribution or baseline RTF')
             print('PLAYBACK_TIMING ' + json.dumps(result, ensure_ascii=False))
         finally:
             raw_env.close()

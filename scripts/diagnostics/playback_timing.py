@@ -5,7 +5,7 @@ import time
 
 def measure_playback(step, *, dt, warmup=500, steps=5000, real_time=False,
                      clock=time.perf_counter, sleep=time.sleep, synchronize=lambda: None,
-                     on_measurement_start=lambda: None):
+                     on_measurement_start=lambda: None, profiler=None):
     """预热后计时。异常直接传播，不输出不完整的成功结果。"""
     if not math.isfinite(dt) or dt <= 0 or warmup < 0 or steps <= 0:
         raise ValueError('dt 和 steps 必须为正，warmup 不得为负')
@@ -14,12 +14,18 @@ def measure_playback(step, *, dt, warmup=500, steps=5000, real_time=False,
     synchronize()
     on_measurement_start()
     start = clock()
-    for _ in range(steps):
-        before = clock()
-        step()
-        remaining = dt - (clock() - before)
-        if real_time and remaining > 0:
-            sleep(remaining)
+    if profiler is not None:
+        profiler.enable()
+    try:
+        for _ in range(steps):
+            before = clock()
+            step()
+            remaining = dt - (clock() - before)
+            if real_time and remaining > 0:
+                sleep(remaining)
+    finally:
+        if profiler is not None:
+            profiler.disable()
     loop_end = clock()
     synchronize()
     end = clock()
