@@ -18,7 +18,8 @@ def main():
     joint = UsdPhysics.RevoluteJoint(stage.GetPrimAtPath("/cartpole/cart/cart_to_pole"))
     before = (joint.GetLocalPos0Attr().Get(), joint.GetLocalPos1Attr().Get(), joint.GetAxisAttr().Get())
     cart = stage.GetPrimAtPath("/cartpole/cart")
-    old_render_paths = [child.GetPath() for child in cart.GetChildren() if UsdGeom.Imageable(child)]
+    old_render_paths = [prim.GetPath() for prim in Usd.PrimRange(cart, Usd.TraverseInstanceProxies()) if UsdGeom.Gprim(prim)]
+    assert old_render_paths, "标准车体未找到实际渲染几何，不能确认外观替换"
     collision_states = {prim.GetPath(): UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Get()
                         for prim in Usd.PrimRange(cart, Usd.TraverseInstanceProxies()) if prim.HasAPI(UsdPhysics.CollisionAPI)}
     assert collision_states, "标准车体未找到碰撞体，不能确认物理保持"
@@ -45,7 +46,6 @@ def main():
         assert not prim.HasAPI(UsdPhysics.CollisionAPI), path
         assert not prim.HasAPI(UsdPhysics.RigidBodyAPI), path
         assert not prim.HasAPI(UsdPhysics.MassAPI), path
-    assert UsdGeom.Imageable(stage.GetPrimAtPath("/cartpole/cart/visuals")).GetVisibilityAttr().Get() == "invisible"
     for path in old_render_paths:
         assert UsdGeom.Imageable(stage.GetPrimAtPath(path)).ComputeVisibility() == "invisible", path
     for path, enabled in collision_states.items():
@@ -61,7 +61,7 @@ def main():
                       "com_m": list(mass.GetCenterOfMassAttr().Get()),
                       "inertia_com_kg_m2": list(mass.GetDiagonalInertiaAttr().Get()),
                       "cart_collision_count": len(collision_states),
-                      "hidden_cart_subtrees": [str(path) for path in old_render_paths],
+                      "hidden_cart_geometry": [str(path) for path in old_render_paths],
                       "scope": "OpenUSD 创建检查通过；不是物理后端或运动验证"}, indent=2, ensure_ascii=False))
 
 

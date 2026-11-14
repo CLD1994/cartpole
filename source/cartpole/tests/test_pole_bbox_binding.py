@@ -20,7 +20,7 @@ class BBoxBindingTests(unittest.TestCase):
                 raise ConstructorReached
             return Mock()
         usd = SimpleNamespace(Usd=Mock(), Gf=Mock(), UsdPhysics=Mock(), UsdShade=Mock(),
-                              UsdGeom=SimpleNamespace(BBoxCache=bbox, Imageable=Mock()))
+                              UsdGeom=SimpleNamespace(BBoxCache=bbox, Imageable=Mock(), Gprim=Mock()))
         usd.Usd.Stage.CreateInMemory.return_value.GetPrimAtPath.return_value.GetChildren.return_value = []
         usd.Usd.PrimRange.return_value = [Mock()]
         profile = SimpleNamespace(load_profile=lambda: {}, model_parameters=lambda _: {})

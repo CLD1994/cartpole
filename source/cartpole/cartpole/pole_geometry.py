@@ -57,13 +57,9 @@ def apply_cartpole_visuals(stage, root_path, model):
         raise ValueError("标准 Cartpole 缺少车体视觉或转轴，无法创建示意外观")
     if cart.IsInstanceProxy() or original.IsInstanceProxy():
         raise ValueError("车体视觉是实例代理，不能独立定义示意外观")
-    # 碰撞网格也可能可见。隐藏所有原有可渲染子树，而不禁用任何物理 prim。
+    # 容器可能不是 Imageable；沿真实层级找到可隐藏的几何子树。
     for child in cart.GetChildren():
-        imageable = UsdGeom.Imageable(child)
-        if imageable:
-            if child.IsInstanceProxy():
-                raise ValueError("车体几何是实例代理，不能独立设置可见性")
-            imageable.CreateVisibilityAttr(UsdGeom.Tokens.invisible)
+        hide_render_subtree(child)
     anchor = joint.GetLocalPos0Attr().Get()
 
     rod = UsdGeom.Cylinder.Define(stage, f"{root_path}/pole/rod_visual")
@@ -113,3 +109,21 @@ def apply_rod_material(stage, rod):
     shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(.65)
     material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
     UsdShade.MaterialBindingAPI.Apply(rod.GetPrim()).Bind(material)
+
+
+def hide_render_subtree(prim):
+    """隐藏渲染而保留物理；非渲染容器继续遍历，实例仅在必要时展开。"""
+    from pxr import UsdGeom
+
+    if prim.IsInstanceProxy():
+        raise ValueError(f"不能写入实例代理的可见性：{prim.GetPath()}")
+    imageable = UsdGeom.Imageable(prim)
+    if imageable:
+        imageable.CreateVisibilityAttr(UsdGeom.Tokens.invisible)
+        return
+    # 非 Imageable 实例根不能承载有效继承可见性，也不能写入其代理孩子。
+    # 仅展开此几何子树的引用，不删除或停用任何碰撞、关节、刚体。
+    if prim.IsInstance():
+        prim.SetInstanceable(False)
+    for child in prim.GetChildren():
+        hide_render_subtree(child)

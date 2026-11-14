@@ -19,7 +19,7 @@ class Attr:
 
 
 class Shape:
-    def __init__(self): self.attrs = {}
+    def __init__(self): self.attrs = {}; self.children = []; self.imageable = True; self.instance = False
     def __getattr__(self, name):
         if name.startswith('Create') and name.endswith('Attr'):
             def create(value):
@@ -31,6 +31,8 @@ class Shape:
     def GetPath(self): return Mock()
     def GetPrim(self): return self
     def IsInstanceProxy(self): return False
+    def IsInstance(self): return self.instance
+    def SetInstanceable(self, value): self.instance = value
     def ClearXformOpOrder(self): pass
     def AddTranslateOp(self): self.attrs['Translate'] = Attr(); return self.attrs['Translate']
     def AddScaleOp(self): self.attrs['Scale'] = Attr(); return self.attrs['Scale']
@@ -56,7 +58,7 @@ class VisualTests(unittest.TestCase):
         factory = SimpleNamespace(Define=lambda stage, path: stage.define(path))
         self.usd = SimpleNamespace(Gf=SimpleNamespace(Vec3f=vector, Vec3d=vector),
             UsdGeom=SimpleNamespace(Cube=factory, Cylinder=factory, Xformable=lambda p:p,
-                Imageable=lambda p:p, Tokens=SimpleNamespace(invisible='invisible', inherited='inherited')),
+                Imageable=lambda p:p if p.imageable else None, Tokens=SimpleNamespace(invisible='invisible', inherited='inherited')),
             # No mutation APIs: any attempt to create collision/mass/rigid bodies fails.
             UsdPhysics=SimpleNamespace(RevoluteJoint=lambda p:p), Sdf=Mock(), UsdShade=Mock())
     def apply(self):
@@ -86,6 +88,26 @@ class VisualTests(unittest.TestCase):
         self.assertEqual(collision.attrs['Visibility'].value, 'invisible')
         for path in ('/r/cart/body_visual', '/r/cart/hub_visual', '/r/pole/rod_visual'):
             self.assertEqual(self.stage.prims[path].attrs['Visibility'].value, 'inherited')
+
+    def test_non_imageable_container_descends_to_real_geometry(self):
+        scope = self.stage.prims['/r/cart/visuals']
+        scope.imageable = False
+        mesh = Shape()
+        scope.children = [mesh]
+        self.apply()
+        self.assertNotIn('Visibility', scope.attrs)
+        self.assertEqual(mesh.attrs['Visibility'].value, 'invisible')
+
+    def test_non_imageable_instance_container_is_expanded_before_children(self):
+        scope = self.stage.prims['/r/cart/visuals']
+        scope.imageable = False
+        scope.instance = True
+        mesh = Shape()
+        mesh.IsInstanceProxy = lambda: scope.instance
+        scope.children = [mesh]
+        self.apply()
+        self.assertFalse(scope.instance)
+        self.assertEqual(mesh.attrs['Visibility'].value, 'invisible')
 
     def test_missing_cart_visual_fails_before_editing(self):
         del self.stage.prims['/r/cart/visuals']
