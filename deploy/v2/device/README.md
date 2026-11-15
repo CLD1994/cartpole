@@ -238,3 +238,20 @@ python .\deploy\v2\device\run_policy.py --port COM11 --onnx "$onnx" --contract "
 报告列出 timing_limits_s、每个完成样本的 command_gap_soft_warning、completion_gaps_over_4ms / completion_gaps_over_6ms；最后失败快照仍记录实际命令gap与观测年龄。4ms计数只涵盖已完成动作（诊断为虚拟动作），不代表独立调度故障次数。诊断使用相同新门槛，仍仅只读且would_stop后的继续是反事实。
 
 这允许最多6ms主机命令间隔，不保证5秒完成，也不证明物理延迟安全。观测仍可能在4ms门停止。既有固件看门狗不变，不需重刷；本次未操作设备。上文历史版本的4ms命令硬限说明由本节取代。
+
+
+### 第九版：受监控持续模式
+
+`--continuous` 与 `--seconds` 二选一，不能用于只读诊断；默认仍0.5秒。持续模式没有任意时长截止，直到用户按一次Ctrl+C或原门控触发才结束。仍需明确 `--start-confirmed`、原合同、设备READY及现场独立停机，不自动ENABLE/回中/重连/恢复。禁止无人值守。
+
+```powershell
+python .\deploy\v2\device\run_policy.py --port COM11 --onnx "$onnx" --contract "$contract" --start-confirmed --continuous --output "$exportDir\continuous-$(Get-Date -Format yyyyMMdd-HHmmss).json"
+```
+
+命令6ms硬限/4ms软告警、观测4ms、推理2ms、制动包络、±0.2m位置、摆角与速度有效性、FAULT、接收积压和原TTL不变。单项配置/状态继续50ms轮转，单组在途；不为长期运行改成阻塞整组查询。门控失败可能很快停止，这是故障停机而非人为时长截断。
+
+按一次Ctrl+C后先零速、等待新零速观测、请求DISABLE并等待确认。仅收到禁用确认且没有会话/接收故障才报告 `stopped_by_user` / 退出码0。第二次Ctrl+C、强杀、关终端或断线可能打断清理；固件WDT只把目标降到0并减速，不自动DISABLED或永久锁停。必须现场确认状态，禁止自动重连继续动作。
+
+内存保留最近10000条动作/推理/间隔及512组读回（约末20秒动作），`run_totals`另累计全程计数/最大间隔/推理总耗时。尾部p95不是全程p95。活动控制期间不做同步磁盘日志；启动清单先落盘，正常停止后保存尾部与总量。崩溃时可能只留下启动清单，不能把缺少最终报告解释为安全停机或已禁用。
+
+本次仅静态及基本检查，未由开发端操作设备或声称长期稳定通过。
