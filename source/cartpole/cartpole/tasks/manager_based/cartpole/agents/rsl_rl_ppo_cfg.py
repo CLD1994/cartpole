@@ -17,6 +17,8 @@ from ..mdp import symmetry
 
 @configclass
 class CartpolePPORunnerCfg(RslRlOnPolicyRunnerCfg):
+    # Explicit RSL-RL 5.5.1 fallback mapping; both networks keep policy observations.
+    obs_groups = {"actor": ["policy"], "critic": ["policy"]}
     num_steps_per_env = 16
     max_iterations = 150
     save_interval = 50
