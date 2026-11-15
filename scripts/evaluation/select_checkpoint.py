@@ -22,6 +22,83 @@ def save(path, data):
     tmp.replace(path)
 
 
+def nominate_complete_episodes(run, checkpoints, candidates, window):
+    """新run以逐iteration原始计数为权威；缺失整套日志才交给旧日志提名。"""
+    episode_file = run/'training-episodes.jsonl'
+    checkpoint_file = run/'training-checkpoints.jsonl'
+    if not episode_file.exists() and not checkpoint_file.exists():
+        return None
+    if not episode_file.is_file() or not checkpoint_file.is_file():
+        raise ValueError('新回合日志只有一份，不能回退旧标量；请恢复完整文件或显式指定候选')
+    rows = [json.loads(line) for line in episode_file.read_text(encoding='utf-8').splitlines() if line.strip()]
+    saves = [json.loads(line) for line in checkpoint_file.read_text(encoding='utf-8').splitlines() if line.strip()]
+    if not rows or not saves:
+        raise ValueError('新回合日志为空，不能用于自动提名')
+    def integer(value):
+        return isinstance(value,int) and not isinstance(value,bool) and value>=0
+    by_iteration = {}
+    previous = None
+    for row in rows:
+        if row.get('schema_version')!=2 or row.get('rank')!=0 or Path(row['run_dir']).resolve()!=run:
+            raise ValueError('回合日志schema/rank/run_dir不匹配；请显式指定候选')
+        fields = ['iteration','start_iteration','window_start_step','window_end_step','completed','successes','failures']
+        if not all(integer(row[k]) for k in fields) or row['successes']+row['failures']!=row['completed']:
+            raise ValueError('回合日志计数无效')
+        if row['window_end_step']<=row['window_start_step'] or row['iteration'] in by_iteration:
+            raise ValueError('回合窗口无效或iteration重复')
+        if previous is None:
+            if row['iteration']!=row['start_iteration'] or row['window_start_step']!=0:
+                raise ValueError('回合日志缺失首个窗口')
+        elif (row['iteration']!=previous['iteration']+1 or row['start_iteration']!=previous['start_iteration']
+              or row['window_start_step']!=previous['window_end_step']):
+            raise ValueError('回合日志窗口不连续，不能混合恢复运行或缺失样本')
+        by_iteration[row['iteration']]=row
+        previous=row
+    bindings = {}
+    for record in saves:
+        if record.get('schema_version')!=1:
+            raise ValueError('未知checkpoint日志schema')
+        path = str(Path(record['checkpoint']).resolve())
+        iteration = record['saved_after_update_iteration']
+        if not integer(iteration) or iteration not in by_iteration or record['training_iteration_metrics']!=by_iteration[iteration]:
+            raise ValueError('checkpoint保存记录与iteration计数不一致')
+        if Path(path).parent!=run:
+            raise ValueError('checkpoint保存记录不属于同一run')
+        bindings[path]=iteration  # 最终保存可重复同一路径，按生产者约定取最后一条。
+    mapped=[]
+    for candidate in checkpoints:
+        row=dict(candidate)
+        if candidate['path'] not in bindings or bindings[candidate['path']]!=candidate['iteration']:
+            row.update(eligible=False, reason='no_matching_save_record')
+        else:
+            samples=[v for i,v in by_iteration.items() if candidate['iteration']-window+1<=i<=candidate['iteration']]
+            completed=sum(v['completed'] for v in samples)
+            successes=sum(v['successes'] for v in samples)
+            row.update(eligible=completed>0, reason=None if completed else 'no_complete_episodes',
+                       completed=completed,successes=successes,
+                       success_rate=successes/completed if completed else None,
+                       iterations=[v['iteration'] for v in samples],
+                       window_start_step=samples[0]['window_start_step'],window_end_step=samples[-1]['window_end_step'])
+        mapped.append(row)
+    available=[r for r in mapped if r['eligible']]
+    if not available:
+        raise ValueError('没有已完成回合且保存记录可关联的候选；不能按零样本排名，请显式指定候选')
+    selected=[]
+    groups=min(candidates,len(available))
+    for group in range(groups):
+        segment=available[group*len(available)//groups:(group+1)*len(available)//groups]
+        best=max(segment,key=lambda r:(r['success_rate'],r['completed'],-r['iteration']))
+        selected.append(next(c for c in checkpoints if c['path']==best['path']))
+    final=checkpoints[-1]
+    if final not in selected:
+        selected.append(final)
+    return selected,dict(method='temporal_groups_complete_episode_counts',window_iterations=window,
+        mapping=mapped,requested_groups=candidates,final_checkpoint_included_for_coverage=True,
+        source_files=[dict(path=str(p),sha256=digest(p)) for p in (episode_file,checkpoint_file)],
+        ranking_rule='每时段按窗口sum(successes)/sum(completed)提名；同分取样本更多者，再取较早iter；零分母不排名，末checkpoint额外纳入覆盖。',
+        warning='仅rank 0训练回合，回合可能跨策略更新；窗口截至保存iteration，不使用未来样本。checkpoint为更新后权重，不代表冻结评估成绩。')
+
+
 def nominate(run, candidates, window, manual):
     """文件编号只用于映射日志横轴和时段，不作为模型质量分数。"""
     import torch
@@ -47,6 +124,9 @@ def nominate(run, candidates, window, manual):
         if missing:
             raise ValueError(f'手动候选不属于该训练目录的有效checkpoint: {sorted(missing)}')
         return selected, dict(method='manual', checkpoints=checkpoints)
+    complete_episode_nomination = nominate_complete_episodes(run, checkpoints, candidates, window)
+    if complete_episode_nomination is not None:
+        return complete_episode_nomination
     events = sorted(run.glob('events.out.tfevents.*'))
     if not events:
         raise ValueError('缺少同目录TensorBoard日志；请用--checkpoints显式指定候选，不自动伪造训练排名')
@@ -99,7 +179,7 @@ def evaluate(candidate, args, output, seeds, stage):
     target = output/stage/('model_'+str(candidate['iteration']))
     target.mkdir(parents=True)
     cmd = [sys.executable, str(Path(__file__).with_name('evaluate_policy.py')),
-           '--checkpoint',candidate['path'],'--num_envs',str(args.num_envs),
+           '--checkpoint',candidate['path'],'--task',args.task,'--num_envs',str(args.num_envs),
            '--seeds',*map(str,seeds),'--device',args.device,'--viz','none','--info',
            '--output-dir',str(target)]
     if args.horizon_s is not None:
@@ -117,7 +197,7 @@ def evaluate(candidate, args, output, seeds, stage):
     path = reports[0]; report = json.loads(path.read_text(encoding='utf-8'))
     if (report['status']!='complete' or report['summary']['status']!='complete'
         or report['checkpoint_sha256']!=candidate['sha256'] or report['seeds']!=seeds
-        or report['num_envs']!=args.num_envs):
+        or report['num_envs']!=args.num_envs or report.get('task')!=args.task):
         raise ValueError(f'报告不完整或身份不匹配: {path}')
     episodes = [e for c in report['cohorts'] for e in c['episodes']]
     if len(episodes)!=len(seeds)*args.num_envs:
@@ -125,7 +205,7 @@ def evaluate(candidate, args, output, seeds, stage):
     successes = [e for e in episodes if e['success']]
     speed = statistics.mean(e['cart_mean_abs_velocity_m_s'] for e in successes) if successes else None
     drift = statistics.mean(abs(e['cart_net_displacement_m']) for e in successes) if successes else None
-    return dict(**candidate, report=str(path), summary=report['summary'],
+    return dict(**candidate, task=report['task'], report=str(path), summary=report['summary'],
                 successful_episode_mean_abs_velocity_m_s=speed,
                 successful_episode_mean_abs_net_displacement_m=drift,
                 env_config_sha256=digest(path.parent/'env.yaml'), code=report['code'])
@@ -134,6 +214,10 @@ def evaluate(candidate, args, output, seeds, stage):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--run-dir',type=Path,required=True)
+    p.add_argument('--task',default='Hexchip-Cartpole-Real-V2-v0',
+                   choices=['Hexchip-Cartpole-Real-V2-v0', 'Hexchip-Cartpole-Real-V2-Window16-v0',
+                            'Hexchip-Cartpole-Real-V2-Window16-Tau0-v0'],
+                   help='候选及holdout统一评估任务；必须显式匹配目标观测和执行器配置，默认保持旧任务')
     p.add_argument('--checkpoints',type=Path,nargs='+',help='显式候选；绕过训练日志提名')
     p.add_argument('--candidates',type=int,default=3,help='训练时段数；另保留最后保存的checkpoint')
     p.add_argument('--window',type=int,default=20,help='提名用日志窗口，单位为训练迭代')
@@ -196,3 +280,4 @@ def main():
 
 if __name__=='__main__':
     main()
+
