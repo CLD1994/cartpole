@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "onnx_main_file_sha256": "REPLACE_WITH_VERIFIED_EXPORTED_MODEL_HASH",
+  "observation_order": [
+    "x",
+    "theta",
+    "xdot",
+    "thetadot"
+  ],
+  "observation_units": [
+    "m",
+    "rad",
+    "m/s",
+    "rad/s"
+  ],
+  "action_type": "cart_target_velocity",
+  "action_scale_m_s": 1.25,
+  "training_control_hz": 500,
+  "x_sign": 1,
+  "action_sign": 1,
+  "angle_sign": null,
+  "export_contract_reviewed": false,
+  "coordinate_evidence_reviewed": false,
+  "timing_mismatch_acknowledged": false,
+  "onsite_stop_ready": false,
+  "evidence_note": "待核实；本文件不能直接启动，不得把签认当作已验证事实",
+  "firmware_coordinates": {
+    "POLE_ZERO_URAD": null,
+    "POLE_INV": null,
+    "X_INV": null
+  }
+}
