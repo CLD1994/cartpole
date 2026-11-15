@@ -73,6 +73,7 @@ class Session:
     receive 接受完整 ASCII 行，tick 必须被调用以检查静默超时和停机截止。
     发送协作者必须具有有界写超时；这里不能中断阻塞的外部 I/O。
     """
+    enforce_position_limits = True  # Other session clients retain their position guards.
     required_active_mode = ('READY', 'NONE')
 
     def __init__(self, transport: Transport, clock: Callable[[], float], limits: Limits):
@@ -152,7 +153,7 @@ class Session:
             return reason
         if not self._measurement_ready(now):
             return 'measurement_unavailable'
-        if abs(self.observation.x_um) >= self.track_limit_um:
+        if self.enforce_position_limits and abs(self.observation.x_um) >= self.track_limit_um:
             return 'position_outside_limits'
         return None
 
@@ -338,7 +339,7 @@ class Session:
         velocity = int(whole)
         if abs(fraction) >= 0.5:
             velocity += 1 if fraction > 0 else -1
-        if abs(self.observation.x_um) >= self.track_limit_um and self.observation.x_um * velocity > 0:
+        if self.enforce_position_limits and abs(self.observation.x_um) >= self.track_limit_um and self.observation.x_um * velocity > 0:
             velocity = 0
         if not self._write(f'VEL {velocity}'):
             raise RuntimeError(self.failure)
