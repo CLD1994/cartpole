@@ -233,12 +233,12 @@ def randomize_pole_axis_properties(
     if "_pole_v2_props" not in _logged_bodies:
         _logged_bodies.add("_pole_v2_props")
         _write_diag(f"v2 pole[{pole_names[0]}]: mass={masses[0, 0]:.4f}kg com_offset={com_offsets[0, 0]:.4f}m")
-        # read back the pole properties to confirm the override took effect (same as v1)
+        # 应用缓存仅供诊断，不是 PhysX 后端独立读回。
         e = int(env_ids[0])
         com_b = [round(float(x), 4) for x in asset.data.body_com_pose_b[e, pole_ids[0]]]
         inertia_b = [round(float(x), 4) for x in asset.data.body_inertia[e, pole_ids[0]]]
         mass = float(asset.data.body_mass.torch[e, pole_ids[0]])
-        _write_diag(f"v2 pole[{pole_names[0]}] AFTER set: mass={mass:.4f}kg com_body={com_b} inertia={inertia_b}")
+        _write_diag(f"v2 pole[{pole_names[0]}] application cache: mass={mass:.4f}kg com_body={com_b} inertia={inertia_b}")
 
 
 def randomize_velocity_tracking(

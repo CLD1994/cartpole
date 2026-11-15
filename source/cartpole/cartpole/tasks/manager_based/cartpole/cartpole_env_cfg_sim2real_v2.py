@@ -24,6 +24,7 @@ from isaaclab.utils.configclass import configclass
 from isaaclab.utils.noise import GaussianNoiseCfg
 
 from .cartpole_env_cfg import CartpoleEnvCfg
+from .pole_spawner import spawn_v2_cartpole
 from .cartpole_env_cfg_sim2real import gaussian_noise_from_list
 from .mdp import (
     action_rate_l2,
@@ -43,6 +44,7 @@ class RealCartpoleV2EnvCfg(CartpoleEnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
 
+        self.scene.robot.spawn.func = spawn_v2_cartpole
         self.episode_length_s = 10.0
 
         # 固定500Hz基线，物理积分1ms；不以动作延迟冒充策略频率波动。
