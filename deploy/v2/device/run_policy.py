@@ -193,9 +193,7 @@ def state_guard(obs, session, starting=False):
     x, th, vx, w = obs.si()
     if not all(math.isfinite(v) for v in (x, th, vx, w)):
         return 'nonfinite_state'
-    # 仅近直立平衡，不允许下垂起摆；行程保护完全交给当前固件。
-    if abs(th) > (math.radians(10) if starting else math.radians(20)):
-        return 'trial_angle_limit'
+    # 启动和运行不以摆角幅度拒绝控制；仍核验有效状态与启动速度。
     if starting and (abs(vx) > .05 or abs(w) > .5):
         return 'initial_velocity_limit'
     return None
@@ -207,7 +205,7 @@ def guard_snapshot(obs, session, starting=False):
             'checked_at_s': CLOCK(), 'starting': starting,
             'limits': {'max_abs_x_m': None,
                        'position_owner': 'firmware',
-                       'max_abs_theta_rad': math.radians(10 if starting else 20),
+                       'max_abs_theta_rad': None,
                        'max_abs_vx_m_s': .05 if starting else None,
                        'max_abs_omega_rad_s': .5 if starting else None},
             'reason': state_guard(obs, session, starting) if obs else 'measurement_unavailable'}
@@ -241,7 +239,7 @@ def main():
         policy.forward((0., 0., 0., 0.))
     # 外部权重初始化前后均核验；在运行期间不可改动导出文件。
     verified_files = verify_model_files(a.onnx, contract)
-    report = {'loop_interval_scope': 'new-observation decision ticks, not serial command completion', 'runner_revision': 12, 'diagnostic_timing': a.diagnostic_timing, 'discarded_stale_candidates': 0, 'candidate_refresh_stages': {}, 'stale_observation_waits': 0, 'max_stale_observation_age_s': 0., 'grid_slots_skipped': 0, 'over_period_late_candidates': 0, 'readback_refresh': [], 'scheduler': 'absolute-grid-wait-fresh', 'duplicate_tick_count': 0, 'verified_model_files': verified_files, 'status': 'starting', 'scope': '限时真机联调；不是硬实时或真机验收',
+    report = {'loop_interval_scope': 'new-observation decision ticks, not serial command completion', 'runner_revision': 13, 'host_angle_gate': False, 'diagnostic_timing': a.diagnostic_timing, 'discarded_stale_candidates': 0, 'candidate_refresh_stages': {}, 'stale_observation_waits': 0, 'max_stale_observation_age_s': 0., 'grid_slots_skipped': 0, 'over_period_late_candidates': 0, 'readback_refresh': [], 'scheduler': 'absolute-grid-wait-fresh', 'duplicate_tick_count': 0, 'verified_model_files': verified_files, 'status': 'starting', 'scope': '限时真机联调；不是硬实时或真机验收',
               'timing_limits_s': {'command_gap_soft': COMMAND_GAP_SOFT_S, 'command_gap_hard': COMMAND_GAP_HARD_S, 'observation_max_age': OBSERVATION_MAX_AGE_S},
               'contract': contract, 'clock': vars(time.get_clock_info('perf_counter')),
               'continuous': a.continuous, 'requested_seconds': None if a.continuous else a.seconds, 'samples': [], 'received_states': [], 'inference_attempts_s': [], 'would_stop_count_scope': 'gate invocation counts, not independent faults or failed cycles', 'would_stop': {}, 'virtual_command_attempted': False, 'motion_command_sent': False, 'motion_command_attempted': False}
