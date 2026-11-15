@@ -64,12 +64,12 @@ def initialize_replay_state(env, initial):
             'scope':'PhysX root_view independent readback plus state interface, before first step'}
 
 
-def comparison(samples, actual):
+def comparison(samples, actual, windows=None):
     # Never extrapolate beyond simulated trace; separately expose early termination.
     samples = [s for s in samples if s['velocity_window16_m_s'] is not None]
     times = [s['time_s'] for s in samples]
     result = {}
-    for lo,hi,name in [(0.016,1.,'startup'),(1.,3.,'middle'),(3.,5.,'late')]:
+    for lo,hi,name in (windows if windows is not None else [(0.016,1.,'startup'),(1.,3.,'middle'),(3.,5.,'late')]):
         pairs = []
         for row in actual:
             t=row['time_s']
@@ -97,7 +97,8 @@ def main():
     from isaaclab.utils.io import dump_yaml
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--trace',type=Path,required=True)
-    p.add_argument('--tau-s',type=float,required=True)
+    p.add_argument('--tau-s',type=float,default=.020)
+    p.add_argument('--segment-ab',action='store_true',help='one run: anchored 200ms segments, tau20ms and tau0')
     p.add_argument('--delay-ms',type=int,choices=[0,2,4,6,8,10,12,14,16],default=6)
     p.add_argument('--output-dir',type=Path,required=True)
     add_launcher_args(p);a=p.parse_args();a.physics='isaacsim_physx'
@@ -107,7 +108,7 @@ def main():
     a.output_dir.mkdir(parents=True,exist_ok=False)
     report={'status':'starting','scope':'open-loop recorded command replay; not hardware or closed-loop validation',
             'trace_sha256':hashlib.sha256(a.trace.read_bytes()).hexdigest(),
-            'replay_revision':2,'tau_s':a.tau_s,'delay_ms':a.delay_ms,'initial_requested':initial,'samples':[],
+            'replay_revision':3,'tau_s':a.tau_s,'delay_ms':a.delay_ms,'initial_requested':initial,'samples':[],
             'limitations':['host completion/parse times, not device timestamps',
                 'initial state was observed before grid origin; time alignment is approximate',
                 'replay ends before final recorded command; its subsequent response is not covered',
@@ -139,15 +140,16 @@ def main():
     dt=float(cfg.sim.dt*cfg.decimation)
     if not math.isclose(dt,.002,abs_tol=1e-9):raise ValueError('replay requires2ms control timestep')
     terminated=[False];position_history=[initial[0]];step_index=[0]
+    current=[report];segment_origin=[0.]
     def consume(snapshot):
         step_index[0]+=1
         state=snapshot['states'][0];position_history.append(state[0])
         n=step_index[0]
-        report['samples'].append({'time_s':n*dt,'state_si':state,
+        current[0]['samples'].append({'time_s':segment_origin[0]+n*dt,'state_si':state,
             'action':snapshot['actions'][0],
             'velocity_window16_m_s':(state[0]-position_history[n-8])/.016 if n>=8 else None})
         terminated[0]=bool(snapshot['terminated'][0] or snapshot['truncated'][0])
-        if terminated[0]:report['termination_reasons']=[k for k,v in snapshot['reasons'].items() if v[0]]
+        if terminated[0]:current[0]['termination_reasons']=[k for k,v in snapshot['reasons'].items() if v[0]]
     rec=RecorderManagerBaseCfg();rec.dataset_export_mode=DatasetExportMode.EXPORT_NONE
     rec.export_in_record_pre_reset=False;rec.export_in_close=False
     rec.replay=RecorderTermCfg(class_type=make_recorder_type(RecorderTerm,snapshot=snapshot_environment,consume=consume))
@@ -159,26 +161,69 @@ def main():
             env=gym.make('Hexchip-Cartpole-Real-V2-v0',cfg=cfg)
             try:
                 with torch.inference_mode():
-                    env.reset(seed=42)
-                    report['initialization']=initialize_replay_state(env.unwrapped,initial)
-                    report['initial_actual']=snapshot_initial_conditions(env.unwrapped)
-                    report['initial_actual']['states']=[report['initialization']['backend_readback']]
-                    report['initial_actual']['state_source']='PhysX root_view independent readback'
-                    position_history[0]=snapshot_state(env.unwrapped)[0][0]
-                    for k in range(math.floor(duration/dt)):
-                        j=bisect.bisect_right(times,k*dt)-1
-                        velocity=velocities[j] if j>=0 else 0.
-                        env.step(torch.tensor([[velocity/1.25]],device=env.unwrapped.device))
-                        if terminated[0]:break
-                    report['status']='terminated_early' if terminated[0] else 'complete'
-                    report['comparison']=comparison(report['samples'],actual)
-                    write_report(out,report)
+                    if a.segment_ab:
+                        anchors=[]
+                        for wanted in (1.,1.5,2.,2.5,3.,3.5,4.,4.5):
+                            anchor=next((r for r in actual if r['time_s']>=wanted),None)
+                            if anchor and anchor['time_s']+.2<=times[-1]:anchors.append(anchor)
+                        if not anchors:raise ValueError('trace too short for anchored segments')
+                        report['segments']=[]
+                        report['segment_scope']='200ms state-anchored open-loop; measured velocities are filtered, latent actuator state is approximated'
+                        report['actuator_initialization']='delay history from prior host commands; reference velocity initialized to measured filtered cart velocity; not observed motor state'
+                        report['comparison_warmup_excluded_s']=.032
+                        jobs=[(row['time_s'],row['state_si'],.2,tau) for row in anchors for tau in (.020,0.)]
+                    else:
+                        jobs=[(0.,initial,duration,a.tau_s)]
+                    for origin,state,seconds,tau in jobs:
+                        run=({'start_s':origin,'tau_s':tau,'samples':[],'status':'starting'}
+                             if a.segment_ab else report)
+                        if a.segment_ab:report['segments'].append(run)
+                        current[0]=run;segment_origin[0]=origin
+                        terminated[0]=False;step_index[0]=0;position_history[:]=[state[0]]
+                        env.reset(seed=42)
+                        run['initialization']=initialize_replay_state(env.unwrapped,state)
+                        tracking=env.unwrapped.action_manager.get_term('joint_effort')
+                        tracking.tau.fill_(tau)
+                        if a.segment_ab:
+                            # No fake physics warmup: explicitly disclose the unknown reference state.
+                            tracking._vel_ref.fill_(state[2])
+                            for lag in range(tracking.max_delay_steps+1):
+                                j=bisect.bisect_right(times,origin-(lag+1)*dt)-1
+                                tracking._action_history[lag].fill_(velocities[j]/1.25 if j>=0 else 0.)
+                        run['initial_actual']=snapshot_initial_conditions(env.unwrapped)
+                        run['initial_actual']['states']=[run['initialization']['backend_readback']]
+                        run['initial_actual']['state_source']='PhysX root_view independent readback'
+                        for k in range(math.floor(seconds/dt)):
+                            j=bisect.bisect_right(times,origin+k*dt)-1
+                            velocity=velocities[j] if j>=0 else 0.
+                            env.step(torch.tensor([[velocity/1.25]],device=env.unwrapped.device))
+                            if terminated[0]:break
+                        run['status']='terminated_early' if terminated[0] else 'complete'
+                        if not a.segment_ab:run['comparison']=comparison(run['samples'],actual)
+                        write_report(out,report)
+                    if a.segment_ab:
+                        # Equal shared prefixes only: don't rank errors over different lengths.
+                        report['paired_comparison']=[]
+                        for i in range(0,len(report['segments']),2):
+                            pair=report['segments'][i:i+2]
+                            upper=min(r['samples'][-1]['time_s'] for r in pair)
+                            lower=pair[0]['start_s']+.032
+                            rows=[r for r in actual if lower<=r['time_s']<=upper]
+                            item={'start_s':pair[0]['start_s'],'comparison_start_s':lower,
+                                  'comparison_end_s':upper,'tau_results':[]}
+                            for run in pair:
+                                item['tau_results'].append({'tau_s':run['tau_s'],'status':run['status'],
+                                    'comparison':comparison(run['samples'],rows,[(lower,upper+1e-9,'shared_segment')])})
+                            report['paired_comparison'].append(item)
+                        report['status']='segments_collected'
+                        write_report(out,report)
             finally:env.close()
     except BaseException as exc:
-        if report['status']=='starting':report.update(status='error',error=str(exc));write_report(out,report)
+        if report['status'] in ('starting','segments_collected'):
+            report.update(status='error',error=str(exc));write_report(out,report)
         raise
     print('REPLAY_REPORT '+str(out))
-    return 0 if report['status']=='complete' else 2
+    return 0 if report['status'] in ('complete','segments_collected') else 2
 
 
 if __name__=='__main__':raise SystemExit(main())
