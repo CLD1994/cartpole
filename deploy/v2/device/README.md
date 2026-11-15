@@ -156,3 +156,18 @@ python deploy/v2/device/shadow.py --port COM11 --onnx <model_1050对应的policy
 ```
 
 此收尾只覆盖进程已经连接设备并观察到READY的情形。模型加载、合同、依赖检查在打开串口之前失败时，脚本不知道设备状态，也不能自动禁用此前由操作者使能的设备。必须保留外层退出后的状态检查；正常返回、异常或Ctrl+C都不能仅看Python退出码判断禁用。外层命令自身若无法通信，使用现场独立停机措施，不宣称软件已停车。
+
+### 禁用设备上的调度诊断（不再次驱动）
+
+`diagnose_timing.py` 复现主机“到拍→是否有新观测→推理→再次收包→虚拟动作”的时序，串口仍由三查询白名单保护，**没有VEL/ENABLE/DISABLE/CONFIG写入**。必须先独立禁用；脚本读到非DISABLED模式立即退出，本身不是停机工具。可以让杆自然下垂，不需要手扶直立。
+
+```powershell
+python .\deploy\v2\device\diagnose_timing.py --port COM11 --onnx "$onnx" --scheduler legacy --output ".\logs\deployment\timing-legacy-$(Get-Date -Format yyyyMMdd-HHmmss).json"
+python .\deploy\v2\device\diagnose_timing.py --port COM11 --onnx "$onnx" --scheduler wait-fresh --output ".\logs\deployment\timing-waitfresh-$(Get-Date -Format yyyyMMdd-HHmmss).json"
+```
+
+两种模式保留4ms虚拟动作间隔截止：legacy在缺新状态时推进下一拍；wait-fresh只等待新完整状态，每次最多休眠200µs，原截止不延长，不重推旧状态，不补发。**运动入口尚未修改**。诊断记录新/重复观测、虚拟间隔、接收/休眠/推理耗时以及异常触发瞬间的时间、阶段、缓存队列和半行状态；预期门控异常在串口关闭之前捕获时间，未知异常另行标明关闭后捕获。记录先入内存，结束后落盘，不覆盖旧报告。
+
+它省略真实VEL写入、设备运动负载及运动专用位置/角度/制动门控，不能用于证明真实闭环时限；主机时间不是设备采样时间。两次运行不共享相同遥测，结果只用于定位线索，不是确定性因果实验。诊断最长0.5秒，未延长实际运动时间。
+
+计时前有界等待本次QUERY/CALIB?/CONFIG?全部预期回执、有效观测、完整行尾和当前输入队列为空，避免把自己启动查询的尾流误算成活动期积压。这里仅检查回执齐全，不要求READY或运动配置匹配；保持DISABLED。2秒内未齐则报告启动未完成，不进入计时。
