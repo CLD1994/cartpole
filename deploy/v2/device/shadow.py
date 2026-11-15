@@ -9,6 +9,10 @@ import math
 from pathlib import Path
 import time
 
+# CPython 3.12 Windows monotonic 使用粗粒度 GetTickCount64。所有期限与
+# 接收时间戳必须共享 perf_counter，不能混用不同起点的时钟。
+CLOCK = time.perf_counter
+
 from check import PROFILE, limits_from_profile
 from receiver import Receiver
 from session import Session
@@ -88,12 +92,16 @@ def main():
               'onnx': str(args.onnx.resolve()),
               'onnx_main_file_sha256': hashlib.sha256(args.onnx.read_bytes()).hexdigest(),
               'device_profile_sha256': hashlib.sha256(profile_bytes).hexdigest(),
+              'clock': {'selected': 'perf_counter',
+                        'perf_counter': vars(time.get_clock_info('perf_counter')),
+                        'monotonic': vars(time.get_clock_info('monotonic'))},
+              'sleep_strategy': 'time.sleep up to 200us; no global timer or priority changes',
               'angle_signs': signs, 'target_control_hz': limits.control_hz, 'samples': []}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     # 在打开设备前确认输出路径可写，且不覆盖此前结果。
     with args.output.open('x', encoding='utf-8') as output:
         session = receiver = None
-        intervals, lateness, inference = [], [], []
+        intervals, lateness, inference, sleeps = [], [], [], []
         last_sample = last_tick = None
         try:
             import serial
@@ -104,21 +112,25 @@ def main():
             port.port = args.port
             with port:
                 port.reset_input_buffer()
-                session = Session(QueryOnlyTransport(port), time.monotonic, limits)
+                session = Session(QueryOnlyTransport(port), CLOCK, limits)
                 session.observe()
-                receiver = Receiver(port, session, time.monotonic)
-                start = time.monotonic()
+                receiver = Receiver(port, session, CLOCK)
+                start = CLOCK()
                 deadline, next_query, next_tick = start + args.seconds, start + .5, start
                 period = 1 / limits.control_hz
-                while time.monotonic() < deadline:
+                while CLOCK() < deadline:
                     if not receiver.poll() or session.failure:
                         raise RuntimeError(receiver.error or session.failure)
-                    now = time.monotonic()
+                    now = CLOCK()
                     if now >= next_query:
                         session.refresh()
-                        next_query = time.monotonic() + .5
+                        next_query = CLOCK() + .5
                     if now < next_tick:
-                        time.sleep(min(.0002, next_tick - now))
+                        # Python 3.11+ Windows 使用高精度等待计时器；实际唤醒仍可能迟到。
+                        requested = min(.0002, next_tick - now)
+                        sleep_start = CLOCK()
+                        time.sleep(requested)
+                        sleeps.append(CLOCK() - sleep_start)
                         continue
                     lateness.append(max(0., now - next_tick))
                     if last_tick is not None:
@@ -134,14 +146,14 @@ def main():
                     row = {'elapsed_s': now-start, 'firmware_state_si': state,
                            'host_receive_age_s': now-obs.received_at, 'predictions': []}
                     for sign in signs:
-                        begin = time.monotonic()
+                        begin = CLOCK()
                         action = policy.forward((state[0], sign*state[1], state[2], sign*state[3]))
-                        elapsed = time.monotonic()-begin
+                        elapsed = CLOCK()-begin
                         inference.append(elapsed)
                         row['predictions'].append({'angle_sign': sign, 'raw_action': action,
                             'clipped_action': max(-1., min(1., action)), 'inference_s': elapsed})
                     report['samples'].append(row)
-                report['wall_s'] = time.monotonic()-start
+                report['wall_s'] = CLOCK()-start
                 report['status'] = 'complete' if report['samples'] else 'no_valid_observations'
         except KeyboardInterrupt:
             report['status'] = 'interrupted'
@@ -152,6 +164,7 @@ def main():
             report['loop_interval_s'] = summary(intervals)
             report['schedule_lateness_s'] = summary(lateness)
             report['inference_s'] = summary(inference)
+            report['sleep_wall_s'] = summary(sleeps)
             if session is not None:
                 report['preflight_reason'] = session.preflight_reason()
                 report['firmware_mode'] = session.mode
