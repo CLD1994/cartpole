@@ -64,7 +64,7 @@ python -m unittest discover -s scripts/evaluation -v
 
 ## 训练结束后选择检查点
 
-`select_checkpoint.py` 只处理一个已经结束的训练目录。先从同目录 TensorBoard 日志提名少量检查点，再用冻结策略完整回合评估排名，最后用不同种子复核第一名。它不会覆盖模型，也不会控制训练进程。操作期间不要继续向该训练目录写入模型或切换评估代码。
+`select_checkpoint.py` 只处理一个已经结束的训练目录。优先从同目录完整回合计数日志提名少量检查点（旧目录缺少两份计数日志时才回退 TensorBoard），再用冻结策略完整回合评估排名，最后用不同种子复核第一名。它不会覆盖模型，也不会控制训练进程。操作期间不要继续向该训练目录写入模型或切换评估代码。
 
 ```powershell
 $env:PYTHONIOENCODING = 'utf-8'
@@ -101,3 +101,17 @@ python .\scripts\evaluation\select_checkpoint.py `
 输出位于独立的 `logs/checkpoint-selection/selection-<编号>/selection.json`，包含提名映射、日志及模型哈希、逐模型报告路径、排名、独立复核和错误信息。子进程的原始日志和配置也保留在该目录。顶层 `status=complete` 只表示流程完成，不表示成功率达到可用标准。提名与冻结评估为独立函数，后续可用有明确口径的新训练统计替换提名，不猜测未知标签格式。
 
 评估报告 schema 3 增加 `cart_mean_abs_velocity_m_s`、`cart_rms_velocity_m_s`、`cart_travel_m` 和 `cart_net_displacement_m`。行程是控制步末绝对速度的矩形积分；首尾位移是终态位置减实际初态位置，两者都不是回中心误差。
+
+
+## Window16 实验的筛选任务与初筛口径
+
+筛选器的 `--task` 会同时传给所有候选与 holdout，并核对报告中的 task；省略时仍使用旧任务 `Hexchip-Cartpole-Real-V2-v0`，不会自动恢复模型训练配置。
+
+- Window16 保留执行器滤波：`--task Hexchip-Cartpole-Real-V2-Window16-v0`
+- Window16 去掉执行器滤波：`--task Hexchip-Cartpole-Real-V2-Window16-Tau0-v0`
+
+以上两个任务已内置 16 ms 速度观测窗口，不要再叠加外部观测窗口。原任务兼容默认不代表适合新实验。
+
+新训练目录的 `training-episodes.jsonl`（schema 2）与 `training-checkpoints.jsonl` 是初筛来源，按最近窗口的 `sum(successes) / sum(completed)` 提名，不平均每轮百分比，不使用累计成功率；零完成回合不排名。校验日志与保存轮次绑定，缺失一份或不一致会报错，不静默回退旧奖励排名。两份都不存在的旧目录才使用 TensorBoard 奖励/回合长度提名。候选仍需独立完整回合评估，训练窗口可能跨策略版本，不等于保存模型的成绩。
+
+公平比较不同训练组时，统一固定评估代码、任务、初态范围、回合时长、种子和并行槽位数。可以分别建立 Window16 与 Window16-Tau0 两个评估场景，但不要把不同场景的成功率混在一起排名。先用选择种子筛选，再用从未参与选择的新种子复核；默认示例种子已反复使用时不再算未见 holdout。脚本一次只筛选同一训练目录，跨训练目录的决赛需另用 evaluate_policy.py 对各组候选在相同任务下评估。所有输出使用新目录，不覆盖模型，不影响正在训练的工作目录。
