@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """限时策略联调入口：无自动使能/配置；需要明确模型合同及现场启动请求。"""
 import argparse
+from collections import deque
 import json
 import math
 from pathlib import Path
@@ -213,10 +214,14 @@ def main():
     p.add_argument('--onnx', required=True, type=Path)
     p.add_argument('--contract', required=True, type=Path)
     p.add_argument('--output', required=True, type=Path)
-    p.add_argument('--seconds', type=float, default=.5)
+    duration_args = p.add_mutually_exclusive_group()
+    duration_args.add_argument('--seconds', type=float, default=.5)
+    duration_args.add_argument('--continuous', action='store_true', help='受监控持续控制，直到Ctrl+C或门控停机；不能无人值守')
     p.add_argument('--diagnostic-timing', action='store_true', help='DISABLED只读同路径诊断；时序/物理门仅记录，真实故障退出')
     p.add_argument('--start-confirmed', action='store_true', help='现场明确请求本次运动；绝不自动使能')
     a = p.parse_args()
+    if a.continuous and a.diagnostic_timing:
+        p.error('--continuous不能与只读诊断组合')
     if not a.diagnostic_timing and not a.start_confirmed:
         p.error('需要现场明确 --start-confirmed；只读诊断请用 shadow.py')
     if not math.isfinite(a.seconds) or not 0 < a.seconds <= (10. if a.diagnostic_timing else 5.):
@@ -231,10 +236,20 @@ def main():
         policy.forward((0., 0., 0., 0.))
     # 外部权重初始化前后均核验；在运行期间不可改动导出文件。
     verified_files = verify_model_files(a.onnx, contract)
-    report = {'loop_interval_scope': 'new-observation decision ticks, not serial command completion', 'runner_revision': 8, 'diagnostic_timing': a.diagnostic_timing, 'stale_observation_waits': 0, 'max_stale_observation_age_s': 0., 'grid_slots_skipped': 0, 'over_period_late_candidates': 0, 'readback_refresh': [], 'scheduler': 'absolute-grid-wait-fresh', 'duplicate_tick_count': 0, 'verified_model_files': verified_files, 'status': 'starting', 'scope': '限时真机联调；不是硬实时或真机验收',
+    report = {'loop_interval_scope': 'new-observation decision ticks, not serial command completion', 'runner_revision': 9, 'diagnostic_timing': a.diagnostic_timing, 'stale_observation_waits': 0, 'max_stale_observation_age_s': 0., 'grid_slots_skipped': 0, 'over_period_late_candidates': 0, 'readback_refresh': [], 'scheduler': 'absolute-grid-wait-fresh', 'duplicate_tick_count': 0, 'verified_model_files': verified_files, 'status': 'starting', 'scope': '限时真机联调；不是硬实时或真机验收',
               'timing_limits_s': {'command_gap_soft': COMMAND_GAP_SOFT_S, 'command_gap_hard': COMMAND_GAP_HARD_S, 'observation_max_age': OBSERVATION_MAX_AGE_S},
               'contract': contract, 'clock': vars(time.get_clock_info('perf_counter')),
-              'requested_seconds': a.seconds, 'samples': [], 'received_states': [], 'inference_attempts_s': [], 'would_stop_count_scope': 'gate invocation counts, not independent faults or failed cycles', 'would_stop': {}, 'virtual_command_attempted': False, 'motion_command_sent': False, 'motion_command_attempted': False}
+              'continuous': a.continuous, 'requested_seconds': None if a.continuous else a.seconds, 'samples': [], 'received_states': [], 'inference_attempts_s': [], 'would_stop_count_scope': 'gate invocation counts, not independent faults or failed cycles', 'would_stop': {}, 'virtual_command_attempted': False, 'motion_command_sent': False, 'motion_command_attempted': False}
+    if a.continuous:
+        report['scope'] = '受监控持续控制，直到用户中断或门控停止；不是无人值守或安全认证'
+        for key in ('samples', 'inference_attempts_s'):
+            report[key] = deque(maxlen=10000)
+        report['readback_refresh'] = deque(maxlen=512)
+        report['retention'] = {'samples':10000,'inference_attempts':10000,'intervals':10000,
+                               'readback_groups':512,'scope':'recent bounded tail, not complete run'}
+    report['run_totals'] = {'command_completions':0,'command_gaps_over_4ms':0,
+        'command_gaps_at_or_over_6ms':0,'maximum_command_gap_s':0.,
+        'inference_attempts':0,'inference_total_s':0.,'maximum_inference_s':0.}
     if a.diagnostic_timing:
         report['scope'] = 'DISABLED同路径只读诊断；虚拟命令完成不包含真实串口动作写入/设备运动负载'
         report['diagnostic_differences'] = ['仅查询真实写入；VEL/DISABLE虚拟完成',
@@ -250,10 +265,13 @@ def main():
     a.output.parent.mkdir(parents=True, exist_ok=True)
     with a.output.open('x', encoding='utf-8') as output:
         session = receiver = None
-        intervals = []
+        intervals = deque(maxlen=10000) if a.continuous else []
         stage = 'startup'
         start = end = last_command_at = next_tick = next_slot = None
         drain = refresh = None
+        # Startup evidence only; no synchronous disk writes in the active control loop.
+        initial_manifest = {k:v for k,v in report.items() if not isinstance(v,deque)}
+        json.dump(initial_manifest,output,ensure_ascii=False,indent=2);output.flush()
         import serial
         port = serial.Serial(port=None, baudrate=profile['measured']['protocol_baud'], timeout=0, write_timeout=.002)
         port.dtr = port.rts = False
@@ -293,7 +311,7 @@ def main():
                         raise RuntimeError('preflight:' + reason)
                     if session.values['CAL_LENGTH_UM'][0] != profile['measured']['calibrated_travel_um']:
                         raise RuntimeError('profile_travel_mismatch')
-                    if a.seconds > .5:
+                    if a.continuous or a.seconds > .5:
                         # 老固件忽略带参数CONFIG?。运动前验证能力，不能在运动中才发现。
                         # 初始整组（包括最后STEP_LOSS）已收齐，旧VEL_MAX不能满足新回执时间。
                         stage = 'single_config_capability'
@@ -333,10 +351,10 @@ def main():
                     start = next_tick = grid_start_ns / 1e9
                     next_slot = 0
                     next_tick_ns = grid_start_ns
-                    end = start + a.seconds
+                    end = math.inf if a.continuous else start + a.seconds
                     last_tick = last_sample = None
                     last_command_at = start
-                    if a.seconds > .5:
+                    if a.continuous or a.seconds > .5:
                         refresh = ReadbackCycle(transport, report['readback_refresh'], start)
                     while CLOCK() < end:
                         # 长窗口轮转刷新；命令6ms硬限、观测4ms及1秒元数据TTL独立。
@@ -408,6 +426,10 @@ def main():
                         raw = policy.forward((x, contract['angle_sign']*th, vx, contract['angle_sign']*w))
                         inference_s = CLOCK()-begin
                         report['inference_attempts_s'].append(inference_s)
+                        totals=report['run_totals']
+                        totals['inference_attempts']+=1
+                        totals['inference_total_s']+=inference_s
+                        totals['maximum_inference_s']=max(totals['maximum_inference_s'],inference_s)
                         if CLOCK()-obs.received_at > OBSERVATION_MAX_AGE_S or CLOCK()-now > .002:
                             gate('inference_deadline')
                             if a.diagnostic_timing and CLOCK() >= obs.received_at+OBSERVATION_MAX_AGE_S:
@@ -465,6 +487,11 @@ def main():
                         completed_ns = time.perf_counter_ns()
                         completed_at = completed_ns / 1e9
                         command_gap = completed_at-last_command_at
+                        totals=report['run_totals']
+                        totals['command_completions']+=1
+                        totals['command_gaps_over_4ms']+=int(command_gap>COMMAND_GAP_SOFT_S)
+                        totals['command_gaps_at_or_over_6ms']+=int(command_gap>=COMMAND_GAP_HARD_S)
+                        totals['maximum_command_gap_s']=max(totals['maximum_command_gap_s'],command_gap)
                         last_command_at = completed_at
                         if not a.diagnostic_timing:
                             report['motion_command_sent'] = True
@@ -521,6 +548,7 @@ def main():
                         'precommand_receive': drain,
                         'readback_in_flight': dict(refresh.pending) if refresh and refresh.pending else None}
                 finally:
+                    report['active_elapsed_s']=CLOCK()-start if start is not None else None
                     if not a.diagnostic_timing and session is not None and (session.phase in (Phase.ACTIVE, Phase.STOPPING)
                                                 or session.mode == ('READY', 'NONE')):
                         report['safe_stop_requested'] = True
@@ -553,13 +581,14 @@ def main():
             report['received_state_measurement_count'] = len(measured_states) if a.diagnostic_timing else None
             report['received_state_host_gap_s'] = summary([b['host_parsed_clock_s']-a['host_parsed_clock_s'] for a,b in zip(measured_states,measured_states[1:])])
             report['received_state_gap_scope'] = 'valid ACTIVE STATE parses in measurement window; not device sample/wire arrival timing' if a.diagnostic_timing else 'not_recorded'
+            report['summary_scope']='retained recent tail; run_totals are full-run' if a.continuous else 'complete recorded run'
             report['loop_interval_s'] = summary(intervals)
             report['completion_gap_s'] = summary([r['command_gap_s'] for r in report['samples']])
             report['completion_gap_scope'] = 'virtual_no_action_write' if a.diagnostic_timing else 'actual_host_write_completion'
             report['completion_gaps_over_6ms'] = sum(r['command_gap_s'] >= COMMAND_GAP_HARD_S for r in report['samples'])
             report['completion_gaps_over_4ms'] = sum(r['command_gap_s'] > COMMAND_GAP_SOFT_S for r in report['samples'])
             report['inference_s'] = summary(report['inference_attempts_s'])
-            report['inference_scope'] = 'all measured policy.forward attempts including discarded candidates; excludes warmup'
+            report['inference_scope'] = ('retained recent policy.forward attempts including discarded candidates; excludes warmup' if a.continuous else 'all measured policy.forward attempts including discarded candidates; excludes warmup')
             report['completed_candidate_inference_s'] = summary([r['inference_s'] for r in report['samples']])
             report['disabled_confirmed'] = bool(session and session.disabled_confirmed)
             report['last_observed_firmware_mode'] = session.mode if session else None
@@ -569,10 +598,16 @@ def main():
             report['receive_error'] = receiver.error if receiver else None
             report['status'] = ('complete' if report['status'] == 'trial_ended' and report['samples'] and (report['disabled_confirmed'] or a.diagnostic_timing)
                                 and not report['session_failure'] and not report['receive_error'] else report['status'])
+            if (a.continuous and report['status']=='interrupted' and report['disabled_confirmed']
+                    and not report['session_failure'] and not report['receive_error']):
+                report['status']='stopped_by_user'
+            for key,value in list(report.items()):
+                if isinstance(value,deque):report[key]=list(value)
+            output.seek(0);output.truncate()
             json.dump(report, output, ensure_ascii=False, indent=2)
             output.write('\n')
     print(json.dumps({k:v for k,v in report.items() if k not in ('samples', 'received_states', 'inference_attempts_s')}, ensure_ascii=False, indent=2))
-    return 0 if report['status'] == 'complete' else 1
+    return 0 if report['status'] in ('complete','stopped_by_user') else 1
 
 
 if __name__ == '__main__':
