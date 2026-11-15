@@ -73,6 +73,8 @@ class Session:
     receive 接受完整 ASCII 行，tick 必须被调用以检查静默超时和停机截止。
     发送协作者必须具有有界写超时；这里不能中断阻塞的外部 I/O。
     """
+    required_active_mode = ('READY', 'NONE')
+
     def __init__(self, transport: Transport, clock: Callable[[], float], limits: Limits):
         self.transport, self.clock, self.limits = transport, clock, limits
         self.phase = Phase.OBSERVING
@@ -163,7 +165,7 @@ class Session:
         return self.expected_readback.keys() | {'CAL_LENGTH_UM'}
 
     def _metadata_reason(self, now):
-        if self.mode != ('READY', 'NONE') or not self._fresh(self._mode_at, now, self.limits.preflight_timeout_s):
+        if self.mode != self.required_active_mode or not self._fresh(self._mode_at, now, self.limits.preflight_timeout_s):
             return 'mode_not_ready'
         expected = self.expected_readback
         for key, value in expected.items():
@@ -262,7 +264,7 @@ class Session:
                 if self.phase == Phase.STOPPING and self._disable_sent and self.mode == ('DISABLED', 'NONE'):
                     self.disabled_confirmed = True
                     self.phase = Phase.FINISHED
-                elif self.phase == Phase.ACTIVE and self.mode != ('READY', 'NONE'):
+                elif self.phase == Phase.ACTIVE and self.mode != self.required_active_mode:
                     self._fail('firmware_mode', now)
                 elif self.phase == Phase.STOPPING and self.mode not in (('READY', 'NONE'), ('DISABLED', 'NONE')):
                     self._fail('firmware_mode', now)
