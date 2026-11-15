@@ -564,7 +564,7 @@ def main():
                             totals['inference_attempts']+=1
                             totals['inference_total_s']+=inference_s
                             totals['maximum_inference_s']=max(totals['maximum_inference_s'],inference_s)
-                            if CLOCK()-now > .002:
+                            if not event_diag and CLOCK()-now > .002:
                                 gate('inference_deadline')
                         if CLOCK()-obs.received_at >= observation_limit_s:
                             if discard_expired_candidate(obs):

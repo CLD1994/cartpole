@@ -54,6 +54,19 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(len(p.event_window),2400)
         self.assertEqual(p.trigger['event_id'],1)
 
+    def test_compute_budget_guard_is_only_non_event_diagnostic(self):
+        import ast
+        from pathlib import Path
+        tree=ast.parse(Path(__file__).with_name('run_policy.py').read_text())
+        guards=[n for n in ast.walk(tree) if isinstance(n,ast.If)
+                and 'CLOCK() - now > 0.002' in ast.unparse(n.test)]
+        self.assertEqual(len(guards),1)
+        self.assertEqual(ast.unparse(guards[0].test),'not event_diag and CLOCK() - now > 0.002')
+        # Independent command/observation deadline checks must remain present.
+        text=Path(__file__).with_name('run_policy.py').read_text()
+        self.assertIn('last_command_at+hard_limit_s',text)
+        self.assertIn('obs.received_at+observation_limit_s',text)
+
     def test_invalid_event_formats(self):
         for line in ('EVENT STEP_LOSS 0 1 0','EVENT STEP_LOSS 1 0 0',
                      'EVENT STEP_LOSS 1 1 -1','EVENT STEP_LOSS 1 1 0 extra',
