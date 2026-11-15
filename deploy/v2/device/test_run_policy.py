@@ -64,3 +64,33 @@ class RunnerTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'single_action_contract_mismatch'):load_contract(path,'unused')
 
 if __name__=='__main__':unittest.main()
+
+class ExpiryCallsiteTests(unittest.TestCase):
+    """执行运行器中的实际期限分支；外部传输/时钟为替身。"""
+    def source_tree(self):
+        import ast
+        from pathlib import Path
+        return ast.parse(Path(__file__).with_name('run_policy.py').read_text())
+    def run_nodes(self, nodes, now):
+        import ast
+        from run_policy import check_trial_end
+        def gate(reason):raise RuntimeError(reason)
+        refresh=Mock()
+        context=dict(CLOCK=lambda:now, end=5., last_command_at=4.999,
+                     hard_limit_s=.006, gate=gate, check_trial_end=check_trial_end,
+                     refresh=refresh, remaining=-.001)
+        exec(compile(ast.fix_missing_locations(ast.Module(body=nodes,type_ignores=[])), '<runner-branch>', 'exec'),context)
+        return refresh
+    def test_wait_fresh_expiry_and_real_gap(self):
+        import ast
+        from run_policy import TrialEnd
+        node=next(n for n in ast.walk(self.source_tree()) if isinstance(n,ast.If) and ast.unparse(n.test)=='remaining <= 0')
+        with self.assertRaises(TrialEnd):self.run_nodes([node],5.)
+        with self.assertRaisesRegex(RuntimeError,'wait_fresh_command_deadline'):self.run_nodes([node],5.006)
+    def test_readback_expiry_and_real_gap(self):
+        import ast
+        from run_policy import TrialEnd
+        node=next(n for n in ast.walk(self.source_tree()) if isinstance(n,ast.If) and ast.unparse(n.test)=='refresh' and any(isinstance(x,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='query_at' for t in x.targets) for x in n.body))
+        with self.assertRaises(TrialEnd):self.run_nodes(node.body,5.)
+        with self.assertRaisesRegex(RuntimeError,'readback_send_deadline'):self.run_nodes(node.body,5.006)
+        self.run_nodes(node.body,4.999).send_if_due.assert_called_once_with(4.999,5.)
