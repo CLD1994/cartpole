@@ -1,7 +1,7 @@
 # 训练候选保存与并行筛选
 
-统一分支 `feat/changqing-training-deployment-ready` 包含完整回合指标、
-训练中候选保存、可选续训学习率限制、三种任务及并行冻结策略评估。
+本分支基于 `feat/changqing-train-400hz-acc9`，包含完整回合指标、
+训练中候选保存、可选续训学习率限制、400 Hz 单动作任务及并行冻结策略评估。
 不需要在训练分支与筛选分支之间切换。功能只对新启动的进程生效，不修改正在运行的训练。
 
 ## 训练中保留候选
@@ -36,9 +36,9 @@
 $repo = 'C:\Users\cldus\workspace\cartpole'
 $tree = "C:\Users\cldus\workspace\cartpole-training-selection-$(Get-Date -Format yyyyMMdd-HHmmss)"
 $python = 'C:\Users\cldus\IsaacLab\.venv\Scripts\python.exe'
-git -C $repo fetch origin feat/changqing-training-deployment-ready
+git -C $repo fetch origin feat/changqing-selection-saved-default
 if ($LASTEXITCODE -ne 0) { throw 'fetch 失败' }
-git -C $repo worktree add --detach $tree origin/feat/changqing-training-deployment-ready
+git -C $repo worktree add --detach $tree origin/feat/changqing-selection-saved-default
 if ($LASTEXITCODE -ne 0) { throw '创建工作区失败' }
 Set-Location $tree
 $env:PYTHONPATH = "$tree\source\cartpole;$env:PYTHONPATH"
@@ -69,36 +69,43 @@ $runDir = '替换为已经结束的具体训练运行目录绝对路径'
 & $python .\scripts\evaluation\select_checkpoint.py `
     --run-dir $runDir `
     --task Hexchip-Cartpole-Real-V2-Window16-Tau0-v0 `
-    --parallel-workers 4 --candidates 3 --window 20 `
+    --parallel-workers 3 `
     --num_envs 32 --seeds 73117 73123 --holdout-seeds 83117 83123 `
     --device cuda:0 --output-dir .\logs\checkpoint-selection
 ```
 
-自动提名包含三个训练时段候选、末检查点，以及所有仍保留的训练指标候选，
-去重后可能超过四个。`--parallel-workers 4` 仅限制同时评估数，其余排队。
+默认 `--nomination saved` 只评估 `candidates.json` 中已保存的动态候选。
+训练默认保留 3 个，只有 1 或 2 个时只评估现有候选，不补入周期或末模型。
+如果训练自行设置更大的 `--candidate-keep`，则评估清单全部候选。
+缺失或空清单清晰报错，不静默回退。`--parallel-workers 3` 仅限制同时评估数，其余排队。
+旧策略显式使用 `--nomination temporal --candidates 3 --window 20`：按三个训练时段提名、
+额外纳入末检查点及所有动态候选，去重后可能超过四个；`--candidates` 不是动态候选数量。
 每候选输出与日志独立；默认不传此参数仍串行。所有候选成功且配置一致后才排名，
 随后只有赢家执行独立 holdout；任一评估失败不会产生完整成功报告。
 holdout 是复核，不参与重新选冠军，也未设置自动真机放行门槛。
 多个进程共享 GPU，显存足够不保证更快，争用或显存不足时降到 2 或 1。
 详见 `docs/training-episode-metrics.md` 的并行取消及进程清理边界。
 
-若只想评估训练保留的前三名，可在上面的命令增加 `--checkpoints $chosen`：
+默认已经只评估动态候选，无需额外参数。需要手动挑选时可加 `--checkpoints $chosen`，
+它覆盖提名策略且不追加其他模型。例如显式传入动态候选清单：
 
 ```powershell
 $manifest = Get-Content (Join-Path $runDir 'training-candidates\candidates.json') -Raw | ConvertFrom-Json
 $chosen = @($manifest.candidates | ForEach-Object { $_.checkpoint })
-if ($chosen.Count -eq 0) { throw '没有符合统计条件的训练候选；请使用自动提名周期检查点' }
+if ($chosen.Count -eq 0) { throw '没有符合统计条件的训练候选；请显式使用 --nomination temporal 或指定周期检查点' }
 ```
 
 允许的文件布局仅为 `<run>/model_<iteration>.pt` 与
 `<run>/training-candidates/candidate_<iteration>.pt`，解析符号链接后检查。
 历史已淘汰候选保存记录保留有效，但不存在的文件不会参与评估。
 周期检查点和候选可以同轮次共存，输出目录不会冲突。
-没有启用训练候选的旧实验仍可通过周期检查点筛选，无法补回未保存轮次的权重。
+没有启用训练候选的旧实验需显式使用 `--nomination temporal` 或 `--checkpoints` 筛选，无法补回未保存轮次的权重。
 
 任务必须匹配训练目标：原始 V2 用 `Hexchip-Cartpole-Real-V2-v0`；
 保留原执行器滤波的 Window16 用 `Hexchip-Cartpole-Real-V2-Window16-v0`；
 Window16 且去掉执行器滤波用 `Hexchip-Cartpole-Real-V2-Window16-Tau0-v0`。
+400 Hz、9 m/s² 单动作实验必须使用 `Hexchip-Cartpole-Real-V2-Window16-Tau0-Acc9-Hz400-v0`，
+不能用 500 Hz Tau0 任务替代。此评估器尚不支持双动作任务。
 选择阶段与 holdout 使用相同任务并校验报告身份。
 
 交付环境只做基础语法、参数、生产消费链与替身检查，未运行 Isaac GPU 训练或并行评估。
