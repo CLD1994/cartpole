@@ -209,6 +209,11 @@ class Session:
         now = self._now()
         if self.phase == Phase.ACTIVE:
             self._begin_stop(now)
+        elif (self.phase in (Phase.OBSERVING, Phase.FINISHED)
+              and self.mode == ('READY', 'NONE') and self._stop_at == -math.inf):
+            # 预检拒绝不代表固件未使能。即使从未发送策略动作，也可显式
+            # 请求零速/停稳/禁用；仅首次启动此流程，不能重置已有停车截止。
+            self._begin_stop(now)
         elif self.phase == Phase.STOPPING:
             self.tick()
 
