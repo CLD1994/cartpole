@@ -16,6 +16,9 @@ from session import Session, Phase
 CONFIG_KEYS = ('VEL_MAX', 'ACC_MAX', 'WDT_MS', 'WDT_DEC', 'X_MARGIN_UM',
                'POLE_ZERO_URAD', 'POLE_INV', 'X_INV', 'STEP_LOSS_UM')
 GRID_PERIOD_NS = 2_000_000
+COMMAND_GAP_SOFT_S = .004
+COMMAND_GAP_HARD_S = .006
+OBSERVATION_MAX_AGE_S = .004
 
 
 def next_grid_slot(slot, start_ns, completed_ns):
@@ -228,7 +231,8 @@ def main():
         policy.forward((0., 0., 0., 0.))
     # 外部权重初始化前后均核验；在运行期间不可改动导出文件。
     verified_files = verify_model_files(a.onnx, contract)
-    report = {'loop_interval_scope': 'new-observation decision ticks, not serial command completion', 'runner_revision': 7, 'diagnostic_timing': a.diagnostic_timing, 'stale_observation_waits': 0, 'max_stale_observation_age_s': 0., 'grid_slots_skipped': 0, 'over_period_late_candidates': 0, 'readback_refresh': [], 'scheduler': 'absolute-grid-wait-fresh', 'duplicate_tick_count': 0, 'verified_model_files': verified_files, 'status': 'starting', 'scope': '限时真机联调；不是硬实时或真机验收',
+    report = {'loop_interval_scope': 'new-observation decision ticks, not serial command completion', 'runner_revision': 8, 'diagnostic_timing': a.diagnostic_timing, 'stale_observation_waits': 0, 'max_stale_observation_age_s': 0., 'grid_slots_skipped': 0, 'over_period_late_candidates': 0, 'readback_refresh': [], 'scheduler': 'absolute-grid-wait-fresh', 'duplicate_tick_count': 0, 'verified_model_files': verified_files, 'status': 'starting', 'scope': '限时真机联调；不是硬实时或真机验收',
+              'timing_limits_s': {'command_gap_soft': COMMAND_GAP_SOFT_S, 'command_gap_hard': COMMAND_GAP_HARD_S, 'observation_max_age': OBSERVATION_MAX_AGE_S},
               'contract': contract, 'clock': vars(time.get_clock_info('perf_counter')),
               'requested_seconds': a.seconds, 'samples': [], 'received_states': [], 'inference_attempts_s': [], 'would_stop_count_scope': 'gate invocation counts, not independent faults or failed cycles', 'would_stop': {}, 'virtual_command_attempted': False, 'motion_command_sent': False, 'motion_command_attempted': False}
     if a.diagnostic_timing:
@@ -335,7 +339,7 @@ def main():
                     if a.seconds > .5:
                         refresh = ReadbackCycle(transport, report['readback_refresh'], start)
                     while CLOCK() < end:
-                        # 长窗口单组轮转刷新；4ms命令截止与1秒元数据TTL不变。
+                        # 长窗口轮转刷新；命令6ms硬限、观测4ms及1秒元数据TTL独立。
                         stage = 'poll'
                         if transport.in_waiting > 128:
                             raise RuntimeError('active_backlog')
@@ -346,14 +350,14 @@ def main():
                         if refresh:
                             refresh.update(session, now)
                         stage = 'gap_check'
-                        if now-last_command_at > .004:
+                        if now-last_command_at >= COMMAND_GAP_HARD_S:
                             gate('command_gap_deadline')
                         if now_ns < next_tick_ns:
                             stage = 'wait_tick'
                             time.sleep(min(.0002, next_tick-now))
                             continue
                         stage = 'tick'
-                        # 栅格迟到仅记录；实际命令/原观测4ms仍为硬停止条件。
+                        # 栅格迟到仅记录；实际命令6ms/原观测4ms为独立硬停止条件。
                         obs = session.observation
                         if obs is None:
                             raise RuntimeError('observation_missing')
@@ -363,14 +367,14 @@ def main():
                         if reason:
                             report['failed_state_check'] = guard_snapshot(obs)
                             gate(reason)
-                        if now-obs.received_at > .004:
+                        if now-obs.received_at > OBSERVATION_MAX_AGE_S:
                             # 尚无推理候选：不用旧缓存，只消耗既有命令预算等新有效帧。
                             # ACTIVE的FAULT/VEL_VALID/metadata失效仍由每次poll立即锁存。
                             stage = 'wait_fresh_observation'
                             report['stale_observation_waits'] += 1
                             report['max_stale_observation_age_s'] = max(
                                 report['max_stale_observation_age_s'], now-obs.received_at)
-                            remaining = min(last_command_at+.004, end)-CLOCK()
+                            remaining = min(last_command_at+COMMAND_GAP_HARD_S, end)-CLOCK()
                             if remaining <= 0:
                                 gate('wait_fresh_command_deadline')
                             time.sleep(min(.0001, remaining) if remaining > 0 else .0001)
@@ -378,7 +382,7 @@ def main():
                         if obs.received_at == last_sample:
                             report['duplicate_tick_count'] += 1
                             stage = 'wait_fresh'
-                            time.sleep(min(.0002, max(0., min(last_command_at+.004, obs.received_at+.004, end)-CLOCK())))
+                            time.sleep(min(.0002, max(0., min(last_command_at+COMMAND_GAP_HARD_S, obs.received_at+OBSERVATION_MAX_AGE_S, end)-CLOCK())))
                             continue
                         if last_tick is not None:
                             intervals.append(now-last_tick)
@@ -397,20 +401,20 @@ def main():
                         x, th, vx, w = obs.si()
                         stage = 'inference'
                         begin = CLOCK()
-                        if begin >= min(last_command_at+.004, obs.received_at+.004, end):
+                        if begin >= min(last_command_at+COMMAND_GAP_HARD_S, obs.received_at+OBSERVATION_MAX_AGE_S, end):
                             gate('candidate_deadline')
-                            if a.diagnostic_timing and begin >= obs.received_at+.004:
+                            if a.diagnostic_timing and begin >= obs.received_at+OBSERVATION_MAX_AGE_S:
                                 continue
                         raw = policy.forward((x, contract['angle_sign']*th, vx, contract['angle_sign']*w))
                         inference_s = CLOCK()-begin
                         report['inference_attempts_s'].append(inference_s)
-                        if CLOCK()-obs.received_at > .004 or CLOCK()-now > .002:
+                        if CLOCK()-obs.received_at > OBSERVATION_MAX_AGE_S or CLOCK()-now > .002:
                             gate('inference_deadline')
-                            if a.diagnostic_timing and CLOCK() >= obs.received_at+.004:
+                            if a.diagnostic_timing and CLOCK() >= obs.received_at+OBSERVATION_MAX_AGE_S:
                                 continue
                         # 分片/新字节可在poll末尾到达；仅在固定原始截止内补收。
                         stage = 'precommand_receive'
-                        receive_deadline = min(last_command_at+.004, obs.received_at+.004, end)
+                        receive_deadline = min(last_command_at+COMMAND_GAP_HARD_S, obs.received_at+OBSERVATION_MAX_AGE_S, end)
                         drain = {'deadline_clock_s': receive_deadline, 'polls': 0,
                                  'wait_s': 0., 'started_clock_s': CLOCK()}
                         while True:
@@ -454,7 +458,7 @@ def main():
                         stage = 'prewrite'
                         if CLOCK() >= receive_deadline:
                             gate('prewrite_fixed_deadline')
-                            if a.diagnostic_timing and CLOCK() >= obs.received_at+.004:
+                            if a.diagnostic_timing and CLOCK() >= obs.received_at+OBSERVATION_MAX_AGE_S:
                                 continue
                         report['virtual_command_attempted' if a.diagnostic_timing else 'motion_command_attempted'] = True
                         velocity = session.command(action)
@@ -468,6 +472,7 @@ def main():
                                                   'raw_action': raw, 'velocity_mm_s': velocity,
                                                   'inference_s': inference_s,
                                                   'command_gap_s': command_gap,
+                                                  'command_gap_soft_warning': command_gap > COMMAND_GAP_SOFT_S,
                                                   'observation_received_clock_s': obs.received_at,
                                                   'observation_host_age_s': completed_at-obs.received_at,
                                                   'grid_slot': candidate_slot,
@@ -489,10 +494,10 @@ def main():
                             # 已成功写入新速度后才安排单条只读查询，不与其他查询叠加。
                             stage = 'readback_query'
                             query_at = CLOCK()
-                            if query_at >= min(last_command_at+.004, end):
+                            if query_at >= min(last_command_at+COMMAND_GAP_HARD_S, end):
                                 gate('readback_send_deadline')
                             refresh.send_if_due(query_at, end)
-                            if CLOCK() >= min(last_command_at+.004, end):
+                            if CLOCK() >= min(last_command_at+COMMAND_GAP_HARD_S, end):
                                 gate('readback_write_deadline')
                     report['status'] = 'trial_ended'
                 except DiagnosticEnd:
@@ -551,7 +556,8 @@ def main():
             report['loop_interval_s'] = summary(intervals)
             report['completion_gap_s'] = summary([r['command_gap_s'] for r in report['samples']])
             report['completion_gap_scope'] = 'virtual_no_action_write' if a.diagnostic_timing else 'actual_host_write_completion'
-            report['completion_gaps_over_4ms'] = sum(r['command_gap_s'] > .004 for r in report['samples'])
+            report['completion_gaps_over_6ms'] = sum(r['command_gap_s'] >= COMMAND_GAP_HARD_S for r in report['samples'])
+            report['completion_gaps_over_4ms'] = sum(r['command_gap_s'] > COMMAND_GAP_SOFT_S for r in report['samples'])
             report['inference_s'] = summary(report['inference_attempts_s'])
             report['inference_scope'] = 'all measured policy.forward attempts including discarded candidates; excludes warmup'
             report['completed_candidate_inference_s'] = summary([r['inference_s'] for r in report['samples']])
