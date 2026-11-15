@@ -214,3 +214,19 @@ python .\deploy\v2\device\diagnose_timing.py --port COM11 --onnx "$onnx" --sched
 候选建立后仍固定其原始观测+4ms及原命令截止，不因后续新帧到达续期；推理开始前再次检查候选截止，发送前后继续原检查。FAULT、VEL_VALID失效、坏数据、元数据过期、积压和越界不进入等待恢复，仍立即走既有停止路径。新增旧缓存等待次数和最大等待时的缓存年龄；这些旧观测只用于诊断，不作为控制输入。
 
 这利用尚剩的原命令时间预算，既不扩大4ms，也不保证Windows/USB下一帧及时到达。无需刷写固件；未由开发端操作设备或验证5秒运动。
+
+### 第七版：同一runner路径的DISABLED计时诊断
+
+保持设备已禁用、关闭其他串口工具，使用同一个模型与合同：
+
+```powershell
+python .\deploy\v2\device\run_policy.py --port COM11 --onnx "$onnx" --contract "$contract" --diagnostic-timing --seconds 10 --output ".\logs\deployment\runner-timing-$(Get-Date -Format yyyyMMdd-HHmmss).json"
+```
+
+无需ENABLE、扶直或 `--start-confirmed`。此模式要求DISABLED，**真实串口写入仅为既有只读查询；所有VEL和DISABLE均虚拟完成，不发给设备**。它不是停机工具；若设备仍READY应先按现有流程独立停稳/禁用。
+
+诊断直接共用运动runner的绝对栅格、WAIT_FRESH、接收、元数据轮询、推理与动作计算路径。位置/角度/制动门只记录would_stop；时序超限也记录后继续，用于观察尾部间隔分布。真实FAULT、速度失效、坏帧、元数据过期与接收错误仍退出。过期观测不用于推理/虚拟动作，候选过期丢弃；超限后的继续是**反事实延续**，真实运动模式仍在首次硬门失败时停。
+
+`completion_gap_s` 是虚拟动作完成间隔，**不包含真实VEL写入或设备运动带来的成本，不能作为真实可持续闭环/安全证明**。`inference_s` 包含所有正式测量推理尝试（含之后被丢弃的候选，不含预热）；`completed_candidate_inference_s`单独列成功到虚拟完成的候选。完整STATE日志含预检，正式 `received_state_host_gap_s` 只使用测量窗口内有效ACTIVE解析记录，是主机解析间隔，不是设备采样或USB到达间隔。`would_stop` 的count是门函数调用数，可能对同一超限阶段多次计数，不是独立失败次数或失败率。
+
+真实运动默认路径仍要求READY/显式启动，保持原门控和停止行为。诊断最长10秒，真实运动最长5秒。本次只做静态及假串口核查，没有由开发端操作设备。
