@@ -16,7 +16,8 @@ class EpisodeMetrics:
         self.episodes = {}
         self.initial_conditions = None
         self.accumulators = [dict(steps=0, theta_sq=0.0, speed_abs=0.0, speed_sq=0.0, max_abs_x_m=0.0,
-                                 max_abs_theta_rad=0.0, max_abs_action=0.0)
+                                 max_abs_theta_rad=0.0, max_abs_action=0.0, previous_action=None,
+                                 action_delta_sq=0.0, pole_velocity_sq=0.0)
                              for _ in range(num_envs)]
 
     def set_initial_conditions(self, *, states, tracking_parameters):
@@ -49,6 +50,10 @@ class EpisodeMetrics:
             item = self.accumulators[i]
             item['steps'] += 1
             item['theta_sq'] += state[1] ** 2
+            item['pole_velocity_sq'] += state[3] ** 2
+            if item['previous_action'] is not None:
+                item['action_delta_sq'] += (action-item['previous_action']) ** 2
+            item['previous_action'] = action
             item['speed_abs'] += abs(state[2])
             item['speed_sq'] += state[2] ** 2
             item['max_abs_x_m'] = max(item['max_abs_x_m'], abs(state[0]))
@@ -64,6 +69,8 @@ class EpisodeMetrics:
                     cart_mean_abs_velocity_m_s=item['speed_abs']/item['steps'],
                     cart_rms_velocity_m_s=math.sqrt(item['speed_sq']/item['steps']),
                     cart_travel_m=item['speed_abs']*self.dt,
+                    pole_rms_velocity_rad_s=math.sqrt(item['pole_velocity_sq']/item['steps']),
+                    action_delta_rms=math.sqrt(item['action_delta_sq']/max(1,item['steps']-1)),
                     cart_net_displacement_m=(state[0]-self.initial_conditions[i]['state'][0]
                                              if self.initial_conditions else None),
                     terminal_state=state, theta_rms_rad=math.sqrt(item['theta_sq']/item['steps']),
