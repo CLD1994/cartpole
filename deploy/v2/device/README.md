@@ -142,3 +142,17 @@ python deploy/v2/device/shadow.py --port COM11 --onnx <model_1050对应的policy
 ```
 
 清单只绑定文件身份，不替代坐标、归一化与现场条件确认。若图中引用还有其他文件，程序会拒绝，必须核实并补全真实清单，不能通过忽略引用规避检查。
+
+### 启动拒绝后的安全收尾与编码
+
+预检后即使没有发送策略动作，只要已读到 `READY NONE`，失败或中断也显式请求现有零速→新状态停稳检查→DISABLE流程；不会自动ENABLE，不重置已经开始的停车截止。报告分开记录 `motion_command_attempted`、`safe_stop_requested`、`disabled_confirmed`、`stop_unconfirmed` 和最后观察到的固件模式（不是未确认停机时的实时状态保证），拒绝启动不再意味着直接留下已使能设备。通信失败、驱动阻塞或未知模式仍不能保证停机，现场独立停机措施必须保留；禁用确认不是机械停稳证明。
+
+`initial_state_check` 和触发时的 `failed_state_check` 保存当时观测、主机接收/检查时间及实际使用阈值，避免只看到笼统越界信息。输出仍拒绝覆盖已有报告。
+
+合同按UTF-8读取（接受BOM），JSON报告写UTF-8。PowerShell生成含中文合同请用下面方式，不要 `-Encoding ascii`（已经写成问号的文本无法恢复）：
+
+```powershell
+[System.IO.File]::WriteAllText($contract, ($contractObject | ConvertTo-Json -Depth 6), [System.Text.UTF8Encoding]::new($false))
+```
+
+此收尾只覆盖进程已经连接设备并观察到READY的情形。模型加载、合同、依赖检查在打开串口之前失败时，脚本不知道设备状态，也不能自动禁用此前由操作者使能的设备。必须保留外层退出后的状态检查；正常返回、异常或Ctrl+C都不能仅看Python退出码判断禁用。外层命令自身若无法通信，使用现场独立停机措施，不宣称软件已停车。
