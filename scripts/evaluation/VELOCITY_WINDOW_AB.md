@@ -45,3 +45,17 @@ Get-ChildItem $replay -Recurse -Filter report.json | ForEach-Object { Get-Conten
 首轮两个报告请求初始摆角速度−0.169rad/s，reset实际为0，因此不能据这两份重放给tau排序。Isaac Lab的reset事件会用soft_joint_vel_limits夹速度；新版本记录该值与reset结果，随后仅在仿真中通过公开接口显式写入记录的初态，立即核对，失败则拒绝继续。没有改变训练任务、真实设备或终止条件。
 
 即使初始化一致，开环倒立摆对模型/初态误差仍敏感，可能提前倒杆；这不是必须“修到完整5秒”的程序故障。报告保留终止，比较时只能用两组共同覆盖的时间段，不能把不同长度的startup RMSE直接排名，也不能把终止后的自动reset状态拼入结果。
+
+### 短片段锚定一次比较（replay_revision 3）
+
+长开环倒立摆会因微小状态/模型差异发散，改用一条命令采集8个约200ms片段，每段分别tau20ms与tau0；锚点取真实报告1、1.5、…、4.5秒后的首条观测。每段单独reset并独立后端核验，退出后再开始下一段，不把重置跳变计入轨迹。
+
+```powershell
+python .\scripts\evaluation\replay_device_actions.py --trace "$trace" --segment-ab --delay-ms 6 --viz none --device cuda:0 --output-dir ".\logs\actuator-replay\segments-$(Get-Date -Format yyyyMMdd-HHmmss)"
+```
+
+每段延迟队列由此前真实主机命令填充；内部参考速度只能用已滤波的实测车速近似，**没有测到电机内部参考状态**，也没有假装做过物理预热。每对比较排除开始32ms，并截到两组共同结束时间，保留提前终止标志。200ms只评估局部输入响应，不是证明整段真实稳定或辨识唯一参数。输入初始速度自身已滤波，主机时间、窗口和2ms量化的限制仍适用。
+
+顶层 `segments_collected` / 退出码0只代表片段收集完成；每段status及paired_comparison仍需检查，不能当两模型均通过或tau0更好。没有改变训练分支、固件或设备。
+
+排除32ms仅减少初始化影响，不证明影响已消失；tau20ms仍可能保留约20%的参考速度初差，另有力伺服与摆杆耦合，因此只能比较近似初始化下的敏感性。
