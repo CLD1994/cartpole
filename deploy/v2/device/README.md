@@ -230,3 +230,11 @@ python .\deploy\v2\device\run_policy.py --port COM11 --onnx "$onnx" --contract "
 `completion_gap_s` 是虚拟动作完成间隔，**不包含真实VEL写入或设备运动带来的成本，不能作为真实可持续闭环/安全证明**。`inference_s` 包含所有正式测量推理尝试（含之后被丢弃的候选，不含预热）；`completed_candidate_inference_s`单独列成功到虚拟完成的候选。完整STATE日志含预检，正式 `received_state_host_gap_s` 只使用测量窗口内有效ACTIVE解析记录，是主机解析间隔，不是设备采样或USB到达间隔。`would_stop` 的count是门函数调用数，可能对同一超限阶段多次计数，不是独立失败次数或失败率。
 
 真实运动默认路径仍要求READY/显式启动，保持原门控和停止行为。诊断最长10秒，真实运动最长5秒。本次只做静态及假串口核查，没有由开发端操作设备。
+
+### 第八版：独立的命令间隔与观测年龄门槛
+
+经用户明确同意，命令完成间隔改为超过4ms记录软告警、6ms硬截止；500Hz绝对栅格不变。WAIT_FRESH、推理前、固定接收截止、写入前后和元数据查询预算都使用同一上次命令+6ms，**候选原始观测+4ms仍独立限制，绝不以新帧替换正在推理的候选或给它续期**。推理2ms、FAULT/VALID、制动、元数据TTL和停机路径不变。
+
+报告列出 timing_limits_s、每个完成样本的 command_gap_soft_warning、completion_gaps_over_4ms / completion_gaps_over_6ms；最后失败快照仍记录实际命令gap与观测年龄。4ms计数只涵盖已完成动作（诊断为虚拟动作），不代表独立调度故障次数。诊断使用相同新门槛，仍仅只读且would_stop后的继续是反事实。
+
+这允许最多6ms主机命令间隔，不保证5秒完成，也不证明物理延迟安全。观测仍可能在4ms门停止。既有固件看门狗不变，不需重刷；本次未操作设备。上文历史版本的4ms命令硬限说明由本节取代。
