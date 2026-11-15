@@ -42,7 +42,7 @@ class StepLossProbe:
             return 'model'
         if self.first_zero_completion_clock_s is not None:
             return 'done' if now >= self.first_zero_completion_clock_s + 2. else 'zero'
-        if self.first_probe_write_clock_s is not None and now >= self.first_probe_write_clock_s + 1.:
+        if self.first_probe_write_clock_s is not None and now >= self.first_probe_write_clock_s + 5.:
             return 'zero'
         return 'probe'
 

@@ -16,11 +16,11 @@ class ProbeTests(unittest.TestCase):
         p=StepLossProbe(); p.receive('EVENT STEP_LOSS 1 1 0',0,True)
         self.assertEqual(p.phase(1),'probe')
         self.assertEqual(p.before_write(1),10); p.completed(10,1.002)
-        self.assertEqual(p.before_write(1.999),10)
-        self.assertEqual(p.before_write(2),0); p.completed(0,2.004)
+        self.assertEqual(p.before_write(5.999),10)
+        self.assertEqual(p.before_write(6),0); p.completed(0,6.004)
         self.assertEqual(p.first_probe_write_clock_s,1)
-        self.assertEqual(p.phase(4.003),'zero')
-        self.assertEqual(p.phase(4.005),'done')
+        self.assertEqual(p.phase(8.003),'zero')
+        self.assertEqual(p.phase(8.005),'done')
     def test_invalid_event_formats(self):
         for line in ('EVENT STEP_LOSS 0 1 0','EVENT STEP_LOSS 1 0 0',
                      'EVENT STEP_LOSS 1 1 -1','EVENT STEP_LOSS 1 1 0 extra',

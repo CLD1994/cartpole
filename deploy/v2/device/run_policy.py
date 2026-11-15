@@ -301,7 +301,7 @@ def main():
               'continuous': a.continuous, 'requested_seconds': None if a.continuous else a.seconds, 'samples': [], 'received_states': [], 'inference_attempts_s': [], 'would_stop_count_scope': 'gate invocation counts, not independent faults or failed cycles', 'would_stop': {}, 'virtual_command_attempted': False, 'motion_command_sent': False, 'motion_command_attempted': False}
     if a.step_loss_probe:
         report['scope'] = '有人监控的STEP_LOSS事件低速探针；不是正式控制或安全验收'
-        report['step_loss_probe_config'] = {'velocity_mm_s': 10, 'positive_window_s': 1.,
+        report['step_loss_probe_config'] = {'velocity_mm_s': 10, 'positive_window_s': 5.,
             'zero_observation_s': 2., 'trigger': 'first eligible EVENT received while ACTIVE',
             'event_delivery_guaranteed': False,
             'event_run_matches_current_firmware_run_verified': False,
