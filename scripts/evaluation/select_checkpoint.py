@@ -136,7 +136,21 @@ def nominate(run, candidates, window, manual):
     """文件编号只用于映射日志横轴和时段，不作为模型质量分数。"""
     import torch
     checkpoints = []
-    paths = list(run.glob('model_*.pt')) + list((run/'training-candidates').glob('candidate_*.pt'))
+    candidate_dir = run/'training-candidates'
+    candidate_paths = list(candidate_dir.glob('candidate_*.pt'))
+    manifest_path = candidate_dir/'candidates.json'
+    if candidate_paths or manifest_path.exists():
+        if not manifest_path.is_file():
+            raise ValueError('训练候选缺少candidates.json；请先完成训练并恢复完整候选记录')
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+        if manifest.get('schema_version') != 1 or manifest.get('status') != 'complete':
+            raise ValueError('训练候选尚未正常结束；不读取运行中或中断状态的候选')
+        declared = [allowed_checkpoint(row['checkpoint'], run) for row in manifest['candidates']]
+        actual = {path.resolve() for path in candidate_paths}
+        if (any(path.parent != candidate_dir for path in declared)
+                or len(set(declared)) != len(declared) or set(declared) != actual):
+            raise ValueError('训练候选manifest与现存文件不一致；请先核查训练输出')
+    paths = list(run.glob('model_*.pt')) + candidate_paths
     for path in paths:
         if not re.fullmatch(r'(model|candidate)_\d+\.pt', path.name):
             continue
