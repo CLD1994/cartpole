@@ -1,0 +1,319 @@
+"""冻结策略的完整回合评估；不训练、不导出策略、不接触真机。"""
+from __future__ import annotations
+
+import argparse
+import copy
+from contextlib import contextmanager
+import hashlib
+import json
+import math
+from pathlib import Path
+import subprocess
+import sys
+import uuid
+
+from episode_metrics import EpisodeMetrics, run_cohort, summarize
+
+
+def parse_args(argv=None, *, add_launcher_args):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--checkpoint', type=Path, required=True)
+    parser.add_argument('--task', default='Hexchip-Cartpole-Real-V2-v0',
+                        choices=['Hexchip-Cartpole-Real-V2-v0', 'Hexchip-Cartpole-Real-V2-Window16-v0', 'Hexchip-Cartpole-Real-V2-Window16-Tau0-v0',
+                            'Hexchip-Cartpole-Real-V2-Window16-Tau0-Acc9-Hz400-v0'])
+    parser.add_argument('--num_envs', type=int, default=100, help='每个种子的完整回合数量')
+    parser.add_argument('--seeds', type=int, nargs='+', default=[101, 202, 303, 404, 505])
+    parser.add_argument('--horizon-s', type=float, help='仅评估实例的回合时长；默认保留训练配置')
+    parser.add_argument('--render-interval', type=int, default=None)
+    parser.add_argument('--initial-cart-velocity-range',type=float,nargs=2,metavar=('LOW','HIGH'),
+                        help='仅评估的小车初速度范围[m/s]；不指定则保留训练范围')
+    parser.add_argument('--initial-pole-velocity-range',type=float,nargs=2,metavar=('LOW','HIGH'),
+                        help='仅评估的摆杆初角速度范围[rad/s]；不指定则保留训练范围')
+    parser.add_argument('--velocity-observation-window-ms', type=int, choices=[0,16], default=0,
+                        help='仅策略速度输入：0瞬时基线；16ms首末位置差，前16ms保留瞬时速度')
+    parser.add_argument('--output-dir', type=Path, default=Path('logs/evaluation'))
+    add_launcher_args(parser)
+    args = parser.parse_args(argv)
+    args.physics = 'isaacsim_physx'
+    if '-Window16-' in args.task and args.velocity_observation_window_ms:
+        parser.error('Window16 task already includes the velocity window; do not apply it twice')
+    if args.num_envs <= 0 or any(seed < 0 for seed in args.seeds) or len(set(args.seeds)) != len(args.seeds):
+        parser.error('num_envs 必须为正，种子必须非负且不能重复')
+    if args.horizon_s is not None and (not math.isfinite(args.horizon_s) or args.horizon_s <= 0):
+        parser.error('horizon-s 必须为有限正数')
+    if args.render_interval is not None and args.render_interval <= 0:
+        parser.error('render-interval 必须为正')
+    for value in (args.initial_cart_velocity_range,args.initial_pole_velocity_range):
+        if value is not None and (not all(math.isfinite(v) for v in value) or value[0]>value[1]):
+            parser.error('初速度范围必须为有限数值，且 LOW <= HIGH')
+    return args
+
+
+def make_recorder_type(base, *, snapshot, consume, before_reset=lambda ids: None):
+    """在公开 post_step 钩子采样，早于自动 reset；不向数据集写入张量。"""
+    class EvaluationRecorder(base):
+        def record_pre_reset(self, env_ids):
+            before_reset(env_ids)
+            return None, None
+
+        def record_post_step(self):
+            consume(snapshot(self._env))
+            return None, None
+    return EvaluationRecorder
+
+
+def snapshot_state(env):
+    """只读取无噪声关节状态；不计算观测，不采样随机数或推进仿真。"""
+    import torch
+    robot = env.scene['robot']
+    cart_ids, _ = robot.find_joints('slider_to_cart')
+    pole_ids, _ = robot.find_joints('cart_to_pole')
+    if len(cart_ids) != 1 or len(pole_ids) != 1:
+        raise ValueError('评估器要求唯一的小车和摆杆关节')
+    cart, pole = cart_ids[0], pole_ids[0]
+    positions, velocities = robot.data.joint_pos.torch, robot.data.joint_vel.torch
+    theta = torch.remainder(positions[:, pole] + math.pi, 2*math.pi) - math.pi
+    state = torch.stack((positions[:,cart],theta,velocities[:,cart],velocities[:,pole]),dim=1)
+    return state.detach().cpu().tolist()
+
+
+def snapshot_environment(env):
+    states = snapshot_state(env)
+    actions = env.action_manager.action
+    if actions.shape[1] != 1:
+        raise ValueError('评估器要求一个速度指令动作')
+    manager = env.termination_manager
+    return dict(states=states, actions=actions[:,0].detach().cpu().tolist(),
+                terminated=manager.terminated.detach().cpu().tolist(),
+                truncated=manager.time_outs.detach().cpu().tolist(),
+                reasons={name:manager.get_term(name).detach().cpu().tolist() for name in manager.active_terms})
+
+
+
+def snapshot_initial_conditions(env):
+    """在显式reset返回后且第一控制步之前读取状态和实际抽样的跟踪参数。"""
+    states = snapshot_state(env)
+    tracking = env.action_manager.get_term('joint_effort')
+    values = {key:getattr(tracking,attr).detach().cpu().tolist() for key,attr in
+              [('velocity_limit_m_s','vel_max'),('tau_s','tau'),('acceleration_limit_m_s2','acc_max'),
+               ('delay_steps','delay_steps')]}
+    parameters = []
+    for i in range(len(states)):
+        item = {key:value[i] for key,value in values.items()}
+        item['delay_s'] = item['delay_steps'] * env.step_dt
+        parameters.append(item)
+    return dict(states=states,tracking_parameters=parameters)
+
+
+def configure_initial_velocities(env_cfg, *, cart_range=None, pole_range=None):
+    """只改评估配置副本；不改变默认训练范围或位置初始化。"""
+    result = copy.deepcopy(env_cfg)
+    for term,value in ((result.events.reset_cart_position,cart_range),
+                       (result.events.reset_pole_position,pole_range)):
+        if value is not None:
+            if len(value)!=2 or not all(math.isfinite(v) for v in value) or value[0]>value[1]:
+                raise ValueError('初速度范围必须是有序有限区间')
+            term.params['velocity_range'] = tuple(value)
+    return result
+
+def write_report(path, report):
+    temporary = path.with_suffix('.tmp')
+    temporary.write_text(json.dumps(report,ensure_ascii=False,indent=2,allow_nan=False)+'\n',encoding='utf-8')
+    temporary.replace(path)
+
+
+
+def refresh_summary(report, status):
+    """全局状态覆盖局部cohort状态；部分种子完成不能发布完整成功率。"""
+    summary = summarize(report['cohorts'])
+    summary['status'] = status
+    if status != 'complete':
+        summary.update(success_rate=None,wilson_95_low=None,wilson_95_high=None)
+    report.update(status=status,summary=summary)
+
+
+def persist_progress(path, report):
+    refresh_summary(report,'running')
+    write_report(path,report)
+
+
+def persist_error(path, report, active, error):
+    if active[0] is not None:
+        report['interrupted_cohort'] = active[0].report()
+    refresh_summary(report,'error')
+    report['error'] = dict(type=type(error).__name__,message=str(error))
+    write_report(path,report)
+
+
+@contextmanager
+def reported_run(path, report, *, active, emit=print):
+    """必须嵌套在launch_simulation内部，确保Kit可能退出进程前已落盘。
+
+    退出码只表示采集完整；不可用cohort局部完成替代全部请求种子完成。
+    """
+    try:
+        yield
+    except BaseException as error:
+        persist_error(path,report,active,error)
+        if isinstance(error,SystemExit) and error.code in (None,0):
+            raise SystemExit(1) from error
+        raise
+    else:
+        cohorts = report['cohorts']
+        complete = ([c['seed'] for c in cohorts] == report['seeds']
+                    and all(c['status']=='complete'
+                            and c['requested']==report['num_envs']
+                            and c['completed']==report['num_envs']
+                            and len(c['episodes'])==report['num_envs'] for c in cohorts))
+        refresh_summary(report,'complete' if complete else 'incomplete')
+        write_report(path,report)
+        emit('POLICY_EVALUATION '+json.dumps(report['summary'],ensure_ascii=False))
+        if not complete:
+            raise SystemExit(1)
+
+
+
+def run_seed_cohort(metrics, *, reset, step_factory, inference_context, max_steps):
+    """运行一个独立种子，复位和步进共用推理上下文。"""
+    with inference_context():
+        reset(metrics.seed)
+        step = step_factory()
+        return run_cohort(metrics,step=step,max_steps=max_steps)
+
+
+def main(argv=None):
+    import warp as wp
+    wp.config.enable_backward = False
+    import cartpole.tasks  # noqa: F401
+    import gymnasium as gym
+    import torch
+    from isaaclab.app import add_launcher_args, launch_simulation
+    from isaaclab.managers import RecorderTerm, RecorderTermCfg, RecorderManagerBaseCfg, DatasetExportMode
+    from isaaclab.utils.io import dump_yaml
+    from isaaclab_tasks.utils import resolve_task_config
+    from isaaclab_rl.rsl_rl import (RslRlVecEnvWrapper, check_rsl_rl_version,
+                                   create_rsl_rl_runner, handle_deprecated_rsl_rl_cfg)
+
+    args = parse_args(argv,add_launcher_args=add_launcher_args)
+    checkpoint = args.checkpoint.resolve(strict=True)
+    digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    output = args.output_dir.resolve() / ('evaluation-'+uuid.uuid4().hex)
+    output.mkdir(parents=True,exist_ok=False)
+    report = dict(schema_version=3,status='starting',checkpoint=str(checkpoint),checkpoint_sha256=digest,
+                  task=args.task,seeds=args.seeds,num_envs=args.num_envs,cohorts=[],
+                  scope='当前配置下的独立仿真评估；不是旧训练环境重建、性能基准或真机验收',
+                  sample_scope='每槽位从显式reset起的第一个回合；状态在自动reset前、每控制步末采样',
+                  recorder_note='Isaac Lab 3.0 recorder会额外计算观测；相同seed不保证与普通play随机数序列相同，不能用于RTF比较',
+                  state_order=['x_m','theta_rad','xdot_m_s','thetadot_rad_s'],
+                  velocity_observation_window_ms=(16 if '-Window16-' in args.task else args.velocity_observation_window_ms),
+                  velocity_window_scope=('ideal 16ms endpoint difference at control ticks; unchanged existing velocity noise; first16ms instantaneous; no sensor quantization, invalidity or sampling jitter'
+                                         if args.velocity_observation_window_ms or '-Window16-' in args.task else 'baseline: original instantaneous velocity observations unchanged'))
+    project = Path(__file__).resolve().parents[2]
+    def git(*arguments):
+        completed = subprocess.run(['git','-C',str(project),*arguments],capture_output=True,text=True)
+        return completed.stdout.strip() if completed.returncode == 0 else None
+    report['code'] = dict(commit=git('rev-parse','HEAD'),dirty_status=git('status','--short'))
+    write_report(output/'report.json',report)
+    print(f'[OUTPUT] {output}',flush=True)
+    active = [None]
+    try:
+        env_cfg,agent_cfg = resolve_task_config(args.task,'rsl_rl_cfg_entry_point',play_mode=False,overrides=[])
+        env_cfg = configure_initial_velocities(env_cfg,cart_range=args.initial_cart_velocity_range,
+                                               pole_range=args.initial_pole_velocity_range)
+        report['reset_conditions'] = {
+            'cart_position_range_m':env_cfg.events.reset_cart_position.params['position_range'],
+            'cart_velocity_range_m_s':env_cfg.events.reset_cart_position.params['velocity_range'],
+            'pole_angle_range_rad':env_cfg.events.reset_pole_position.params['position_range'],
+            'pole_velocity_range_rad_s':env_cfg.events.reset_pole_position.params['velocity_range']}
+        report['initial_sample_scope'] = '显式reset完成后、首个env.step之前；直接关节状态，不含观测噪声'
+        agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg,check_rsl_rl_version())
+        env_cfg.scene.num_envs = args.num_envs
+        env_cfg.sim.device = args.device
+        env_cfg.seed = agent_cfg.seed = args.seeds[0]
+        env_cfg.log_dir = None
+        if args.horizon_s is not None:
+            env_cfg.episode_length_s = args.horizon_s
+        if args.render_interval is not None:
+            env_cfg.sim.render_interval = args.render_interval
+        with launch_simulation(env_cfg,args):
+            with reported_run(output/'report.json',report,active=active,emit=lambda text:print(text,flush=True)):
+                # 保存解析后的物理配置，不把诊断recorder写成训练模型的一部分。
+                dump_yaml(str(output/'env.yaml'),env_cfg)
+                def consume(data):
+                    if active[0] is not None:
+                        active[0].record(**data)
+                def before_reset(env_ids):
+                    if active[0] is not None:
+                        if hasattr(env_ids, 'detach'):
+                            env_ids = env_ids.detach().cpu().tolist()
+                        active[0].check_reset(env_ids)
+                recorder_type = make_recorder_type(RecorderTerm,snapshot=snapshot_environment,
+                                                   consume=consume,before_reset=before_reset)
+                recorder_cfg = RecorderManagerBaseCfg()
+                recorder_cfg.dataset_export_mode = DatasetExportMode.EXPORT_NONE
+                recorder_cfg.export_in_record_pre_reset = False
+                recorder_cfg.export_in_close = False
+                recorder_cfg.evaluation = RecorderTermCfg(class_type=recorder_type)
+                env_cfg.recorders = recorder_cfg
+                raw = gym.make(args.task,cfg=env_cfg)
+                try:
+                    env = RslRlVecEnvWrapper(raw,clip_actions=agent_cfg.clip_actions)
+                    agent_cfg.device = str(env.unwrapped.device)
+                    dump_yaml(str(output/'agent.yaml'),agent_cfg)
+                    runner = create_rsl_rl_runner(env,agent_cfg,log_dir=None)
+                    runner.load(str(checkpoint))
+                    policy = runner.get_inference_policy(device=env.unwrapped.device)
+                    dt = env.unwrapped.step_dt
+                    from velocity_window import VelocityWindow
+                    velocity_window = (VelocityWindow(env.unwrapped,args.velocity_observation_window_ms/1000.)
+                                       if args.velocity_observation_window_ms else None)
+                    report.update(step_dt_s=dt,physics_dt_s=env.unwrapped.physics_dt,
+                                  horizon_s=env_cfg.episode_length_s,device=str(env.unwrapped.device),
+                                  physics_backend=type(env_cfg.sim.physics).__name__,
+                                  visualization=getattr(args,'visualizer',None),
+                                  render_interval=env_cfg.sim.render_interval)
+                    for seed in args.seeds:
+                        active[0] = None
+                        metrics = EpisodeMetrics(num_envs=args.num_envs,seed=seed,dt=dt)
+                        def reset(seed):
+                            raw.reset(seed=seed)
+                            if velocity_window is not None:
+                                velocity_window.reset()
+                            metrics.set_initial_conditions(**snapshot_initial_conditions(env.unwrapped))
+                            policy.reset(torch.ones(args.num_envs,dtype=torch.bool,device=env.unwrapped.device))
+                        def step_factory():
+                            obs = env.get_observations()
+                            active[0] = metrics
+                            def step():
+                                nonlocal obs
+                                policy_obs = velocity_window.apply(obs) if velocity_window is not None else obs
+                                obs,_,dones,_ = env.step(policy(policy_obs))
+                                if velocity_window is not None:
+                                    velocity_window.advance(dones)
+                                policy.reset(dones)
+                            return step
+                        cohort = run_seed_cohort(metrics,reset=reset,step_factory=step_factory,
+                            inference_context=torch.inference_mode,
+                            max_steps=math.ceil(env_cfg.episode_length_s/dt)+2)
+                        active[0] = None
+                        report['cohorts'].append(cohort)
+                        persist_progress(output/'report.json',report)
+                        print(f"[SEED {seed}] {cohort['completed']}/{args.num_envs} complete, successes={cohort['successes']}",flush=True)
+                        if cohort['status'] != 'complete':
+                            break
+                finally:
+                    raw.close()
+        return 0
+    except BaseException as error:
+        # Kit may raise SystemExit during shutdown. Never overwrite a terminal report
+        # with that expected exit; ordinary startup/shutdown failures still count as errors.
+        expected_exit = (isinstance(error,SystemExit)
+                         and ((report['status']=='complete' and error.code in (None,0))
+                              or (report['status']=='incomplete' and error.code==1)))
+        if not expected_exit and report['status'] != 'error':
+            persist_error(output/'report.json',report,active,error)
+        raise
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

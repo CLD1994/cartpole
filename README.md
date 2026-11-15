@@ -156,3 +156,8 @@ python .\scripts\diagnostics\env_step_rtf.py --task Hexchip-Cartpole-Real-V2-v0 
 ```
 
 比较两次 `ENV_STEP_TIMING`，确认 `physics_dt_s=0.001`、`step_dt_s=0.002`、`num_envs=1` 和 `device=cuda:0`。两者都是完整环境的零动作基线，不包含模型推理，也不使用 RSL-RL 包装器。不同任务的动力学、动作含义、终止条件和重置次数可能不同，因此差值不是某一函数的精确成本，更不能等同于相同策略的性能差距。该对照用于决定下一步优先检查框架公共路径还是项目额外逻辑，不衡量控制效果。
+
+## 训练指标与可选配方
+
+完整回合指标、动态候选及冻结策略评估见 [训练流程](docs/training-deployment-workflow.md)。
+[400 Hz / Acc9 / Window16 / Tau0](docs/training-400hz-acc9.md) 为独立单动作配方，原 V2 任务不变。

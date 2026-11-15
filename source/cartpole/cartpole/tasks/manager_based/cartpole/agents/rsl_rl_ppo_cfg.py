@@ -3,6 +3,8 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+import math
+
 from isaaclab.utils.configclass import configclass
 from cartpole.device_profile import load_profile, model_parameters
 
@@ -15,6 +17,8 @@ from ..mdp import symmetry
 
 @configclass
 class CartpolePPORunnerCfg(RslRlOnPolicyRunnerCfg):
+    # Explicit RSL-RL 5.5.1 fallback mapping; both networks keep policy observations.
+    obs_groups = {"actor": ["policy"], "critic": ["policy"]}
     num_steps_per_env = 16
     max_iterations = 150
     save_interval = 50
@@ -89,7 +93,16 @@ class RealCartpoleV2PPORunnerCfg(RealCartpolePPORunnerCfg):
     experiment_name = "cartpole_real_v2"
 
     def __post_init__(self):
-        # 保持单位物理时间的折扣与GAE衰减，不把周期缩短变成长时间视野。
         self.algorithm = self.algorithm.copy()
         self.algorithm.gamma = 0.99 ** (V2_DT / 0.005)
         self.algorithm.lam = 0.95 ** (V2_DT / 0.005)
+
+
+@configclass
+class RealCartpoleV2WindowPPORunnerCfg(RealCartpoleV2PPORunnerCfg):
+    """可选 Window 配方；不改变原 V2 折扣参数。"""
+
+    def __post_init__(self):
+        super().__post_init__()
+        # 与既有 Window16 训练一致；400Hz 配方也保留这些每步参数。
+        self.algorithm.gamma = math.exp(-V2_DT / 2.0)
