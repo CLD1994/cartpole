@@ -20,6 +20,7 @@ GRID_PERIOD_NS = 2_000_000
 COMMAND_GAP_SOFT_S = .004
 COMMAND_GAP_HARD_S = .006
 OBSERVATION_MAX_AGE_S = .004
+TRACK_END_MARGIN_M = .050
 
 
 def next_grid_slot(slot, start_ns, completed_ns):
@@ -185,27 +186,41 @@ def load_contract(path, model):
     return c
 
 
-def state_guard(obs, starting=False):
+def position_limit_m(session):
+    # Physical calibrated endpoints, not the firmware soft-limit endpoints.
+    if session._metadata_reason(CLOCK()):
+        raise RuntimeError('position_calibration_not_ready')
+    length = session.values['CAL_LENGTH_UM'][0]
+    if length != getattr(session, 'bound_travel_um', None):
+        raise RuntimeError('position_calibration_changed')
+    limit = length / 2e6 - TRACK_END_MARGIN_M
+    if not math.isfinite(limit) or limit <= 0:
+        raise RuntimeError('position_calibration_invalid')
+    return limit
+
+
+def state_guard(obs, session, starting=False):
     x, th, vx, w = obs.si()
     if not all(math.isfinite(v) for v in (x, th, vx, w)):
         return 'nonfinite_state'
-    # 仅近直立平衡试验，不允许下垂起摆；固定保守区域不等于安全保证。
-    if abs(x) > .2 or abs(th) > (math.radians(10) if starting else math.radians(20)):
+    # 仅近直立平衡，不允许下垂起摆；动态位置门不替代独立制动包络。
+    if abs(x) > position_limit_m(session) or abs(th) > (math.radians(10) if starting else math.radians(20)):
         return 'trial_position_or_angle_limit'
     if starting and (abs(vx) > .05 or abs(w) > .5):
         return 'initial_velocity_limit'
     return None
 
 
-def guard_snapshot(obs, starting=False):
+def guard_snapshot(obs, session, starting=False):
     return {'state_si': list(obs.si()) if obs else None,
             'host_received_at_s': obs.received_at if obs else None,
             'checked_at_s': CLOCK(), 'starting': starting,
-            'limits': {'max_abs_x_m': .2,
+            'limits': {'max_abs_x_m': position_limit_m(session),
+                       'physical_endpoint_margin_m': TRACK_END_MARGIN_M,
                        'max_abs_theta_rad': math.radians(10 if starting else 20),
                        'max_abs_vx_m_s': .05 if starting else None,
                        'max_abs_omega_rad_s': .5 if starting else None},
-            'reason': state_guard(obs, starting) if obs else 'measurement_unavailable'}
+            'reason': state_guard(obs, session, starting) if obs else 'measurement_unavailable'}
 
 
 def main():
@@ -236,7 +251,7 @@ def main():
         policy.forward((0., 0., 0., 0.))
     # 外部权重初始化前后均核验；在运行期间不可改动导出文件。
     verified_files = verify_model_files(a.onnx, contract)
-    report = {'loop_interval_scope': 'new-observation decision ticks, not serial command completion', 'runner_revision': 9, 'diagnostic_timing': a.diagnostic_timing, 'stale_observation_waits': 0, 'max_stale_observation_age_s': 0., 'grid_slots_skipped': 0, 'over_period_late_candidates': 0, 'readback_refresh': [], 'scheduler': 'absolute-grid-wait-fresh', 'duplicate_tick_count': 0, 'verified_model_files': verified_files, 'status': 'starting', 'scope': '限时真机联调；不是硬实时或真机验收',
+    report = {'loop_interval_scope': 'new-observation decision ticks, not serial command completion', 'runner_revision': 10, 'diagnostic_timing': a.diagnostic_timing, 'stale_observation_waits': 0, 'max_stale_observation_age_s': 0., 'grid_slots_skipped': 0, 'over_period_late_candidates': 0, 'readback_refresh': [], 'scheduler': 'absolute-grid-wait-fresh', 'duplicate_tick_count': 0, 'verified_model_files': verified_files, 'status': 'starting', 'scope': '限时真机联调；不是硬实时或真机验收',
               'timing_limits_s': {'command_gap_soft': COMMAND_GAP_SOFT_S, 'command_gap_hard': COMMAND_GAP_HARD_S, 'observation_max_age': OBSERVATION_MAX_AGE_S},
               'contract': contract, 'clock': vars(time.get_clock_info('perf_counter')),
               'continuous': a.continuous, 'requested_seconds': None if a.continuous else a.seconds, 'samples': [], 'received_states': [], 'inference_attempts_s': [], 'would_stop_count_scope': 'gate invocation counts, not independent faults or failed cycles', 'would_stop': {}, 'virtual_command_attempted': False, 'motion_command_sent': False, 'motion_command_attempted': False}
@@ -311,6 +326,13 @@ def main():
                         raise RuntimeError('preflight:' + reason)
                     if session.values['CAL_LENGTH_UM'][0] != profile['measured']['calibrated_travel_um']:
                         raise RuntimeError('profile_travel_mismatch')
+                    session.bound_travel_um = session.values['CAL_LENGTH_UM'][0]
+                    report['position_boundary'] = {
+                        'calibrated_travel_um': session.bound_travel_um,
+                        'physical_endpoint_margin_m': TRACK_END_MARGIN_M,
+                        'max_abs_x_m': position_limit_m(session),
+                        'firmware_margin_additionally_subtracted': False,
+                        'independent_braking_guard_retained': True}
                     if a.continuous or a.seconds > .5:
                         # 老固件忽略带参数CONFIG?。运动前验证能力，不能在运动中才发现。
                         # 初始整组（包括最后STEP_LOSS）已收齐，旧VEL_MAX不能满足新回执时间。
@@ -338,7 +360,7 @@ def main():
                         reason = session.preflight_reason()
                         if reason:
                             raise RuntimeError('post_probe_preflight:' + reason)
-                    report['initial_state_check'] = guard_snapshot(session.observation, starting=True)
+                    report['initial_state_check'] = guard_snapshot(session.observation, session, starting=True)
                     reason = report['initial_state_check']['reason']
                     if reason:
                         gate(reason)
@@ -381,9 +403,9 @@ def main():
                             raise RuntimeError('observation_missing')
                         # 已观察到的危险状态必须先停止，不能因缓存旧而等待恢复。
                         stage = 'cached_state_guard'
-                        reason = state_guard(obs)
+                        reason = state_guard(obs, session)
                         if reason:
-                            report['failed_state_check'] = guard_snapshot(obs)
+                            report['failed_state_check'] = guard_snapshot(obs, session)
                             gate(reason)
                         if now-obs.received_at > OBSERVATION_MAX_AGE_S:
                             # 尚无推理候选：不用旧缓存，只消耗既有命令预算等新有效帧。
@@ -411,9 +433,9 @@ def main():
                         if now_ns-candidate_due_ns > GRID_PERIOD_NS:
                             report['over_period_late_candidates'] += 1
                         stage = 'state_guard'
-                        reason = state_guard(obs)
+                        reason = state_guard(obs, session)
                         if reason:
-                            report['failed_state_check'] = guard_snapshot(obs)
+                            report['failed_state_check'] = guard_snapshot(obs, session)
                             gate(reason)
                         last_sample = obs.received_at
                         x, th, vx, w = obs.si()
@@ -452,8 +474,8 @@ def main():
                             if refresh:
                                 refresh.update(session, CLOCK())
                             latest = session.observation
-                            if latest is None or state_guard(latest):
-                                report['failed_state_check'] = guard_snapshot(latest)
+                            if latest is None or state_guard(latest, session):
+                                report['failed_state_check'] = guard_snapshot(latest, session)
                                 if latest is None:
                                     raise RuntimeError('latest_state_missing')
                                 gate('latest_state_limit')
