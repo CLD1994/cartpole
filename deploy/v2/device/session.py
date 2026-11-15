@@ -73,6 +73,9 @@ class Session:
     receive 接受完整 ASCII 行，tick 必须被调用以检查静默超时和停机截止。
     发送协作者必须具有有界写超时；这里不能中断阻塞的外部 I/O。
     """
+    enforce_position_limits = True  # Other session clients retain their position guards.
+    required_active_mode = ('READY', 'NONE')
+
     def __init__(self, transport: Transport, clock: Callable[[], float], limits: Limits):
         self.transport, self.clock, self.limits = transport, clock, limits
         self.phase = Phase.OBSERVING
@@ -150,7 +153,7 @@ class Session:
             return reason
         if not self._measurement_ready(now):
             return 'measurement_unavailable'
-        if abs(self.observation.x_um) >= self.track_limit_um:
+        if self.enforce_position_limits and abs(self.observation.x_um) >= self.track_limit_um:
             return 'position_outside_limits'
         return None
 
@@ -163,7 +166,7 @@ class Session:
         return self.expected_readback.keys() | {'CAL_LENGTH_UM'}
 
     def _metadata_reason(self, now):
-        if self.mode != ('READY', 'NONE') or not self._fresh(self._mode_at, now, self.limits.preflight_timeout_s):
+        if self.mode != self.required_active_mode or not self._fresh(self._mode_at, now, self.limits.preflight_timeout_s):
             return 'mode_not_ready'
         expected = self.expected_readback
         for key, value in expected.items():
@@ -208,6 +211,11 @@ class Session:
         """开始有界零速/禁用流程；不把调用成功当成机械已停。"""
         now = self._now()
         if self.phase == Phase.ACTIVE:
+            self._begin_stop(now)
+        elif (self.phase in (Phase.OBSERVING, Phase.FINISHED)
+              and self.mode == ('READY', 'NONE') and self._stop_at == -math.inf):
+            # 预检拒绝不代表固件未使能。即使从未发送策略动作，也可显式
+            # 请求零速/停稳/禁用；仅首次启动此流程，不能重置已有停车截止。
             self._begin_stop(now)
         elif self.phase == Phase.STOPPING:
             self.tick()
@@ -257,7 +265,7 @@ class Session:
                 if self.phase == Phase.STOPPING and self._disable_sent and self.mode == ('DISABLED', 'NONE'):
                     self.disabled_confirmed = True
                     self.phase = Phase.FINISHED
-                elif self.phase == Phase.ACTIVE and self.mode != ('READY', 'NONE'):
+                elif self.phase == Phase.ACTIVE and self.mode != self.required_active_mode:
                     self._fail('firmware_mode', now)
                 elif self.phase == Phase.STOPPING and self.mode not in (('READY', 'NONE'), ('DISABLED', 'NONE')):
                     self._fail('firmware_mode', now)
@@ -331,7 +339,7 @@ class Session:
         velocity = int(whole)
         if abs(fraction) >= 0.5:
             velocity += 1 if fraction > 0 else -1
-        if abs(self.observation.x_um) >= self.track_limit_um and self.observation.x_um * velocity > 0:
+        if self.enforce_position_limits and abs(self.observation.x_um) >= self.track_limit_um and self.observation.x_um * velocity > 0:
             velocity = 0
         if not self._write(f'VEL {velocity}'):
             raise RuntimeError(self.failure)

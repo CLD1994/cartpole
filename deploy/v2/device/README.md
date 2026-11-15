@@ -74,3 +74,43 @@ Python 和 C 均要求 `1 ≤ max_line ≤ max_pending ≤ 1048576`，时间阈�
 ### 动作整数化
 
 会话接收有限的归一化动作 `[-1, 1]`，乘以注入的速度上限后转换成整数 mm/s。Python 与 C 均取最近整数，恰好半单位时远离零，例如 `0.5 → 1`、`-0.5 → -1`。范围外或非有限动作仍触发失效停车，不在会话内部静默钳位；模型输出钳位属于上层策略适配的职责。
+
+## 单动作 ONNX 联调运行器
+
+`run_policy.py` 仅支持四维观测 `[x, theta, xdot, thetadot]` 与一个归一化目标速度动作，缩放为 ±1250 mm/s。合同控制频率为 400 或 500 Hz；400 Hz 要求设备档案加速度为 9000 mm/s²。固件 STATE 可以为 500 Hz，运行器按 2.5/2 ms 绝对栅格选择新观测，不是每收一帧就推理；跳过错过的栅格，不补发突发命令。这不是硬实时承诺。
+
+准备 `model-contract.example.json` 的独立副本，核实模型主文件及全部外部权重 SHA256、坐标方向、控制频率和现场条件。签认是操作者声明，不是自动验收。用 `--profile` 指定本次设备档案，校准行程、频率、加速度、软限位余量必须与现场读回一致；不修改仓库默认档案以冒充实际配置。
+
+```powershell
+# $python、$onnx、$contract、$sessionProfile、$hostTree 均为已核实的本次路径。
+$report = Join-Path $exportRoot ('control-' + [guid]::NewGuid().ToString('N') + '.json')
+& $python (Join-Path $hostTree 'deploy\v2\device\run_policy.py') `
+  --port COM11 --onnx $onnx --contract $contract --profile $sessionProfile `
+  --output $report --seconds 5 --start-confirmed
+```
+
+运行器不自动 ENABLE、不标定、不设置固件参数。必须由现场步骤先准备 READY；启动检查失败也会在已知 READY 时尝试零速、停稳、DISABLE。使用 `--continuous` 替代 `--seconds 5` 进入有人监控持续运行，Ctrl+C 请求停车。每次使用新的报告文件；已有文件拒绝覆盖。报告中 `disabled_confirmed` 才代表已收到 DISABLED 确认，单独的退出码不能证明停车。
+
+位置软限位与提前制动由固件负责，运行器不施加额外位置门或摆角门。有效测量、坐标/标定一致性、固件状态、读回有效期和命令时限仍独立检查。持续运行逐条刷新 CONFIG? 键值，只有真实新回执延长有效期。
+
+### 时序配置与只读诊断
+
+- 默认 `--timing-profile normal`：命令完成间隔硬限 6 ms、观测年龄 4 ms、决策计算预算 2 ms。
+- `--timing-profile debug`：显式实验选项，命令 15 ms、观测 12 ms，不额外施加 2 ms 决策预算；其他故障检查仍有效。报告记录选择，事件记录不会暗中放宽时序。
+- `--diagnostic-timing --seconds 5`：要求 DISABLED 的只读同路径测量，不加 `--start-confirmed`。VEL/DISABLE 仅虚拟完成，不能据此证明运动时序合格。
+- `shadow.py`：只读推理；`diagnose_timing.py`：只读节拍分析。两者均不代替真机验证。
+
+### 固件 PR #17 事件诊断配套
+
+`--step-loss-monitor` 选择可选的事件记录。启动发 `RUN?` 并解析正式 `OK RUN <run_id>`，仅接纳同运行编号的新 `EVENT STEP_LOSS <event_id> <run_id> <device_us>`，保存首个事件前最多 400、之后最多 2000 个控制决策样本。通知可能丢失；没有事件不代表没有故障。
+
+事件本身不切换低速、不修改模型动作、不放宽时序。**是否继续控制由固件模式决定**：固件 observe-only 保持 READY 时继续；正常保护模式进入 FAULT 时仍立即结束控制并执行既有停车处理。EVENTS 开关不等于 OBSERVE_ONLY，后者必须由现场另行明确配置。事件时间为设备时钟，收到时间为主机时钟，不能直接相减。
+
+轨迹导出直接使用 `CLD1994/device-nerve-esp32` PR #17 对应版本的 `tools/step_trace_capture.py`，在控制结束且设备静止后读取 SLT4；不要同时争用串口，不沿用 SLT3 的 PCNT/EN/SPI 字段解释。SLT4 为软件 STEP 位置与缓存编码器的非同步观测，不证明物理脉冲、物理失步或实际移动。
+
+```powershell
+$trace = Join-Path $exportRoot ('step-trace-' + [guid]::NewGuid().ToString('N') + '.json')
+& $python (Join-Path $firmwareTree 'tools\step_trace_capture.py') --port COM11 --baud 460800 --out $trace
+```
+
+本整理只验证纯 Python 协议/调度边界与模拟传输；目标 Windows 调度、USB 串口、实际 ONNX 模型和固件配套需现场验证。双动作 VELA 与自动低速切换实验不在此运行器范围内。
