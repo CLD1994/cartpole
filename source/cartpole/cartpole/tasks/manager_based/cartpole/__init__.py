@@ -53,3 +53,13 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:RealCartpoleV2PPORunnerCfg",
     },
 )
+
+gym.register(
+    id="Hexchip-Cartpole-Real-V2-Window16-Tau0-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cartpole_env_cfg_velocity_window:RealCartpoleV2Window16Tau0EnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:RealCartpoleV2PPORunnerCfg",
+    },
+)

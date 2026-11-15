@@ -78,6 +78,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--resume-learning-rate", type=float, default=None)
     parser.add_argument("--adaptive-lr-max", type=float, default=None)
+    parser.add_argument("--training-candidates", action="store_true")
+    parser.add_argument("--candidate-window", type=int, default=100)
+    parser.add_argument("--candidate-min-episodes", type=int, default=256)
+    parser.add_argument("--candidate-interval", type=int, default=1)
+    parser.add_argument("--candidate-keep", type=int, default=3)
     cli_args.add_rsl_rl_args(parser)
     add_launcher_args(parser)
     remaining_args_env_registration = cli_args.register_external_tasks(argv)
@@ -205,6 +210,11 @@ def _run(args_cli: argparse.Namespace) -> None:
                 from cartpole.training_lr_guard import install_lr_guard
                 install_lr_guard(runner, initial_lr=args_cli.resume_learning_rate,
                                  max_lr=args_cli.adaptive_lr_max, log_dir=rank_dir)
+            if args_cli.training_candidates:
+                from cartpole.training_candidates import install_training_candidates
+                install_training_candidates(runner, window=args_cli.candidate_window,
+                    min_episodes=args_cli.candidate_min_episodes,
+                    interval=args_cli.candidate_interval, keep=args_cli.candidate_keep)
             dump_train_configs(rank_dir, env_cfg, agent_cfg)
 
             if agent_cfg.logger == "wandb":
