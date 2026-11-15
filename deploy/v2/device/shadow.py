@@ -30,8 +30,11 @@ class QueryOnlyTransport:
 
 
 class Policy:
-    """仅接受四维单批次观测、单动作的确定性 ONNX 策略。"""
-    def __init__(self, path):
+    """四维单批次观测；默认单动作，合同调用方可显式要求双动作。"""
+    def __init__(self, path, action_dim=1):
+        if action_dim not in (1, 2):
+            raise ValueError("unsupported_action_dimension")
+        self.action_dim = action_dim
         import numpy as np
         import onnxruntime as ort
         self.np = np
@@ -55,9 +58,10 @@ class Policy:
         if not self.np.isfinite(x).all():
             raise ValueError('nonfinite_observation')
         y = self.runtime.run([self.output_name], {self.input_name: x})[0]
-        if y.shape not in ((1,), (1, 1)) or not self.np.isfinite(y).all():
+        shapes = ((1,), (1, 1)) if self.action_dim == 1 else ((1, 2),)
+        if y.shape not in shapes or not self.np.isfinite(y).all():
             raise ValueError('invalid_policy_output')
-        return float(y.reshape(-1)[0])
+        return float(y.reshape(-1)[0]) if self.action_dim == 1 else tuple(float(v) for v in y[0])
 
 
 def summary(values):

@@ -28,17 +28,32 @@ def candidate_refresh_allowed(now, observation_at, last_command_at, end):
             and now < min(last_command_at + COMMAND_GAP_HARD_S, end))
 
 
-def next_grid_slot(slot, start_ns, completed_ns):
+def next_grid_slot(slot, start_ns, completed_ns, period_ns=GRID_PERIOD_NS):
     # 只指向严格未来栅格；不循环补发已错过的slot。
-    return max(slot + 1, (completed_ns-start_ns)//GRID_PERIOD_NS + 1)
+    return max(slot + 1, (completed_ns-start_ns)//period_ns + 1)
 
 
 CONFIG_QUERY_BYTES = tuple(f'CONFIG? {key}\n'.encode('ascii') for key in CONFIG_KEYS)
 
 
+def valid_motion_line(line, dual=False):
+    words = line.split()
+    try:
+        if len(words) == 2 and words[0] == 'VEL':
+            v = int(words[1])
+            return line == f'VEL {v}\n' and abs(v) <= 1250
+        if dual and len(words) == 3 and words[0] == 'VELA':
+            v, a = map(int, words[1:])
+            return line == f'VELA {v} {a}\n' and abs(v) <= 1250 and 100 <= a <= 9000
+    except ValueError:
+        pass
+    return False
+
+
 class ControlTransport:
     """只允许查询、会话速度命令和禁用，拒绝ENABLE/配置/定位。"""
-    def __init__(self, port):
+    def __init__(self, port, dual=False):
+        self.dual = dual
         self.port = port
         self.partial = False
 
@@ -53,11 +68,10 @@ class ControlTransport:
         return data
 
     def write(self, data):
-        if data not in (b'QUERY\n', b'CALIB?\n', b'CONFIG?\n', b'DISABLE\n', *CONFIG_QUERY_BYTES):
+        if data not in (b'QUERY\n', b'CALIB?\n', b'CONFIG?\n', b'DISABLE\n', b'VELA?\n', *CONFIG_QUERY_BYTES):
             try:
                 line = data.decode('ascii')
-                value = int(line[4:-1])
-                valid = line == f'VEL {value}\n' and abs(value) <= 1250
+                valid = valid_motion_line(line, self.dual)
             except (ValueError, UnicodeError):
                 valid = False
             if not valid:
@@ -72,6 +86,23 @@ class BoundSession(Session):
         self.coordinates = coordinates
         super().__init__(transport, clock, limits)
 
+    def command_dual(self, action):
+        self.tick()
+        if self.phase != Phase.ACTIVE:
+            raise RuntimeError(self.failure or 'session_not_active')
+        if (not isinstance(action, (tuple, list)) or len(action) != 2
+                or any(isinstance(v, bool) or not isinstance(v, (int, float))
+                       or not math.isfinite(v) or not -1 <= v <= 1 for v in action)):
+            self._fail('invalid_action', self._now())
+            raise ValueError('invalid_action')
+        def nearest(v):
+            return int(math.copysign(math.floor(abs(v)+.5), v))
+        velocity = nearest(action[0]*self.limits.speed_mm_s)
+        acceleration = nearest(100+(action[1]+1)*4450)
+        if not self._write(f'VELA {velocity} {acceleration}'):
+            raise RuntimeError(self.failure)
+        return velocity, acceleration
+
     @property
     def expected_readback(self):
         return {**super().expected_readback, **self.coordinates}
@@ -80,15 +111,14 @@ class BoundSession(Session):
 class DiagnosticTransport(ControlTransport):
     """唯一真实写入出口仅允许只读查询；动作/禁用返回虚拟完成。"""
     def write(self, data):
-        queries = (b'QUERY\n', b'CALIB?\n', b'CONFIG?\n', *CONFIG_QUERY_BYTES)
+        queries = (b'QUERY\n', b'CALIB?\n', b'CONFIG?\n', b'VELA?\n', *CONFIG_QUERY_BYTES)
         if data in queries:
             return self.port.write(data)
         if data == b'DISABLE\n':
             return len(data)
         try:
             line = data.decode('ascii')
-            velocity = int(line[4:-1])
-            if line == f'VEL {velocity}\n' and abs(velocity) <= 1250:
+            if valid_motion_line(line, self.dual):
                 return len(data)
         except (ValueError, UnicodeError):
             pass
@@ -157,8 +187,17 @@ def load_contract(path, model):
     c = json.loads(path.read_text(encoding='utf-8-sig'))
     expected = {'schema_version': 1, 'observation_order': ['x', 'theta', 'xdot', 'thetadot'],
                 'observation_units': ['m', 'rad', 'm/s', 'rad/s'],
-                'action_type': 'cart_target_velocity', 'action_scale_m_s': 1.25,
-                'training_control_hz': 500, 'x_sign': 1, 'action_sign': 1}
+                'action_scale_m_s': 1.25,
+                'x_sign': 1, 'action_sign': 1}
+    dual = c.get('action_type') == 'cart_target_velocity_acceleration'
+    if dual:
+        if (c.get('action_dim') != 2 or c.get('training_control_hz') != 400
+                or c.get('acceleration_range_m_s2') != [0.1, 9.0]
+                or c.get('command_protocol') != 'VELA/1'):
+            raise ValueError('dual_action_contract_mismatch')
+    elif (c.get('action_type') != 'cart_target_velocity' or c.get('action_dim', 1) != 1
+          or c.get('training_control_hz') not in (400, 500)):
+        raise ValueError('single_action_contract_mismatch')
     if any(c.get(k) != v for k, v in expected.items()):
         raise ValueError('model_contract_mismatch')
     if type(c.get('angle_sign')) is not int or c['angle_sign'] not in (-1, 1):
@@ -216,6 +255,7 @@ def main():
     p.add_argument('--port', required=True)
     p.add_argument('--onnx', required=True, type=Path)
     p.add_argument('--contract', required=True, type=Path)
+    p.add_argument('--profile', type=Path, default=PROFILE, help='本次标定与训练设备配置；不修改固件')
     p.add_argument('--output', required=True, type=Path)
     duration_args = p.add_mutually_exclusive_group()
     duration_args.add_argument('--seconds', type=float, default=.5)
@@ -230,16 +270,19 @@ def main():
     if not math.isfinite(a.seconds) or not 0 < a.seconds <= (10. if a.diagnostic_timing else 5.):
         p.error('--seconds 运动在(0,5]，只读诊断在(0,10]' )
     contract = load_contract(a.contract, a.onnx)
-    profile = json.loads(PROFILE.read_text(encoding='utf-8'))
+    profile = json.loads(a.profile.read_text(encoding='utf-8-sig'))
+    dual = contract['action_type'] == 'cart_target_velocity_acceleration'
+    period_ns = 1_000_000_000 // contract['training_control_hz']
     limits = limits_from_profile(profile)
-    if limits.control_hz != 500 or limits.speed_mm_s != 1250:
+    if (limits.control_hz != contract['training_control_hz'] or limits.speed_mm_s != 1250
+            or (contract['training_control_hz'] == 400 and limits.acceleration_mm_s2 != 9000)):
         raise ValueError('profile_contract_mismatch')
-    policy = Policy(a.onnx)
+    policy = Policy(a.onnx, action_dim=2 if dual else 1)
     for _ in range(20):
         policy.forward((0., 0., 0., 0.))
     # 外部权重初始化前后均核验；在运行期间不可改动导出文件。
     verified_files = verify_model_files(a.onnx, contract)
-    report = {'loop_interval_scope': 'new-observation decision ticks, not serial command completion', 'runner_revision': 13, 'host_angle_gate': False, 'diagnostic_timing': a.diagnostic_timing, 'discarded_stale_candidates': 0, 'candidate_refresh_stages': {}, 'stale_observation_waits': 0, 'max_stale_observation_age_s': 0., 'grid_slots_skipped': 0, 'over_period_late_candidates': 0, 'readback_refresh': [], 'scheduler': 'absolute-grid-wait-fresh', 'duplicate_tick_count': 0, 'verified_model_files': verified_files, 'status': 'starting', 'scope': '限时真机联调；不是硬实时或真机验收',
+    report = {'loop_interval_scope': 'new-observation decision ticks, not serial command completion', 'runner_revision': 14, 'control_hz': limits.control_hz, 'grid_period_ns': period_ns, 'action_dim': 2 if dual else 1, 'host_angle_gate': False, 'diagnostic_timing': a.diagnostic_timing, 'discarded_stale_candidates': 0, 'candidate_refresh_stages': {}, 'stale_observation_waits': 0, 'max_stale_observation_age_s': 0., 'grid_slots_skipped': 0, 'over_period_late_candidates': 0, 'readback_refresh': [], 'scheduler': 'absolute-grid-wait-fresh', 'duplicate_tick_count': 0, 'verified_model_files': verified_files, 'status': 'starting', 'scope': '限时真机联调；不是硬实时或真机验收',
               'timing_limits_s': {'command_gap_soft': COMMAND_GAP_SOFT_S, 'command_gap_hard': COMMAND_GAP_HARD_S, 'observation_max_age': OBSERVATION_MAX_AGE_S},
               'contract': contract, 'clock': vars(time.get_clock_info('perf_counter')),
               'continuous': a.continuous, 'requested_seconds': None if a.continuous else a.seconds, 'samples': [], 'received_states': [], 'inference_attempts_s': [], 'would_stop_count_scope': 'gate invocation counts, not independent faults or failed cycles', 'would_stop': {}, 'virtual_command_attempted': False, 'motion_command_sent': False, 'motion_command_attempted': False}
@@ -291,7 +334,7 @@ def main():
             with port:
                 try:
                     port.reset_input_buffer()
-                    transport = (DiagnosticTransport if a.diagnostic_timing else ControlTransport)(port)
+                    transport = (DiagnosticTransport if a.diagnostic_timing else ControlTransport)(port, dual=dual)
                     session = (DiagnosticSession if a.diagnostic_timing else BoundSession)(transport, CLOCK, limits, contract['firmware_coordinates'])
                     if a.diagnostic_timing:
                         session.diagnostic_state_events = report['received_states']
@@ -322,6 +365,21 @@ def main():
                         raise RuntimeError('preflight:' + reason)
                     if session.values['CAL_LENGTH_UM'][0] != profile['measured']['calibrated_travel_um']:
                         raise RuntimeError('profile_travel_mismatch')
+                    if dual:
+                        stage = 'vela_capability'
+                        probe_at = CLOCK()
+                        if transport.write(b'VELA?\n') != 6:
+                            raise RuntimeError('vela_probe_write')
+                        while CLOCK()-probe_at < .2:
+                            if not receiver.poll() or session.failure:
+                                raise RuntimeError(receiver.error or session.failure)
+                            value, at = session.values.get('VELA', (None, -math.inf))
+                            if value == 1 and at >= probe_at:
+                                break
+                            time.sleep(.0002)
+                        else:
+                            raise RuntimeError('vela_capability_required')
+                        report['vela_capability'] = {'version': 1, 'verified': True}
                     session.bound_travel_um = session.values['CAL_LENGTH_UM'][0]
                     report['position_boundary'] = {
                         'calibrated_travel_um': session.bound_travel_um,
@@ -425,7 +483,7 @@ def main():
                         candidate_slot = next_slot
                         candidate_due_ns = next_tick_ns
                         grid_lateness_s = (now_ns-candidate_due_ns)/1e9
-                        if now_ns-candidate_due_ns > GRID_PERIOD_NS:
+                        if now_ns-candidate_due_ns > period_ns:
                             report['over_period_late_candidates'] += 1
                         stage = 'state_guard'
                         reason = state_guard(obs, session)
@@ -503,7 +561,7 @@ def main():
                                 drain['wait_s'] += CLOCK()-begin
                         if retry_candidate:
                             continue  # 不使用旧raw；外层拿到更新帧后从头推理。
-                        action = max(-1., min(1., raw))
+                        action = tuple(max(-1., min(1., v)) for v in raw) if dual else max(-1., min(1., raw))
                         stage = 'prewrite'
                         if CLOCK() >= receive_deadline:
                             if discard_expired_candidate(obs):
@@ -512,7 +570,11 @@ def main():
                             if a.diagnostic_timing and CLOCK() >= obs.received_at+OBSERVATION_MAX_AGE_S:
                                 continue
                         report['virtual_command_attempted' if a.diagnostic_timing else 'motion_command_attempted'] = True
-                        velocity = session.command(action)
+                        acceleration = None
+                        if dual:
+                            velocity, acceleration = session.command_dual(action)
+                        else:
+                            velocity = session.command(action)
                         completed_ns = time.perf_counter_ns()
                         completed_at = completed_ns / 1e9
                         command_gap = completed_at-last_command_at
@@ -525,7 +587,7 @@ def main():
                         if not a.diagnostic_timing:
                             report['motion_command_sent'] = True
                         report['samples'].append({'elapsed_s': CLOCK()-start, 'state_si': obs.si(),
-                                                  'raw_action': raw, 'velocity_mm_s': velocity,
+                                                  'raw_action': raw, 'velocity_mm_s': velocity, 'acceleration_mm_s2': acceleration,
                                                   'inference_s': inference_s,
                                                   'command_gap_s': command_gap,
                                                   'command_gap_soft_warning': command_gap > COMMAND_GAP_SOFT_S,
@@ -540,11 +602,11 @@ def main():
                         if completed_at >= receive_deadline:
                             gate('write_completion_deadline')
                         # 成功写入且通过硬截止后才推进；短间隔相位恢复并非固定周期保证。
-                        next_slot = next_grid_slot(candidate_slot, grid_start_ns, completed_ns)
+                        next_slot = next_grid_slot(candidate_slot, grid_start_ns, completed_ns, period_ns)
                         skipped = next_slot-candidate_slot-1
                         report['grid_slots_skipped'] += skipped
                         report['samples'][-1]['skipped_following_slots'] = skipped
-                        next_tick_ns = grid_start_ns + next_slot*GRID_PERIOD_NS
+                        next_tick_ns = grid_start_ns + next_slot*period_ns
                         next_tick = next_tick_ns/1e9
                         if refresh:
                             # 已成功写入新速度后才安排单条只读查询，不与其他查询叠加。
