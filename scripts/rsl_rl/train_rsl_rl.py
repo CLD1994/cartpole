@@ -76,6 +76,8 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         default=True,
         help="Restore the policy optimizer; disable to keep a fresh optimizer and configured learning rate.",
     )
+    parser.add_argument("--resume-learning-rate", type=float, default=None)
+    parser.add_argument("--adaptive-lr-max", type=float, default=None)
     cli_args.add_rsl_rl_args(parser)
     add_launcher_args(parser)
     remaining_args_env_registration = cli_args.register_external_tasks(argv)
@@ -196,6 +198,13 @@ def _run(args_cli: argparse.Namespace) -> None:
                     ),
                     map_location=agent_cfg.device,
                 )
+            if args_cli.resume_learning_rate is not None or args_cli.adaptive_lr_max is not None:
+                if (resume_path is None or not args_cli.resume_optimizer_state
+                        or args_cli.resume_learning_rate is None or args_cli.adaptive_lr_max is None):
+                    raise ValueError("LR experiment requires checkpoint, optimizer restore and both LR flags")
+                from cartpole.training_lr_guard import install_lr_guard
+                install_lr_guard(runner, initial_lr=args_cli.resume_learning_rate,
+                                 max_lr=args_cli.adaptive_lr_max, log_dir=rank_dir)
             dump_train_configs(rank_dir, env_cfg, agent_cfg)
 
             if agent_cfg.logger == "wandb":
