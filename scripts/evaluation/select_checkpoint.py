@@ -4,6 +4,9 @@ import argparse
 import hashlib
 import json
 import math
+import os
+import signal
+import time
 from pathlib import Path
 import re
 import statistics
@@ -206,7 +209,7 @@ def nominate(run, candidates, window, manual):
         warning='日志均值是更新前采集且可跨策略版本的最近100个结束回合；model_it为更新后权重。这里只提名，不是冻结checkpoint成绩；旧Metrics/success_rate不参与。')), checkpoints)
 
 
-def evaluate(candidate, args, output, seeds, stage):
+def start_evaluation(candidate, args, output, seeds, stage):
     candidate = {key: candidate[key] for key in ('path','iteration','sha256')}
     if digest(Path(candidate['path'])) != candidate['sha256']:
         raise ValueError('checkpoint在选择过程中被修改，请等待训练结束后重跑')
@@ -223,8 +226,22 @@ def evaluate(candidate, args, output, seeds, stage):
         if values is not None:
             cmd += [flag,*map(str,values)]
     print(f"[{stage}] {Path(candidate['path']).name}", flush=True)
-    with (target/'console.log').open('w',encoding='utf-8') as log:
-        result = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT)
+    log = (target/'console.log').open('w', encoding='utf-8')
+    try:
+        process = subprocess.Popen(
+            cmd, stdout=log, stderr=subprocess.STDOUT,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0,
+            start_new_session=os.name != 'nt')
+    except BaseException:
+        log.close()
+        raise
+    return dict(candidate=candidate, target=target, process=process, log=log,
+                started=time.perf_counter())
+
+
+def finish_evaluation(job, args, seeds):
+    candidate, target, result = job['candidate'], job['target'], job['process']
+    job['log'].close()
     reports = list(target.glob('evaluation-*/report.json'))
     if result.returncode != 0 or len(reports)!=1:
         raise RuntimeError(f'评估未完成: {target}/console.log (exit={result.returncode})')
@@ -242,7 +259,91 @@ def evaluate(candidate, args, output, seeds, stage):
     return dict(**candidate, task=report['task'], report=str(path), summary=report['summary'],
                 successful_episode_mean_abs_velocity_m_s=speed,
                 successful_episode_mean_abs_net_displacement_m=drift,
-                env_config_sha256=digest(path.parent/'env.yaml'), code=report['code'])
+                env_config_sha256=digest(path.parent/'env.yaml'), code=report['code'],
+                evaluation_wall_s=time.perf_counter()-job['started'])
+
+
+def stop_evaluations(jobs):
+    """只终止本次启动的评估进程组，不触碰其他训练或选择任务。"""
+    errors = []
+    for job in jobs:
+        process = job['process']
+        try:
+            if process.poll() is None:
+                if os.name == 'nt':
+                    subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   check=False, timeout=5)
+                else:
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+        except Exception as exc:
+            errors.append(f'PID {process.pid}: {exc}')
+    for job in jobs:
+        process = job['process']
+        try:
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                if os.name != 'nt':
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                else:
+                    process.kill()
+                process.wait(timeout=5)
+        except Exception as exc:
+            errors.append(f'PID {process.pid}: {exc}')
+        finally:
+            job['log'].close()
+    if errors:
+        raise RuntimeError('评估进程清理异常，请核查这些PID: ' + '; '.join(errors))
+
+
+def evaluate_candidates(candidates, args, output, seeds, stage, on_result, workers):
+    """有界并行；失败或 Ctrl+C 清理所有仍在运行的本次子进程。"""
+    pending = iter(enumerate(candidates))
+    active = []
+    results = {}
+    try:
+        exhausted = False
+        while active or not exhausted:
+            while not exhausted and len(active) < workers:
+                item = next(pending, None)
+                if item is None:
+                    exhausted = True
+                    break
+                index, candidate = item
+                job = start_evaluation(candidate, args, output, seeds, stage)
+                job['index'] = index
+                active.append(job)
+            completed = [job for job in active if job['process'].poll() is not None]
+            for job in completed:
+                row = finish_evaluation(job, args, seeds)
+                on_result(row)
+                results[job['index']] = row
+                active.remove(job)
+                print(f"[{stage} complete] {Path(row['path']).name} "
+                      f"wall={row['evaluation_wall_s']:.1f}s", flush=True)
+            if active and not completed:
+                time.sleep(0.05)
+        return [results[index] for index in range(len(candidates))]
+    finally:
+        original_error = sys.exc_info()[1]
+        try:
+            stop_evaluations(active)
+        except Exception as cleanup_error:
+            if original_error is not None:
+                raise RuntimeError(f'{type(original_error).__name__}: {original_error}; '
+                                   f'cleanup: {cleanup_error}') from original_error
+            raise
+
+
+def evaluate(candidate, args, output, seeds, stage):
+    return evaluate_candidates([candidate], args, output, seeds, stage, lambda row: None, 1)[0]
 
 
 def main():
@@ -254,6 +355,8 @@ def main():
                    help='候选及holdout统一评估任务；必须显式匹配目标观测和执行器配置，默认保持旧任务')
     p.add_argument('--checkpoints',type=Path,nargs='+',help='显式候选；绕过训练日志提名')
     p.add_argument('--candidates',type=int,default=3,help='训练时段数；另保留最后保存的checkpoint')
+    p.add_argument('--parallel-workers',type=int,default=1,
+                   help='同时评估的候选数；默认1保持串行，共享device，显存不足或争用时减小')
     p.add_argument('--window',type=int,default=20,help='提名用日志窗口，单位为训练迭代')
     p.add_argument('--num_envs',type=int,default=32,help='每候选每种子的完整回合数')
     p.add_argument('--seeds',type=int,nargs='+',default=[101,202])
@@ -269,7 +372,7 @@ def main():
     for values in (args.initial_cart_velocity_range,args.initial_pole_velocity_range):
         if values is not None and (not all(math.isfinite(v) for v in values) or values[0]>values[1]):
             p.error('初速度区间必须为有序有限数值')
-    if min(args.candidates,args.window,args.num_envs)<=0:
+    if min(args.candidates,args.window,args.num_envs,args.parallel_workers)<=0:
         p.error('数量和窗口必须为正')
     all_seeds = args.seeds+args.holdout_seeds
     if any(s<0 for s in all_seeds) or len(set(all_seeds))!=len(all_seeds):
@@ -284,13 +387,15 @@ def main():
     try:
         candidates, nomination = nominate(args.run_dir.resolve(strict=True),args.candidates,args.window,args.checkpoints)
         report['nomination']=nomination; report['candidates']=candidates; save(dest,report)
-        for c in candidates:
-            row = evaluate(c,args,output,args.seeds,'selection')
+        def record_result(row):
             if report['evaluated']:
                 first = report['evaluated'][0]
                 if row['env_config_sha256']!=first['env_config_sha256'] or row['code']!=first['code']:
                     raise ValueError('候选之间配置或代码发生变化，不允许混合排名')
             report['evaluated'].append(row); save(dest,report)
+        report['evaluated'] = evaluate_candidates(
+            candidates, args, output, args.seeds, 'selection', record_result, args.parallel_workers)
+        save(dest, report)
         ranking = sorted(report['evaluated'],key=lambda r:(-r['summary']['success_rate'],
             r['successful_episode_mean_abs_velocity_m_s'] if r['successful_episode_mean_abs_velocity_m_s'] is not None else math.inf,
             r['successful_episode_mean_abs_net_displacement_m'] if r['successful_episode_mean_abs_net_displacement_m'] is not None else math.inf,
