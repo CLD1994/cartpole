@@ -1,4 +1,4 @@
-"""训练结束后按同一训练目录的日志提名，再独立评估候选；不修改任何checkpoint。"""
+"""训练结束后默认评估已保存动态候选；旧时段提名需显式启用，不修改checkpoint。"""
 from __future__ import annotations
 import argparse
 import hashlib
@@ -132,8 +132,10 @@ def nominate_complete_episodes(run, checkpoints, candidates, window):
         warning='仅rank 0训练回合，回合可能跨策略更新；窗口截至保存iteration，不使用未来样本。checkpoint为更新后权重，不代表冻结评估成绩。')
 
 
-def nominate(run, candidates, window, manual):
+def nominate(run, candidates, window, manual, strategy="saved"):
     """文件编号只用于映射日志横轴和时段，不作为模型质量分数。"""
+    if strategy not in ("saved", "temporal"):
+        raise ValueError("unknown nomination strategy")
     import torch
     checkpoints = []
     candidate_dir = run/'training-candidates'
@@ -150,7 +152,12 @@ def nominate(run, candidates, window, manual):
         if (any(path.parent != candidate_dir for path in declared)
                 or len(set(declared)) != len(declared) or set(declared) != actual):
             raise ValueError('训练候选manifest与现存文件不一致；请先核查训练输出')
-    paths = list(run.glob('model_*.pt')) + candidate_paths
+    saved_only = not manual and strategy == 'saved'
+    if saved_only:
+        if not manifest_path.is_file() or not candidate_paths:
+            raise ValueError('没有完整的动态候选；请使用 --checkpoints 显式指定，或 --nomination temporal 启用旧时段提名')
+        manual = declared
+    paths = list(manual) if manual else list(run.glob('model_*.pt')) + candidate_paths
     for path in paths:
         if not re.fullmatch(r'(model|candidate)_\d+\.pt', path.name):
             continue
@@ -174,7 +181,7 @@ def nominate(run, candidates, window, manual):
         missing = requested - {c['path'] for c in selected}
         if missing:
             raise ValueError(f'手动候选不属于该训练目录的有效checkpoint: {sorted(missing)}')
-        return selected, dict(method='manual', checkpoints=checkpoints)
+        return selected, dict(method='saved_training_candidates' if saved_only else 'manual', checkpoints=checkpoints)
     complete_episode_nomination = nominate_complete_episodes(run, checkpoints, candidates, window)
     if complete_episode_nomination is not None:
         return include_saved_candidates(complete_episode_nomination, checkpoints)
@@ -365,10 +372,13 @@ def main():
     p.add_argument('--run-dir',type=Path,required=True)
     p.add_argument('--task',default='Hexchip-Cartpole-Real-V2-v0',
                    choices=['Hexchip-Cartpole-Real-V2-v0', 'Hexchip-Cartpole-Real-V2-Window16-v0',
-                            'Hexchip-Cartpole-Real-V2-Window16-Tau0-v0'],
+                            'Hexchip-Cartpole-Real-V2-Window16-Tau0-v0',
+                            'Hexchip-Cartpole-Real-V2-Window16-Tau0-Acc9-Hz400-v0'],
                    help='候选及holdout统一评估任务；必须显式匹配目标观测和执行器配置，默认保持旧任务')
     p.add_argument('--checkpoints',type=Path,nargs='+',help='显式候选；绕过训练日志提名')
-    p.add_argument('--candidates',type=int,default=3,help='训练时段数；另保留最后保存的checkpoint')
+    p.add_argument('--nomination', choices=['saved','temporal'], default='saved',
+                   help='默认仅评估已保存动态候选；temporal 显式启用时段提名、末模型及动态候选')
+    p.add_argument('--candidates',type=int,default=3,help='仅 temporal 模式的训练时段数，不是动态候选数量')
     p.add_argument('--parallel-workers',type=int,default=1,
                    help='同时评估的候选数；默认1保持串行，共享device，显存不足或争用时减小')
     p.add_argument('--window',type=int,default=20,help='提名用日志窗口，单位为训练迭代')
@@ -399,7 +409,7 @@ def main():
     dest = output/'selection.json'; save(dest,report)
     print(f'[OUTPUT] {dest}',flush=True)
     try:
-        candidates, nomination = nominate(args.run_dir.resolve(strict=True),args.candidates,args.window,args.checkpoints)
+        candidates, nomination = nominate(args.run_dir.resolve(strict=True),args.candidates,args.window,args.checkpoints,strategy=args.nomination)
         report['nomination']=nomination; report['candidates']=candidates; save(dest,report)
         def record_result(row):
             if report['evaluated']:
@@ -433,3 +443,4 @@ def main():
 
 if __name__=='__main__':
     main()
+
