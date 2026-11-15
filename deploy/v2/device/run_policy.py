@@ -195,7 +195,7 @@ def main():
         policy.forward((0., 0., 0., 0.))
     # 外部权重初始化前后均核验；在运行期间不可改动导出文件。
     verified_files = verify_model_files(a.onnx, contract)
-    report = {'loop_interval_scope': 'new-observation decision ticks, not serial command completion', 'runner_revision': 5, 'grid_slots_skipped': 0, 'over_period_late_candidates': 0, 'readback_refresh': [], 'scheduler': 'absolute-grid-wait-fresh', 'duplicate_tick_count': 0, 'verified_model_files': verified_files, 'status': 'starting', 'scope': '限时真机联调；不是硬实时或真机验收',
+    report = {'loop_interval_scope': 'new-observation decision ticks, not serial command completion', 'runner_revision': 6, 'stale_observation_waits': 0, 'max_stale_observation_age_s': 0., 'grid_slots_skipped': 0, 'over_period_late_candidates': 0, 'readback_refresh': [], 'scheduler': 'absolute-grid-wait-fresh', 'duplicate_tick_count': 0, 'verified_model_files': verified_files, 'status': 'starting', 'scope': '限时真机联调；不是硬实时或真机验收',
               'contract': contract, 'clock': vars(time.get_clock_info('perf_counter')),
               'requested_seconds': a.seconds, 'samples': [], 'motion_command_sent': False, 'motion_command_attempted': False}
     a.output.parent.mkdir(parents=True, exist_ok=True)
@@ -308,8 +308,26 @@ def main():
                         stage = 'tick'
                         # 栅格迟到仅记录；实际命令/原观测4ms仍为硬停止条件。
                         obs = session.observation
-                        if obs is None or now-obs.received_at > .004:
-                            raise RuntimeError('observation_late')
+                        if obs is None:
+                            raise RuntimeError('observation_missing')
+                        # 已观察到的危险状态必须先停止，不能因缓存旧而等待恢复。
+                        stage = 'cached_state_guard'
+                        reason = state_guard(obs)
+                        if reason:
+                            report['failed_state_check'] = guard_snapshot(obs)
+                            raise RuntimeError(reason)
+                        if now-obs.received_at > .004:
+                            # 尚无推理候选：不用旧缓存，只消耗既有命令预算等新有效帧。
+                            # ACTIVE的FAULT/VEL_VALID/metadata失效仍由每次poll立即锁存。
+                            stage = 'wait_fresh_observation'
+                            report['stale_observation_waits'] += 1
+                            report['max_stale_observation_age_s'] = max(
+                                report['max_stale_observation_age_s'], now-obs.received_at)
+                            remaining = min(last_command_at+.004, end)-CLOCK()
+                            if remaining <= 0:
+                                raise RuntimeError('wait_fresh_command_deadline')
+                            time.sleep(min(.0001, remaining))
+                            continue
                         if obs.received_at == last_sample:
                             report['duplicate_tick_count'] += 1
                             stage = 'wait_fresh'
@@ -332,6 +350,8 @@ def main():
                         x, th, vx, w = obs.si()
                         stage = 'inference'
                         begin = CLOCK()
+                        if begin >= min(last_command_at+.004, obs.received_at+.004, end):
+                            raise RuntimeError('candidate_deadline')
                         raw = policy.forward((x, contract['angle_sign']*th, vx, contract['angle_sign']*w))
                         inference_s = CLOCK()-begin
                         if CLOCK()-obs.received_at > .004 or CLOCK()-now > .002:
