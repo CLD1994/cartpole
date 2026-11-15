@@ -138,13 +138,16 @@ def main():
         policy.forward((0., 0., 0., 0.))
     # 外部权重初始化前后均核验；在运行期间不可改动导出文件。
     verified_files = verify_model_files(a.onnx, contract)
-    report = {'verified_model_files': verified_files, 'status': 'starting', 'scope': '限时真机联调；不是硬实时或真机验收',
+    report = {'loop_interval_scope': 'new-observation decision ticks, not serial command completion', 'runner_revision': 2, 'scheduler': 'wait-fresh', 'duplicate_tick_count': 0, 'verified_model_files': verified_files, 'status': 'starting', 'scope': '限时真机联调；不是硬实时或真机验收',
               'contract': contract, 'clock': vars(time.get_clock_info('perf_counter')),
               'requested_seconds': a.seconds, 'samples': [], 'motion_command_sent': False, 'motion_command_attempted': False}
     a.output.parent.mkdir(parents=True, exist_ok=True)
     with a.output.open('x', encoding='utf-8') as output:
         session = receiver = None
         intervals = []
+        stage = 'startup'
+        start = last_command_at = next_tick = None
+        drain = None
         import serial
         port = serial.Serial(port=None, baudrate=profile['measured']['protocol_baud'], timeout=0, write_timeout=.002)
         port.dtr = port.rts = False
@@ -195,59 +198,87 @@ def main():
                     last_command_at = start
                     while CLOCK() < end:
                         # 首次原型运行最多0.5秒；运行中不插入元数据查询。
+                        stage = 'poll'
                         if transport.in_waiting > 128:
                             raise RuntimeError('active_backlog')
                         if not receiver.poll() or session.phase != Phase.ACTIVE:
                             raise RuntimeError(receiver.error or session.failure or 'session_inactive')
                         now = CLOCK()
+                        stage = 'gap_check'
                         if now-last_command_at > .004:
                             raise RuntimeError('command_gap_deadline')
                         if now < next_tick:
+                            stage = 'wait_tick'
                             time.sleep(min(.0002, next_tick-now))
                             continue
+                        stage = 'tick'
                         if now-next_tick > .002:
                             raise RuntimeError('control_deadline')
-                        if last_tick is not None:
-                            intervals.append(now-last_tick)
-                        last_tick = now
-                        next_tick = now + .002
                         obs = session.observation
                         if obs is None or now-obs.received_at > .004:
                             raise RuntimeError('observation_late')
                         if obs.received_at == last_sample:
+                            report['duplicate_tick_count'] += 1
+                            stage = 'wait_fresh'
+                            time.sleep(min(.0002, max(0., min(last_command_at+.004, obs.received_at+.004, end)-CLOCK())))
                             continue
+                        if last_tick is not None:
+                            intervals.append(now-last_tick)
+                        last_tick = now
+                        # 仅新观测消耗一个调度点；重复观测等待期间不推进截止。
+                        next_tick = now + .002
+                        stage = 'state_guard'
                         reason = state_guard(obs)
                         if reason:
                             report['failed_state_check'] = guard_snapshot(obs)
                             raise RuntimeError(reason)
                         last_sample = obs.received_at
                         x, th, vx, w = obs.si()
+                        stage = 'inference'
                         begin = CLOCK()
                         raw = policy.forward((x, contract['angle_sign']*th, vx, contract['angle_sign']*w))
                         inference_s = CLOCK()-begin
                         if CLOCK()-obs.received_at > .004 or CLOCK()-now > .002:
                             raise RuntimeError('inference_deadline')
-                        # 新状态可能在推理期间到达；先处理故障/有效性变化，再允许会话发命令。
-                        if transport.in_waiting > 128:
-                            raise RuntimeError('precommand_backlog')
-                        if not receiver.poll() or session.phase != Phase.ACTIVE:
-                            raise RuntimeError(receiver.error or session.failure or 'session_inactive')
-                        if transport.partial or transport.in_waiting:
-                            # 未解析完的尾帧可能是FAULT；不延续上一非零目标等待排空。
-                            raise RuntimeError('precommand_receive_incomplete')
-                        latest = session.observation
-                        if latest is None or state_guard(latest):
-                            report['failed_state_check'] = guard_snapshot(latest)
-                            raise RuntimeError('latest_state_limit')
-                        if CLOCK()-obs.received_at > .004 or CLOCK() >= end:
-                            raise RuntimeError('command_deadline')
+                        # 分片/新字节可在poll末尾到达；仅在固定原始截止内补收。
+                        stage = 'precommand_receive'
+                        receive_deadline = min(last_command_at+.004, obs.received_at+.004, end)
+                        drain = {'deadline_clock_s': receive_deadline, 'polls': 0,
+                                 'wait_s': 0., 'started_clock_s': CLOCK()}
+                        while True:
+                            if CLOCK() >= receive_deadline:
+                                raise RuntimeError('precommand_receive_deadline')
+                            if transport.in_waiting > 128:
+                                raise RuntimeError('precommand_backlog')
+                            if not receiver.poll() or session.phase != Phase.ACTIVE:
+                                raise RuntimeError(receiver.error or session.failure or 'session_inactive')
+                            drain['polls'] += 1
+                            latest = session.observation
+                            if latest is None or state_guard(latest):
+                                report['failed_state_check'] = guard_snapshot(latest)
+                                raise RuntimeError('latest_state_limit')
+                            pending = transport.in_waiting
+                            drain.update(pending_bytes=pending, partial=transport.partial,
+                                         elapsed_s=CLOCK()-drain['started_clock_s'])
+                            if CLOCK() >= receive_deadline:
+                                raise RuntimeError('precommand_receive_deadline')
+                            if pending > 128:
+                                raise RuntimeError('precommand_backlog')
+                            if not transport.partial and pending == 0:
+                                break
+                            if pending == 0:
+                                begin = CLOCK()
+                                time.sleep(min(.0001, max(0., receive_deadline-begin)))
+                                drain['wait_s'] += CLOCK()-begin
                         action = max(-1., min(1., raw))
                         # 向上取整绝对目标速度，覆盖Session整数化后的大小。
                         planned_speed = math.ceil(abs(action) * limits.speed_mm_s)
+                        stage = 'braking_guard'
                         if braking_reason(session, planned_speed):
                             raise RuntimeError('braking_envelope')
-                        if CLOCK()-last_command_at > .004:
-                            raise RuntimeError('prewrite_command_gap_deadline')
+                        stage = 'prewrite'
+                        if CLOCK() >= receive_deadline:
+                            raise RuntimeError('prewrite_fixed_deadline')
                         report['motion_command_attempted'] = True
                         velocity = session.command(action)
                         completed_at = CLOCK()
@@ -257,8 +288,10 @@ def main():
                         report['samples'].append({'elapsed_s': CLOCK()-start, 'state_si': obs.si(),
                                                   'raw_action': raw, 'velocity_mm_s': velocity,
                                                   'inference_s': inference_s,
-                                                  'command_gap_s': command_gap})
-                        if command_gap > .004:
+                                                  'command_gap_s': command_gap,
+                                                  'precommand_receive': drain})
+                        stage = 'write_completion'
+                        if completed_at >= receive_deadline:
                             raise RuntimeError('write_completion_deadline')
                     report['status'] = 'trial_ended'
                 except KeyboardInterrupt:
@@ -266,6 +299,16 @@ def main():
                 except Exception as exc:
                     report['status'] = 'error'
                     report['error'] = f'{type(exc).__name__}: {exc}'
+                    # 在停车/串口清理前捕获失败；不读取串口、不重置任何截止。
+                    failed_at = CLOCK()
+                    failed_obs = session.observation if session else None
+                    report['failure_snapshot'] = {'stage': stage, 'clock_s': failed_at,
+                        'elapsed_s': failed_at-start if start is not None else None,
+                        'actual_command_gap_s': failed_at-last_command_at if last_command_at is not None else None,
+                        'last_command_clock_s': last_command_at, 'next_tick_clock_s': next_tick,
+                        'observation_received_clock_s': failed_obs.received_at if failed_obs else None,
+                        'host_observation_age_s': failed_at-failed_obs.received_at if failed_obs else None,
+                        'precommand_receive': drain}
                 finally:
                     if session is not None and (session.phase in (Phase.ACTIVE, Phase.STOPPING)
                                                 or session.mode == ('READY', 'NONE')):
