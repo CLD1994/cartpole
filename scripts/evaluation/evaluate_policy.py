@@ -19,7 +19,7 @@ def parse_args(argv=None, *, add_launcher_args):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--checkpoint', type=Path, required=True)
     parser.add_argument('--task', default='Hexchip-Cartpole-Real-V2-v0',
-                        choices=['Hexchip-Cartpole-Real-V2-v0'])
+                        choices=['Hexchip-Cartpole-Real-V2-v0', 'Hexchip-Cartpole-Real-V2-Window16-v0'])
     parser.add_argument('--num_envs', type=int, default=100, help='每个种子的完整回合数量')
     parser.add_argument('--seeds', type=int, nargs='+', default=[101, 202, 303, 404, 505])
     parser.add_argument('--horizon-s', type=float, help='仅评估实例的回合时长；默认保留训练配置')
@@ -34,6 +34,8 @@ def parse_args(argv=None, *, add_launcher_args):
     add_launcher_args(parser)
     args = parser.parse_args(argv)
     args.physics = 'isaacsim_physx'
+    if args.task.endswith('-Window16-v0') and args.velocity_observation_window_ms:
+        parser.error('Window16 task already includes the velocity window; do not apply it twice')
     if args.num_envs <= 0 or any(seed < 0 for seed in args.seeds) or len(set(args.seeds)) != len(args.seeds):
         parser.error('num_envs 必须为正，种子必须非负且不能重复')
     if args.horizon_s is not None and (not math.isfinite(args.horizon_s) or args.horizon_s <= 0):
@@ -202,9 +204,9 @@ def main(argv=None):
                   sample_scope='每槽位从显式reset起的第一个回合；状态在自动reset前、每控制步末采样',
                   recorder_note='Isaac Lab 3.0 recorder会额外计算观测；相同seed不保证与普通play随机数序列相同，不能用于RTF比较',
                   state_order=['x_m','theta_rad','xdot_m_s','thetadot_rad_s'],
-                  velocity_observation_window_ms=args.velocity_observation_window_ms,
+                  velocity_observation_window_ms=(16 if args.task.endswith('-Window16-v0') else args.velocity_observation_window_ms),
                   velocity_window_scope=('ideal 16ms endpoint difference at control ticks; unchanged existing velocity noise; first16ms instantaneous; no sensor quantization, invalidity or sampling jitter'
-                                         if args.velocity_observation_window_ms else 'baseline: original instantaneous velocity observations unchanged'))
+                                         if args.velocity_observation_window_ms or args.task.endswith('-Window16-v0') else 'baseline: original instantaneous velocity observations unchanged'))
     project = Path(__file__).resolve().parents[2]
     def git(*arguments):
         completed = subprocess.run(['git','-C',str(project),*arguments],capture_output=True,text=True)
