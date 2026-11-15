@@ -52,3 +52,30 @@ Do not choose tau0 when replicating the original-tau Window16 group.
 Candidate history starts fresh on each new run; it does not import prior windows.
 Settings: `--candidate-window 100 --candidate-min-episodes 256 --candidate-keep 3`.
 Single-process only. No Isaac training was run in the delivery environment.
+
+## Selection compatibility
+
+Use branch `fix/changqing-candidate-selector` for the integrated selector. It
+inherits training candidates + the low-LR guard + all three task registrations.
+It includes selection-task-contract (`c4abf2d`) so `--task` is passed to BOTH
+selection and holdout and verified in reports.
+
+Permitted model layouts are only `<run>/model_<iteration>.pt` and
+`<run>/training-candidates/candidate_<iteration>.pt`, after resolving symlinks.
+The saved `iter` must match the filename. Historical save records for evicted
+candidate files remain valid but missing files are not evaluated. Periodic and
+candidate checkpoints may share an iteration; each uses a distinct result folder.
+Automatic nomination additionally includes all retained candidate files; it may
+therefore evaluate more than the requested temporal-group count. `--checkpoints`
+can explicitly choose either permitted file kind without reading training logs.
+
+```powershell
+# In the new selector worktree; run directory belongs to an already FINISHED run.
+$run = 'ABSOLUTE_FINISHED_TRAINING_RUN_DIRECTORY'
+& $python .\scripts\evaluation\select_checkpoint.py --run-dir $run --task Hexchip-Cartpole-Real-V2-Window16-Tau0-v0 --num_envs 32 --device cuda:0
+# Or explicitly evaluate only the saved training shortlist:
+$chosen = @((Get-Content "$run\training-candidates\candidates.json" -Raw | ConvertFrom-Json).candidates | ForEach-Object { $_.checkpoint })
+& $python .\scripts\evaluation\select_checkpoint.py --run-dir $run --task Hexchip-Cartpole-Real-V2-Window16-Tau0-v0 --checkpoints $chosen --num_envs 32 --device cuda:0
+```
+For original-tau Window16 choose `Hexchip-Cartpole-Real-V2-Window16-v0` instead.
+This does not modify checkpoints or already running training processes.
