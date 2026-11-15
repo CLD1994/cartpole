@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """限时策略联调入口：无自动使能/配置；需要明确模型合同及现场启动请求。"""
 import argparse
-import hashlib
 import json
 import math
 from pathlib import Path
@@ -9,6 +8,7 @@ import time
 
 from shadow import CLOCK, PROFILE, Policy, summary
 from check import limits_from_profile
+from model_integrity import verify_model_files
 from receiver import Receiver
 from session import Session, Phase
 
@@ -76,8 +76,7 @@ def load_contract(path, model):
         raise ValueError('model_contract_mismatch')
     if type(c.get('angle_sign')) is not int or c['angle_sign'] not in (-1, 1):
         raise ValueError('angle_sign_required')
-    if c.get('onnx_main_file_sha256') != hashlib.sha256(model.read_bytes()).hexdigest():
-        raise ValueError('onnx_hash_mismatch')
+    verify_model_files(model, c)
     coordinates = c.get('firmware_coordinates')
     if (not isinstance(coordinates, dict) or set(coordinates) != {'POLE_ZERO_URAD', 'POLE_INV', 'X_INV'}
             or any(type(v) is not int for v in coordinates.values())
@@ -126,7 +125,9 @@ def main():
     policy = Policy(a.onnx)
     for _ in range(20):
         policy.forward((0., 0., 0., 0.))
-    report = {'status': 'starting', 'scope': '限时真机联调；不是硬实时或真机验收',
+    # 外部权重初始化前后均核验；在运行期间不可改动导出文件。
+    verified_files = verify_model_files(a.onnx, contract)
+    report = {'verified_model_files': verified_files, 'status': 'starting', 'scope': '限时真机联调；不是硬实时或真机验收',
               'contract': contract, 'clock': vars(time.get_clock_info('perf_counter')),
               'requested_seconds': a.seconds, 'samples': [], 'motion_command_sent': False, 'motion_command_attempted': False}
     a.output.parent.mkdir(parents=True, exist_ok=True)
