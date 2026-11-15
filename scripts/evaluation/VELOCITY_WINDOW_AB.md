@@ -21,3 +21,20 @@ Get-ChildItem $ab -Recurse -Filter report.json | Select-Object -ExpandProperty F
 ```
 
 不需要Kit进行统计评估；可另用Kit观察，但不要把评估耗时当性能基准。64回合/组是初步敏感性比较，不是真机验收，也不是14Hz抖动已证实由估速窗导致。当前仅基本静态/局部数值核查，Isaac Lab现场待运行。
+
+## 已有真机指令的离线 PhysX 重放
+
+不需要checkpoint，不运行策略、不连接串口。将同一5秒真实VEL序列作为外部输入，A固定tau20ms，B仅tau=0；两组均固定动作比例1.25m/s、加速度10m/s²、指令延迟6ms、名义资产与原力伺服。**20ms是当前代码名义值，不是已证明1050训练的唯一参数**；训练本来随机tau10–40ms。
+
+```powershell
+$trace = Get-ChildItem . -Recurse -File -Filter 'trial1050-gap6-20261115-104841.json' | Select-Object -First 1 -ExpandProperty FullName
+if (-not $trace) { throw 'Please set $trace to the saved five-second motion report path' }
+$replay = ".\logs\actuator-replay\$(Get-Date -Format yyyyMMdd-HHmmss)"
+python .\scripts\evaluation\replay_device_actions.py --trace "$trace" --tau-s 0.020 --delay-ms 6 --viz none --device cuda:0 --output-dir "$replay\tau20"
+python .\scripts\evaluation\replay_device_actions.py --trace "$trace" --tau-s 0 --delay-ms 6 --viz none --device cuda:0 --output-dir "$replay\tau0"
+Get-ChildItem $replay -Recurse -Filter report.json | ForEach-Object { Get-Content $_.FullName -Raw -Encoding utf8 }
+```
+
+报告含逐拍物理状态、16ms窗速度、起始/中段/末段真实估速残差；终止则保留已完成片段并退出码2，绝不自动重置后继续拼接。两组初始实际状态应匹配，保存env.yaml用于核对。基于主机写完成时刻，命令在下一2ms控制边界生效，最多增加2ms量化；输入估速自身含16ms滤波，初始真实瞬时速度未知。host时间不是设备执行/采样时间，故残差含对时误差。
+
+固件vel_ramp是逐步限加速度追踪且换向经过零速，不是tau一阶滤波。B只去掉仿真额外一阶参考滤波，仍有力伺服/摆杆耦合，不宣称复制ISR梯形规划，也不能用这次重放证明固件正常或闭环安全。当前未在开发端运行PhysX，供现场仿真联调。
