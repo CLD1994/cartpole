@@ -481,7 +481,9 @@ def main():
                                 report['max_stale_observation_age_s'], now-obs.received_at)
                             remaining = min(last_command_at+hard_limit_s, end)-CLOCK()
                             if remaining <= 0:
-                                gate('wait_fresh_command_deadline')
+                                if CLOCK() >= last_command_at+hard_limit_s:
+                                    gate('wait_fresh_command_deadline')
+                                check_trial_end(CLOCK(), end)
                             time.sleep(min(.0001, remaining) if remaining > 0 else .0001)
                             continue
                         if obs.received_at == last_sample:
@@ -627,11 +629,14 @@ def main():
                             # 已成功写入新速度后才安排单条只读查询，不与其他查询叠加。
                             stage = 'readback_query'
                             query_at = CLOCK()
-                            if query_at >= min(last_command_at+hard_limit_s, end):
+                            if query_at >= last_command_at+hard_limit_s:
                                 gate('readback_send_deadline')
+                            check_trial_end(query_at, end)
                             refresh.send_if_due(query_at, end)
-                            if CLOCK() >= min(last_command_at+hard_limit_s, end):
+                            query_done = CLOCK()
+                            if query_done >= last_command_at+hard_limit_s:
                                 gate('readback_write_deadline')
+                            check_trial_end(query_done, end)
                     report['status'] = 'trial_ended'
                 except TrialEnd:
                     report['status'] = 'trial_ended'
