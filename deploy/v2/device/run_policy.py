@@ -13,6 +13,11 @@ from receiver import Receiver
 from session import Session, Phase
 
 
+CONFIG_KEYS = ('VEL_MAX', 'ACC_MAX', 'WDT_MS', 'WDT_DEC', 'X_MARGIN_UM',
+               'POLE_ZERO_URAD', 'POLE_INV', 'X_INV', 'STEP_LOSS_UM')
+CONFIG_QUERY_BYTES = tuple(f'CONFIG? {key}\n'.encode('ascii') for key in CONFIG_KEYS)
+
+
 class ControlTransport:
     """只允许查询、会话速度命令和禁用，拒绝ENABLE/配置/定位。"""
     def __init__(self, port):
@@ -30,7 +35,7 @@ class ControlTransport:
         return data
 
     def write(self, data):
-        if data not in (b'QUERY\n', b'CALIB?\n', b'CONFIG?\n', b'DISABLE\n'):
+        if data not in (b'QUERY\n', b'CALIB?\n', b'CONFIG?\n', b'DISABLE\n', *CONFIG_QUERY_BYTES):
             try:
                 line = data.decode('ascii')
                 value = int(line[4:-1])
@@ -58,13 +63,12 @@ class ReadbackCycle:
     groups = (
         ('QUERY', ()),
         ('CALIB?', ('CAL_STATE', 'CAL_LENGTH_UM', 'CAL_SAVED', 'CAL_STORAGE')),
-        ('CONFIG?', ('VEL_MAX', 'ACC_MAX', 'WDT_MS', 'WDT_DEC', 'X_MARGIN_UM',
-                     'POLE_ZERO_URAD', 'POLE_INV', 'X_INV', 'STEP_LOSS_UM')),
+        *((f'CONFIG? {key}', (key,)) for key in CONFIG_KEYS),
     )
 
     def __init__(self, transport, history, start):
         self.transport, self.history = transport, history
-        self.next_at, self.index, self.pending = start+.15, 0, None
+        self.next_at, self.index, self.pending = start+.05, 0, None
 
     def update(self, session, now):
         if self.pending is None:
@@ -94,7 +98,7 @@ class ReadbackCycle:
         if self.transport.write(data) != len(data):
             raise RuntimeError('readback_short_write')
         row.update(status='waiting', write_completed_clock_s=CLOCK())
-        self.next_at = now+.15
+        self.next_at = now+.05
         self.index = (self.index+1) % len(self.groups)
 
 
@@ -183,7 +187,7 @@ def main():
         policy.forward((0., 0., 0., 0.))
     # 外部权重初始化前后均核验；在运行期间不可改动导出文件。
     verified_files = verify_model_files(a.onnx, contract)
-    report = {'loop_interval_scope': 'new-observation decision ticks, not serial command completion', 'runner_revision': 3, 'readback_refresh': [], 'scheduler': 'wait-fresh', 'duplicate_tick_count': 0, 'verified_model_files': verified_files, 'status': 'starting', 'scope': '限时真机联调；不是硬实时或真机验收',
+    report = {'loop_interval_scope': 'new-observation decision ticks, not serial command completion', 'runner_revision': 4, 'readback_refresh': [], 'scheduler': 'wait-fresh', 'duplicate_tick_count': 0, 'verified_model_files': verified_files, 'status': 'starting', 'scope': '限时真机联调；不是硬实时或真机验收',
               'contract': contract, 'clock': vars(time.get_clock_info('perf_counter')),
               'requested_seconds': a.seconds, 'samples': [], 'motion_command_sent': False, 'motion_command_attempted': False}
     a.output.parent.mkdir(parents=True, exist_ok=True)
@@ -220,7 +224,9 @@ def main():
                     while CLOCK() < end:
                         if not receiver.poll() or session.failure:
                             raise RuntimeError(receiver.error or session.failure)
-                        if session.preflight_reason() is None:
+                        if (session.preflight_reason() is None
+                                and 'STEP_LOSS_UM' in session.values
+                                and not transport.partial and transport.in_waiting == 0):
                             break
                         time.sleep(.0002)
                     reason = session.preflight_reason()
@@ -228,6 +234,33 @@ def main():
                         raise RuntimeError('preflight:' + reason)
                     if session.values['CAL_LENGTH_UM'][0] != profile['measured']['calibrated_travel_um']:
                         raise RuntimeError('profile_travel_mismatch')
+                    if a.seconds > .5:
+                        # 老固件忽略带参数CONFIG?。运动前验证能力，不能在运动中才发现。
+                        # 初始整组（包括最后STEP_LOSS）已收齐，旧VEL_MAX不能满足新回执时间。
+                        stage = 'single_config_capability'
+                        if 'STEP_LOSS_UM' not in session.values:
+                            raise RuntimeError('initial_config_dump_incomplete')
+                        probe_at = CLOCK()
+                        probe = b'CONFIG? VEL_MAX\n'
+                        if transport.write(probe) != len(probe):
+                            raise RuntimeError('single_config_probe_write')
+                        while CLOCK()-probe_at < .2:
+                            if not receiver.poll() or session.failure:
+                                raise RuntimeError(receiver.error or session.failure)
+                            if CLOCK()-probe_at >= .2:
+                                raise RuntimeError('single_config_readback_unsupported_or_timeout')
+                            entry = session.values.get('VEL_MAX')
+                            if (entry and entry[1] > probe_at and entry[0] == limits.speed_mm_s
+                                    and not transport.partial and transport.in_waiting == 0):
+                                report['single_config_capability'] = {
+                                    'verified': True, 'response_s': CLOCK()-probe_at}
+                                break
+                            time.sleep(.0002)
+                        else:
+                            raise RuntimeError('single_config_readback_unsupported_or_timeout')
+                        reason = session.preflight_reason()
+                        if reason:
+                            raise RuntimeError('post_probe_preflight:' + reason)
                     report['initial_state_check'] = guard_snapshot(session.observation, starting=True)
                     reason = report['initial_state_check']['reason']
                     if reason:
