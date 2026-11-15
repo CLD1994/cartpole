@@ -3,8 +3,14 @@ from collections import deque
 from session import Phase
 
 
+class EventWaitTimeout(RuntimeError):
+    pass
+
+
 class StepLossProbe:
     def __init__(self):
+        self.expected_run_id = None
+        self.wait_started_at = None
         self.events = deque(maxlen=128)
         self.highest_event_id = 0
         self.highest_device_us = 0
@@ -28,6 +34,12 @@ class StepLossProbe:
         row = {'event_id': event, 'run_id': run, 'device_us': device_us,
                'host_received_clock_s': now, 'received_while_active': active,
                'disposition': 'duplicate_or_older'}
+        if self.expected_run_id is None or run != self.expected_run_id:
+            row['disposition'] = 'unverified_or_other_run'
+            self.events.append(row)
+            return
+        if active:
+            self.check_wait(now)
         if fresh:
             self.highest_event_id = event
             self.highest_device_us = device_us
@@ -36,6 +48,11 @@ class StepLossProbe:
                 row['disposition'] = 'trigger'
                 self.trigger = dict(row)
         self.events.append(row)
+
+    def check_wait(self, now):
+        if (self.trigger is None and self.wait_started_at is not None
+                and now >= self.wait_started_at + 120.):
+            raise EventWaitTimeout('event_wait_timeout')
 
     def phase(self, now):
         if self.trigger is None:
@@ -74,8 +91,20 @@ class StepLossEventMixin:
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.step_loss_probe = StepLossProbe()
+        self.run_query_pending = False
+        self.run_reply = None
 
     def receive(self, line):
+        if line.split()[:1] == ['RUN']:
+            words = line.split()
+            if (len(words) != 2 or not words[1].isascii() or not words[1].isdigit()
+                    or not 0 < int(words[1]) <= 2**32-1):
+                raise RuntimeError('malformed_run_reply')
+            if self.run_query_pending:
+                self.run_reply = int(words[1])
+                self.step_loss_probe.expected_run_id = self.run_reply
+                self.run_query_pending = False
+            return
         if line.split()[:1] != ['EVENT']:
             return super().receive(line)
         self.tick()
