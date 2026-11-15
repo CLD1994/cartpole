@@ -63,7 +63,6 @@ class RunnerTests(unittest.TestCase):
             bad={**c,key:value};path=Mock();path.read_text.return_value=json.dumps(bad)
             with self.assertRaisesRegex(ValueError,'single_action_contract_mismatch'):load_contract(path,'unused')
 
-if __name__=='__main__':unittest.main()
 
 class ExpiryCallsiteTests(unittest.TestCase):
     """执行运行器中的实际期限分支；外部传输/时钟为替身。"""
@@ -94,3 +93,5 @@ class ExpiryCallsiteTests(unittest.TestCase):
         with self.assertRaises(TrialEnd):self.run_nodes(node.body,5.)
         with self.assertRaisesRegex(RuntimeError,'readback_send_deadline'):self.run_nodes(node.body,5.006)
         self.run_nodes(node.body,4.999).send_if_due.assert_called_once_with(4.999,5.)
+
+if __name__=='__main__':unittest.main()
