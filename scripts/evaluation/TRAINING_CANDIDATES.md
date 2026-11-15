@@ -1,6 +1,6 @@
 # 训练候选保存与并行筛选
 
-统一分支 `feat/changqing-training-selection-integrated` 包含完整回合指标、
+统一分支 `feat/changqing-training-deployment-ready` 包含完整回合指标、
 训练中候选保存、可选续训学习率限制、三种任务及并行冻结策略评估。
 不需要在训练分支与筛选分支之间切换。功能只对新启动的进程生效，不修改正在运行的训练。
 
@@ -36,9 +36,9 @@
 $repo = 'C:\Users\cldus\workspace\cartpole'
 $tree = "C:\Users\cldus\workspace\cartpole-training-selection-$(Get-Date -Format yyyyMMdd-HHmmss)"
 $python = 'C:\Users\cldus\IsaacLab\.venv\Scripts\python.exe'
-git -C $repo fetch origin feat/changqing-training-selection-integrated
+git -C $repo fetch origin feat/changqing-training-deployment-ready
 if ($LASTEXITCODE -ne 0) { throw 'fetch 失败' }
-git -C $repo worktree add --detach $tree origin/feat/changqing-training-selection-integrated
+git -C $repo worktree add --detach $tree origin/feat/changqing-training-deployment-ready
 if ($LASTEXITCODE -ne 0) { throw '创建工作区失败' }
 Set-Location $tree
 $env:PYTHONPATH = "$tree\source\cartpole;$env:PYTHONPATH"
