@@ -74,3 +74,12 @@ class JointVelocityTrackingActionCfg(JointEffortActionCfg):
 
     effort_limit: float = 3.0
     """施加到关节的力上限 [N]；是待辨识的模型参数，不是实测电机推力。"""
+
+
+@configclass
+class JointVelocityAccelerationActionCfg(JointVelocityTrackingActionCfg):
+    """双动作：[归一化目标速度，归一化加速度幅值]。"""
+
+    class_type: str = "{DIR}.vel_acc_action:JointVelocityAccelerationAction"
+    acceleration_min: float = 0.1
+    acceleration_max: float = 9.0

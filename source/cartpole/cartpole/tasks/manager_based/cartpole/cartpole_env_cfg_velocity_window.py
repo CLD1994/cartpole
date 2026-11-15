@@ -35,3 +35,18 @@ class RealCartpoleV2Window16Tau0Acc9Hz400EnvCfg(RealCartpoleV2Window16Tau0EnvCfg
         self.actions.joint_effort.acc_max = 9.0
         # reset 随机化也必须遵守新上限，不能重新抽到 9–10 m/s²。
         self.events.randomize_tracking.params['acc_max_range'] = (8.0, 9.0)
+
+
+@configclass
+class RealCartpoleV2Window16Tau0Acc9Hz400DualEnvCfg(RealCartpoleV2Window16Tau0Acc9Hz400EnvCfg):
+    """只增加可学习加速度上限；保留固定上限基线的其他配置。"""
+
+    def __post_init__(self):
+        super().__post_init__()
+        from .mdp.vel_tracking_actions import JointVelocityAccelerationActionCfg
+        self.actions.joint_effort = JointVelocityAccelerationActionCfg(
+            **vars(self.actions.joint_effort)
+        )
+        self.actions.joint_effort.class_type = "{DIR}.vel_acc_action:JointVelocityAccelerationAction"
+        # 延迟解析，避免配置加载时提前导入 PhysX。
+        self.rewards.action_rate.func = f"{__package__}.mdp.vel_acc_action:velocity_action_rate_l2"
