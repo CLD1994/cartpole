@@ -365,7 +365,8 @@ def main():
     p.add_argument('--run-dir',type=Path,required=True)
     p.add_argument('--task',default='Hexchip-Cartpole-Real-V2-v0',
                    choices=['Hexchip-Cartpole-Real-V2-v0', 'Hexchip-Cartpole-Real-V2-Window16-v0',
-                            'Hexchip-Cartpole-Real-V2-Window16-Tau0-v0'],
+                            'Hexchip-Cartpole-Real-V2-Window16-Tau0-v0',
+                            'Hexchip-Cartpole-Real-V2-Window16-Tau0-Acc9-Hz400-v0'],
                    help='候选及holdout统一评估任务；必须显式匹配目标观测和执行器配置，默认保持旧任务')
     p.add_argument('--checkpoints',type=Path,nargs='+',help='显式候选；绕过训练日志提名')
     p.add_argument('--candidates',type=int,default=3,help='训练时段数；另保留最后保存的checkpoint')
