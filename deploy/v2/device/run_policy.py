@@ -66,6 +66,38 @@ class BoundSession(Session):
         return {**super().expected_readback, **self.coordinates}
 
 
+class DiagnosticTransport(ControlTransport):
+    """唯一真实写入出口仅允许只读查询；动作/禁用返回虚拟完成。"""
+    def write(self, data):
+        queries = (b'QUERY\n', b'CALIB?\n', b'CONFIG?\n', *CONFIG_QUERY_BYTES)
+        if data in queries:
+            return self.port.write(data)
+        if data == b'DISABLE\n':
+            return len(data)
+        try:
+            line = data.decode('ascii')
+            velocity = int(line[4:-1])
+            if line == f'VEL {velocity}\n' and abs(velocity) <= 1250:
+                return len(data)
+        except (ValueError, UnicodeError):
+            pass
+        raise ValueError('diagnostic_write_rejected')
+
+
+class DiagnosticSession(BoundSession):
+    required_active_mode = ('DISABLED', 'NONE')
+
+    def receive(self, line):
+        super().receive(line)
+        if line.split()[:1] == ['STATE'] and hasattr(self, 'diagnostic_state_events'):
+            self.diagnostic_state_events.append({'host_parsed_clock_s': CLOCK(),
+                'valid': self.observation is not None, 'phase': self.phase.value})
+
+
+class DiagnosticEnd(Exception):
+    pass
+
+
 class ReadbackCycle:
     """单组在途的只读刷新；跨控制周期收齐回执，绝不伪造TTL。"""
     groups = (
@@ -179,12 +211,13 @@ def main():
     p.add_argument('--contract', required=True, type=Path)
     p.add_argument('--output', required=True, type=Path)
     p.add_argument('--seconds', type=float, default=.5)
+    p.add_argument('--diagnostic-timing', action='store_true', help='DISABLED只读同路径诊断；时序/物理门仅记录，真实故障退出')
     p.add_argument('--start-confirmed', action='store_true', help='现场明确请求本次运动；绝不自动使能')
     a = p.parse_args()
-    if not a.start_confirmed:
+    if not a.diagnostic_timing and not a.start_confirmed:
         p.error('需要现场明确 --start-confirmed；只读诊断请用 shadow.py')
-    if not math.isfinite(a.seconds) or not 0 < a.seconds <= 5.:
-        p.error('--seconds 必须在(0,5]' )
+    if not math.isfinite(a.seconds) or not 0 < a.seconds <= (10. if a.diagnostic_timing else 5.):
+        p.error('--seconds 运动在(0,5]，只读诊断在(0,10]' )
     contract = load_contract(a.contract, a.onnx)
     profile = json.loads(PROFILE.read_text(encoding='utf-8'))
     limits = limits_from_profile(profile)
@@ -195,15 +228,27 @@ def main():
         policy.forward((0., 0., 0., 0.))
     # 外部权重初始化前后均核验；在运行期间不可改动导出文件。
     verified_files = verify_model_files(a.onnx, contract)
-    report = {'loop_interval_scope': 'new-observation decision ticks, not serial command completion', 'runner_revision': 6, 'stale_observation_waits': 0, 'max_stale_observation_age_s': 0., 'grid_slots_skipped': 0, 'over_period_late_candidates': 0, 'readback_refresh': [], 'scheduler': 'absolute-grid-wait-fresh', 'duplicate_tick_count': 0, 'verified_model_files': verified_files, 'status': 'starting', 'scope': '限时真机联调；不是硬实时或真机验收',
+    report = {'loop_interval_scope': 'new-observation decision ticks, not serial command completion', 'runner_revision': 7, 'diagnostic_timing': a.diagnostic_timing, 'stale_observation_waits': 0, 'max_stale_observation_age_s': 0., 'grid_slots_skipped': 0, 'over_period_late_candidates': 0, 'readback_refresh': [], 'scheduler': 'absolute-grid-wait-fresh', 'duplicate_tick_count': 0, 'verified_model_files': verified_files, 'status': 'starting', 'scope': '限时真机联调；不是硬实时或真机验收',
               'contract': contract, 'clock': vars(time.get_clock_info('perf_counter')),
-              'requested_seconds': a.seconds, 'samples': [], 'motion_command_sent': False, 'motion_command_attempted': False}
+              'requested_seconds': a.seconds, 'samples': [], 'received_states': [], 'inference_attempts_s': [], 'would_stop_count_scope': 'gate invocation counts, not independent faults or failed cycles', 'would_stop': {}, 'virtual_command_attempted': False, 'motion_command_sent': False, 'motion_command_attempted': False}
+    if a.diagnostic_timing:
+        report['scope'] = 'DISABLED同路径只读诊断；虚拟命令完成不包含真实串口动作写入/设备运动负载'
+        report['diagnostic_differences'] = ['仅查询真实写入；VEL/DISABLE虚拟完成',
+            '模式门要求DISABLED，物理门及时间超限记录后继续，不代表运动可以继续',
+            'FAULT/速度失效/坏帧/元数据过期/接收器错误仍退出',
+            '超限后的样本是反事实延续；真实runner会在首次超限停止']
+    def gate(reason):
+        if not a.diagnostic_timing:
+            raise RuntimeError(reason)
+        row = report['would_stop'].setdefault(reason, {'count': 0, 'first_clock_s': CLOCK(), 'last_clock_s': None})
+        row['count'] += 1
+        row['last_clock_s'] = CLOCK()
     a.output.parent.mkdir(parents=True, exist_ok=True)
     with a.output.open('x', encoding='utf-8') as output:
         session = receiver = None
         intervals = []
         stage = 'startup'
-        start = last_command_at = next_tick = next_slot = None
+        start = end = last_command_at = next_tick = next_slot = None
         drain = refresh = None
         import serial
         port = serial.Serial(port=None, baudrate=profile['measured']['protocol_baud'], timeout=0, write_timeout=.002)
@@ -213,8 +258,10 @@ def main():
             with port:
                 try:
                     port.reset_input_buffer()
-                    transport = ControlTransport(port)
-                    session = BoundSession(transport, CLOCK, limits, contract['firmware_coordinates'])
+                    transport = (DiagnosticTransport if a.diagnostic_timing else ControlTransport)(port)
+                    session = (DiagnosticSession if a.diagnostic_timing else BoundSession)(transport, CLOCK, limits, contract['firmware_coordinates'])
+                    if a.diagnostic_timing:
+                        session.diagnostic_state_events = report['received_states']
                     receiver = Receiver(transport, session, CLOCK)
                     # 与固件tools一致：先对齐持续遥测行，再发请求，避免丢查询回执。
                     align_end = CLOCK()+.5
@@ -272,9 +319,9 @@ def main():
                     report['initial_state_check'] = guard_snapshot(session.observation, starting=True)
                     reason = report['initial_state_check']['reason']
                     if reason:
-                        raise RuntimeError(reason)
+                        gate(reason)
                     if braking_reason(session, 0):
-                        raise RuntimeError('initial_braking_envelope')
+                        gate('initial_braking_envelope')
                     if transport.partial or transport.in_waiting:
                         raise RuntimeError('preflight_receive_incomplete')
                     session.start()
@@ -300,7 +347,7 @@ def main():
                             refresh.update(session, now)
                         stage = 'gap_check'
                         if now-last_command_at > .004:
-                            raise RuntimeError('command_gap_deadline')
+                            gate('command_gap_deadline')
                         if now_ns < next_tick_ns:
                             stage = 'wait_tick'
                             time.sleep(min(.0002, next_tick-now))
@@ -315,7 +362,7 @@ def main():
                         reason = state_guard(obs)
                         if reason:
                             report['failed_state_check'] = guard_snapshot(obs)
-                            raise RuntimeError(reason)
+                            gate(reason)
                         if now-obs.received_at > .004:
                             # 尚无推理候选：不用旧缓存，只消耗既有命令预算等新有效帧。
                             # ACTIVE的FAULT/VEL_VALID/metadata失效仍由每次poll立即锁存。
@@ -325,8 +372,8 @@ def main():
                                 report['max_stale_observation_age_s'], now-obs.received_at)
                             remaining = min(last_command_at+.004, end)-CLOCK()
                             if remaining <= 0:
-                                raise RuntimeError('wait_fresh_command_deadline')
-                            time.sleep(min(.0001, remaining))
+                                gate('wait_fresh_command_deadline')
+                            time.sleep(min(.0001, remaining) if remaining > 0 else .0001)
                             continue
                         if obs.received_at == last_sample:
                             report['duplicate_tick_count'] += 1
@@ -345,25 +392,32 @@ def main():
                         reason = state_guard(obs)
                         if reason:
                             report['failed_state_check'] = guard_snapshot(obs)
-                            raise RuntimeError(reason)
+                            gate(reason)
                         last_sample = obs.received_at
                         x, th, vx, w = obs.si()
                         stage = 'inference'
                         begin = CLOCK()
                         if begin >= min(last_command_at+.004, obs.received_at+.004, end):
-                            raise RuntimeError('candidate_deadline')
+                            gate('candidate_deadline')
+                            if a.diagnostic_timing and begin >= obs.received_at+.004:
+                                continue
                         raw = policy.forward((x, contract['angle_sign']*th, vx, contract['angle_sign']*w))
                         inference_s = CLOCK()-begin
+                        report['inference_attempts_s'].append(inference_s)
                         if CLOCK()-obs.received_at > .004 or CLOCK()-now > .002:
-                            raise RuntimeError('inference_deadline')
+                            gate('inference_deadline')
+                            if a.diagnostic_timing and CLOCK() >= obs.received_at+.004:
+                                continue
                         # 分片/新字节可在poll末尾到达；仅在固定原始截止内补收。
                         stage = 'precommand_receive'
                         receive_deadline = min(last_command_at+.004, obs.received_at+.004, end)
                         drain = {'deadline_clock_s': receive_deadline, 'polls': 0,
                                  'wait_s': 0., 'started_clock_s': CLOCK()}
                         while True:
+                            if a.diagnostic_timing and CLOCK() >= end:
+                                raise DiagnosticEnd()
                             if CLOCK() >= receive_deadline:
-                                raise RuntimeError('precommand_receive_deadline')
+                                gate('precommand_receive_deadline')
                             if transport.in_waiting > 128:
                                 raise RuntimeError('precommand_backlog')
                             if not receiver.poll() or session.phase != Phase.ACTIVE:
@@ -374,12 +428,14 @@ def main():
                             latest = session.observation
                             if latest is None or state_guard(latest):
                                 report['failed_state_check'] = guard_snapshot(latest)
-                                raise RuntimeError('latest_state_limit')
+                                if latest is None:
+                                    raise RuntimeError('latest_state_missing')
+                                gate('latest_state_limit')
                             pending = transport.in_waiting
                             drain.update(pending_bytes=pending, partial=transport.partial,
                                          elapsed_s=CLOCK()-drain['started_clock_s'])
                             if CLOCK() >= receive_deadline:
-                                raise RuntimeError('precommand_receive_deadline')
+                                gate('precommand_receive_deadline')
                             if pending > 128:
                                 raise RuntimeError('precommand_backlog')
                             drain['readback_in_flight'] = bool(refresh and refresh.pending)
@@ -387,28 +443,33 @@ def main():
                                 break
                             if pending == 0:
                                 begin = CLOCK()
-                                time.sleep(min(.0001, max(0., receive_deadline-begin)))
+                                time.sleep(min(.0001, max(0., receive_deadline-begin)) if begin < receive_deadline else .0001)
                                 drain['wait_s'] += CLOCK()-begin
                         action = max(-1., min(1., raw))
                         # 向上取整绝对目标速度，覆盖Session整数化后的大小。
                         planned_speed = math.ceil(abs(action) * limits.speed_mm_s)
                         stage = 'braking_guard'
                         if braking_reason(session, planned_speed):
-                            raise RuntimeError('braking_envelope')
+                            gate('braking_envelope')
                         stage = 'prewrite'
                         if CLOCK() >= receive_deadline:
-                            raise RuntimeError('prewrite_fixed_deadline')
-                        report['motion_command_attempted'] = True
+                            gate('prewrite_fixed_deadline')
+                            if a.diagnostic_timing and CLOCK() >= obs.received_at+.004:
+                                continue
+                        report['virtual_command_attempted' if a.diagnostic_timing else 'motion_command_attempted'] = True
                         velocity = session.command(action)
                         completed_ns = time.perf_counter_ns()
                         completed_at = completed_ns / 1e9
                         command_gap = completed_at-last_command_at
                         last_command_at = completed_at
-                        report['motion_command_sent'] = True
+                        if not a.diagnostic_timing:
+                            report['motion_command_sent'] = True
                         report['samples'].append({'elapsed_s': CLOCK()-start, 'state_si': obs.si(),
                                                   'raw_action': raw, 'velocity_mm_s': velocity,
                                                   'inference_s': inference_s,
                                                   'command_gap_s': command_gap,
+                                                  'observation_received_clock_s': obs.received_at,
+                                                  'observation_host_age_s': completed_at-obs.received_at,
                                                   'grid_slot': candidate_slot,
                                                   'grid_due_clock_s': candidate_due_ns/1e9,
                                                   'grid_lateness_s': grid_lateness_s,
@@ -416,7 +477,7 @@ def main():
                                                   'readback_in_flight': dict(refresh.pending) if refresh and refresh.pending else None})
                         stage = 'write_completion'
                         if completed_at >= receive_deadline:
-                            raise RuntimeError('write_completion_deadline')
+                            gate('write_completion_deadline')
                         # 成功写入且通过硬截止后才推进；短间隔相位恢复并非固定周期保证。
                         next_slot = next_grid_slot(candidate_slot, grid_start_ns, completed_ns)
                         skipped = next_slot-candidate_slot-1
@@ -429,10 +490,12 @@ def main():
                             stage = 'readback_query'
                             query_at = CLOCK()
                             if query_at >= min(last_command_at+.004, end):
-                                raise RuntimeError('readback_send_deadline')
+                                gate('readback_send_deadline')
                             refresh.send_if_due(query_at, end)
                             if CLOCK() >= min(last_command_at+.004, end):
-                                raise RuntimeError('readback_write_deadline')
+                                gate('readback_write_deadline')
+                    report['status'] = 'trial_ended'
+                except DiagnosticEnd:
                     report['status'] = 'trial_ended'
                 except KeyboardInterrupt:
                     report['status'] = 'interrupted'
@@ -453,7 +516,7 @@ def main():
                         'precommand_receive': drain,
                         'readback_in_flight': dict(refresh.pending) if refresh and refresh.pending else None}
                 finally:
-                    if session is not None and (session.phase in (Phase.ACTIVE, Phase.STOPPING)
+                    if not a.diagnostic_timing and session is not None and (session.phase in (Phase.ACTIVE, Phase.STOPPING)
                                                 or session.mode == ('READY', 'NONE')):
                         report['safe_stop_requested'] = True
                         session.stop()
@@ -479,18 +542,30 @@ def main():
             report['status'] = 'error'
             report['outer_error'] = f'{type(exc).__name__}: {exc}'
         finally:
+            report['received_state_count'] = len(report['received_states']) if a.diagnostic_timing else None
+            report['received_state_scope'] = 'all parsed STATE lines including startup; host time, not device sampling time' if a.diagnostic_timing else 'not_recorded'
+            measured_states = [r for r in report['received_states'] if start is not None and end is not None and start <= r['host_parsed_clock_s'] < end and r['valid'] and r['phase'] == 'active']
+            report['received_state_measurement_count'] = len(measured_states) if a.diagnostic_timing else None
+            report['received_state_host_gap_s'] = summary([b['host_parsed_clock_s']-a['host_parsed_clock_s'] for a,b in zip(measured_states,measured_states[1:])])
+            report['received_state_gap_scope'] = 'valid ACTIVE STATE parses in measurement window; not device sample/wire arrival timing' if a.diagnostic_timing else 'not_recorded'
             report['loop_interval_s'] = summary(intervals)
+            report['completion_gap_s'] = summary([r['command_gap_s'] for r in report['samples']])
+            report['completion_gap_scope'] = 'virtual_no_action_write' if a.diagnostic_timing else 'actual_host_write_completion'
+            report['completion_gaps_over_4ms'] = sum(r['command_gap_s'] > .004 for r in report['samples'])
+            report['inference_s'] = summary(report['inference_attempts_s'])
+            report['inference_scope'] = 'all measured policy.forward attempts including discarded candidates; excludes warmup'
+            report['completed_candidate_inference_s'] = summary([r['inference_s'] for r in report['samples']])
             report['disabled_confirmed'] = bool(session and session.disabled_confirmed)
             report['last_observed_firmware_mode'] = session.mode if session else None
             report['stop_unconfirmed'] = bool((report['motion_command_attempted']
                 or report.get('safe_stop_requested')) and not report['disabled_confirmed'])
             report['session_failure'] = session.failure if session else None
             report['receive_error'] = receiver.error if receiver else None
-            report['status'] = ('complete' if report['status'] == 'trial_ended' and report['samples'] and report['disabled_confirmed']
+            report['status'] = ('complete' if report['status'] == 'trial_ended' and report['samples'] and (report['disabled_confirmed'] or a.diagnostic_timing)
                                 and not report['session_failure'] and not report['receive_error'] else report['status'])
             json.dump(report, output, ensure_ascii=False, indent=2)
             output.write('\n')
-    print(json.dumps({k:v for k,v in report.items() if k != 'samples'}, ensure_ascii=False, indent=2))
+    print(json.dumps({k:v for k,v in report.items() if k not in ('samples', 'received_states', 'inference_attempts_s')}, ensure_ascii=False, indent=2))
     return 0 if report['status'] == 'complete' else 1
 
 
