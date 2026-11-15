@@ -15,7 +15,8 @@ class EntrypointsTest(unittest.TestCase):
                 args = ["--task", "Hexchip-Cartpole-Real-V2-v0", "--viz", "none", "env.seed=42"]
                 original = args.copy()
                 self.assertEqual(entrypoint(args, run_cli=dispatch), 7)
-                self.assertEqual(calls, [["--rl_library", "rsl_rl", *original]])
+                prefix = ["--rl_library", "rsl_rl"] if entrypoint is play.main else []
+                self.assertEqual(calls, [[*prefix, *original]])
                 self.assertEqual(args, original)
 
     def test_help_is_forwarded_without_training(self):
@@ -24,7 +25,7 @@ class EntrypointsTest(unittest.TestCase):
             calls.append(args)
             return 0
         self.assertEqual(train.main(["--help"], run_cli=dispatch), 0)
-        self.assertEqual(calls, [["--rl_library", "rsl_rl", "--help"]])
+        self.assertEqual(calls, [["--help"]])
 
     def test_play_forwards_checkpoint_and_visualizer(self):
         calls = []
@@ -41,7 +42,7 @@ class EntrypointsTest(unittest.TestCase):
             calls.append(args)
             return 2
         self.assertEqual(train.main(["--headless"], run_cli=dispatch), 2)
-        self.assertEqual(calls, [["--rl_library", "rsl_rl", "--headless"]])
+        self.assertEqual(calls, [["--headless"]])
 
 
 if __name__ == "__main__":
