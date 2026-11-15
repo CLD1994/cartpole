@@ -15,6 +15,14 @@ from session import Session, Phase
 
 CONFIG_KEYS = ('VEL_MAX', 'ACC_MAX', 'WDT_MS', 'WDT_DEC', 'X_MARGIN_UM',
                'POLE_ZERO_URAD', 'POLE_INV', 'X_INV', 'STEP_LOSS_UM')
+GRID_PERIOD_NS = 2_000_000
+
+
+def next_grid_slot(slot, start_ns, completed_ns):
+    # 只指向严格未来栅格；不循环补发已错过的slot。
+    return max(slot + 1, (completed_ns-start_ns)//GRID_PERIOD_NS + 1)
+
+
 CONFIG_QUERY_BYTES = tuple(f'CONFIG? {key}\n'.encode('ascii') for key in CONFIG_KEYS)
 
 
@@ -187,7 +195,7 @@ def main():
         policy.forward((0., 0., 0., 0.))
     # 外部权重初始化前后均核验；在运行期间不可改动导出文件。
     verified_files = verify_model_files(a.onnx, contract)
-    report = {'loop_interval_scope': 'new-observation decision ticks, not serial command completion', 'runner_revision': 4, 'readback_refresh': [], 'scheduler': 'wait-fresh', 'duplicate_tick_count': 0, 'verified_model_files': verified_files, 'status': 'starting', 'scope': '限时真机联调；不是硬实时或真机验收',
+    report = {'loop_interval_scope': 'new-observation decision ticks, not serial command completion', 'runner_revision': 5, 'grid_slots_skipped': 0, 'over_period_late_candidates': 0, 'readback_refresh': [], 'scheduler': 'absolute-grid-wait-fresh', 'duplicate_tick_count': 0, 'verified_model_files': verified_files, 'status': 'starting', 'scope': '限时真机联调；不是硬实时或真机验收',
               'contract': contract, 'clock': vars(time.get_clock_info('perf_counter')),
               'requested_seconds': a.seconds, 'samples': [], 'motion_command_sent': False, 'motion_command_attempted': False}
     a.output.parent.mkdir(parents=True, exist_ok=True)
@@ -195,7 +203,7 @@ def main():
         session = receiver = None
         intervals = []
         stage = 'startup'
-        start = last_command_at = next_tick = None
+        start = last_command_at = next_tick = next_slot = None
         drain = refresh = None
         import serial
         port = serial.Serial(port=None, baudrate=profile['measured']['protocol_baud'], timeout=0, write_timeout=.002)
@@ -270,7 +278,10 @@ def main():
                     if transport.partial or transport.in_waiting:
                         raise RuntimeError('preflight_receive_incomplete')
                     session.start()
-                    start = next_tick = CLOCK()
+                    grid_start_ns = time.perf_counter_ns()
+                    start = next_tick = grid_start_ns / 1e9
+                    next_slot = 0
+                    next_tick_ns = grid_start_ns
                     end = start + a.seconds
                     last_tick = last_sample = None
                     last_command_at = start
@@ -283,19 +294,19 @@ def main():
                             raise RuntimeError('active_backlog')
                         if not receiver.poll() or session.phase != Phase.ACTIVE:
                             raise RuntimeError(receiver.error or session.failure or 'session_inactive')
-                        now = CLOCK()
+                        now_ns = time.perf_counter_ns()
+                        now = now_ns / 1e9
                         if refresh:
                             refresh.update(session, now)
                         stage = 'gap_check'
                         if now-last_command_at > .004:
                             raise RuntimeError('command_gap_deadline')
-                        if now < next_tick:
+                        if now_ns < next_tick_ns:
                             stage = 'wait_tick'
                             time.sleep(min(.0002, next_tick-now))
                             continue
                         stage = 'tick'
-                        if now-next_tick > .002:
-                            raise RuntimeError('control_deadline')
+                        # 栅格迟到仅记录；实际命令/原观测4ms仍为硬停止条件。
                         obs = session.observation
                         if obs is None or now-obs.received_at > .004:
                             raise RuntimeError('observation_late')
@@ -307,8 +318,11 @@ def main():
                         if last_tick is not None:
                             intervals.append(now-last_tick)
                         last_tick = now
-                        # 仅新观测消耗一个调度点；重复观测等待期间不推进截止。
-                        next_tick = now + .002
+                        candidate_slot = next_slot
+                        candidate_due_ns = next_tick_ns
+                        grid_lateness_s = (now_ns-candidate_due_ns)/1e9
+                        if now_ns-candidate_due_ns > GRID_PERIOD_NS:
+                            report['over_period_late_candidates'] += 1
                         stage = 'state_guard'
                         reason = state_guard(obs)
                         if reason:
@@ -366,7 +380,8 @@ def main():
                             raise RuntimeError('prewrite_fixed_deadline')
                         report['motion_command_attempted'] = True
                         velocity = session.command(action)
-                        completed_at = CLOCK()
+                        completed_ns = time.perf_counter_ns()
+                        completed_at = completed_ns / 1e9
                         command_gap = completed_at-last_command_at
                         last_command_at = completed_at
                         report['motion_command_sent'] = True
@@ -374,11 +389,21 @@ def main():
                                                   'raw_action': raw, 'velocity_mm_s': velocity,
                                                   'inference_s': inference_s,
                                                   'command_gap_s': command_gap,
+                                                  'grid_slot': candidate_slot,
+                                                  'grid_due_clock_s': candidate_due_ns/1e9,
+                                                  'grid_lateness_s': grid_lateness_s,
                                                   'precommand_receive': drain,
                                                   'readback_in_flight': dict(refresh.pending) if refresh and refresh.pending else None})
                         stage = 'write_completion'
                         if completed_at >= receive_deadline:
                             raise RuntimeError('write_completion_deadline')
+                        # 成功写入且通过硬截止后才推进；短间隔相位恢复并非固定周期保证。
+                        next_slot = next_grid_slot(candidate_slot, grid_start_ns, completed_ns)
+                        skipped = next_slot-candidate_slot-1
+                        report['grid_slots_skipped'] += skipped
+                        report['samples'][-1]['skipped_following_slots'] = skipped
+                        next_tick_ns = grid_start_ns + next_slot*GRID_PERIOD_NS
+                        next_tick = next_tick_ns/1e9
                         if refresh:
                             # 已成功写入新速度后才安排单条只读查询，不与其他查询叠加。
                             stage = 'readback_query'
@@ -401,6 +426,8 @@ def main():
                         'elapsed_s': failed_at-start if start is not None else None,
                         'actual_command_gap_s': failed_at-last_command_at if last_command_at is not None else None,
                         'last_command_clock_s': last_command_at, 'next_tick_clock_s': next_tick,
+                        'grid_slot': next_slot,
+                        'grid_lateness_s': failed_at-next_tick if next_tick is not None else None,
                         'observation_received_clock_s': failed_obs.received_at if failed_obs else None,
                         'host_observation_age_s': failed_at-failed_obs.received_at if failed_obs else None,
                         'precommand_receive': drain,
