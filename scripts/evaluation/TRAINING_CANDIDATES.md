@@ -1,81 +1,104 @@
-# Training-metric candidate checkpoints
+# 训练候选保存与并行筛选
 
-Opt-in `--training-candidates`, for NEW training or explicit checkpoint resume.
-It cannot attach to an already running Python process. This branch includes the
-original V2, Window16, Window16-Tau0 tasks and optional low-LR resume guard.
+统一分支 `feat/changqing-training-selection-integrated` 包含完整回合指标、
+训练中候选保存、可选续训学习率限制、三种任务及并行冻结策略评估。
+不需要在训练分支与筛选分支之间切换。功能只对新启动的进程生效，不修改正在运行的训练。
 
-Every iteration after logging, consider the last 100 rollout summaries. Require
-at least 256 completed non-partial episodes. Rank by total successes / total
-completed (not average of percentages), then Mean episode length, then Mean reward;
-keep the earlier checkpoint on an exact tie. Keep the top 3 and replace only
-generated candidate files. Ordinary periodic checkpoints are never removed.
-Default candidate interval is 1, so no eligible iteration is skipped. Candidates
-can be adjacent and windows overlap; they are not independent trials.
+## 训练中保留候选
 
-Success-rate scope: complete episodes ending in the last 100 rollouts, excluding
-initial randomized partial episodes. Length/reward scope: official logger's last
-100 ended episodes (possibly initial partial episodes), exactly the console values.
-These are different windows, explicitly recorded; secondary metrics are tie-breaks
-only. Episodes themselves can span several changing policies. Values do NOT measure
-one frozen checkpoint. Saves occur AFTER the triggering PPO update (the training
-rollout preceded that update), include actor/critic/Adam state, and record this
-relationship in infos and metadata. This is NOT a claim of best deployment policy.
-Final candidates need common fixed-policy evaluation.
+训练加 `--training-candidates` 后，每轮更新并记录日志后检查最近 100 个 rollout
+（采样批次）的完整回合。至少累计 256 个完整回合才参与排名。首先比较
+`sum(successes) / sum(completed)`，相同则比较控制台 `Mean episode length`、
+`Mean reward`，仍相同保留较早轮次。默认保留前三名，不限于 50 的整数倍。
+候选替换只删除本功能生成的候选文件，不删除周期检查点。
 
-Outputs in the new run's `training-candidates/`:
-- `candidates.json`: ranked top 3, counts, metric scopes, window iteration range,
-  checkpoint paths, and best_checkpoint (null before sufficient evidence).
-- `candidate-history.jsonl`: save/eviction history.
-- `candidate_<iteration>.pt`: resumable full checkpoints.
-On normal end: `TRAINING_METRIC_BEST <path>`. Interrupted runs may retain status
-running; this does not invalidate earlier candidate files. Standard output and
-training-checkpoints.jsonl also record candidate saves. Extra disk I/O occurs
-when rankings improve; do not use this run for throughput benchmarking.
+成功率统计排除起始随机截断回合；长度与奖励来自官方日志最近 100 个结束回合，
+可能包含起始部分回合。这是两个不同窗口，长度与奖励仅用于同成功率下排序。
+训练回合可能跨多次策略更新，触发指标来自更新前采样，候选保存的是该轮更新后
+策略、价值网络和优化器状态。因此训练指标候选不是冻结策略评估冠军，更不是真机验收。
+候选窗口可以重叠、轮次可以相邻，不能视为独立试验。
+
+产物位于每个新训练目录的 `training-candidates/`：
+
+- `candidates.json`：保留的候选、排序指标、统计范围和当前训练指标首选。
+- `candidate-history.jsonl`：保存与淘汰历史。
+- `candidate_<iteration>.pt`：可续训的完整检查点。
+
+`training-checkpoints.jsonl` 同时记录候选保存事件，筛选器用它关联原始回合计数。
+正常结束输出 `TRAINING_METRIC_BEST`。每次续训重新累计窗口，不继承旧训练统计。
+当前候选功能仅支持单进程训练；不能将额外候选保存 I/O 当作吞吐性能基准。
+
+## 在一个独立工作区使用完整流程
+
+以下训练命令仅供新实验使用，不要为了启用此功能重启已有实验。
 
 ```powershell
-Set-Location C:\Users\cldus\workspace\cartpole
-git fetch origin
-git worktree add ..\cartpole-training-candidates origin/feat/changqing-training-candidates
-Set-Location ..\cartpole-training-candidates
-$env:PYTHONPATH = "$($PWD.Path)\source\cartpole;$env:PYTHONPATH"
+$repo = 'C:\Users\cldus\workspace\cartpole'
+$tree = "C:\Users\cldus\workspace\cartpole-training-selection-$(Get-Date -Format yyyyMMdd-HHmmss)"
 $python = 'C:\Users\cldus\IsaacLab\.venv\Scripts\python.exe'
-& $python -c "import importlib.util; print(importlib.util.find_spec('cartpole').origin)"
-# Example NEW run, NOT a command to restart currently running experiments:
-& $python .\scripts\rsl_rl\train.py --task Hexchip-Cartpole-Real-V2-Window16-Tau0-v0 --num_envs 512 --max_iterations 2000 --run_name scratch_window16_tau0_candidates --viz none --device cuda:0 --training-candidates 2>&1 | Tee-Object .\train-candidates.log
+git -C $repo fetch origin feat/changqing-training-selection-integrated
+if ($LASTEXITCODE -ne 0) { throw 'fetch 失败' }
+git -C $repo worktree add --detach $tree origin/feat/changqing-training-selection-integrated
+if ($LASTEXITCODE -ne 0) { throw '创建工作区失败' }
+Set-Location $tree
+$env:PYTHONPATH = "$tree\source\cartpole;$env:PYTHONPATH"
+$env:PYTHONIOENCODING = 'utf-8'
+& $python .\scripts\rsl_rl\train.py `
+    --task Hexchip-Cartpole-Real-V2-Window16-Tau0-v0 `
+    --num_envs 512 --max_iterations 2000 `
+    --run_name scratch_window16_tau0_candidates `
+    --viz none --device cuda:0 --training-candidates
+if ($LASTEXITCODE -ne 0) { throw '训练未正常完成，请先检查日志' }
 ```
 
-To resume instead, add `--checkpoint 'ABSOLUTE_CHECKPOINT_PATH'`; max_iterations
-then means additional iterations. To replicate the low-LR Window16 experiment,
-choose `Hexchip-Cartpole-Real-V2-Window16-v0`, supply the original model1050 path,
-and add `--resume-learning-rate 0.0003 --adaptive-lr-max 0.001`.
-Do not choose tau0 when replicating the original-tau Window16 group.
-Candidate history starts fresh on each new run; it does not import prior windows.
-Settings: `--candidate-window 100 --candidate-min-episodes 256 --candidate-keep 3`.
-Single-process only. No Isaac training was run in the delivery environment.
+可调参数：`--candidate-window 100 --candidate-min-episodes 256 --candidate-keep 3
+--candidate-interval 1`。默认 interval=1，不跳过符合条件的轮次。
+续训时额外传 `--checkpoint '绝对检查点路径'`；`--max_iterations` 表示追加轮次。
+可选低学习率续训同时传 `--resume-learning-rate 0.0003 --adaptive-lr-max 0.001`，
+要求恢复优化器状态。它不会默认应用到从头训练。
 
-## Selection compatibility
+## 训练结束后并行评估
 
-Use branch `fix/changqing-candidate-selector` for the integrated selector. It
-inherits training candidates + the low-LR guard + all three task registrations.
-It includes selection-task-contract (`c4abf2d`) so `--task` is passed to BOTH
-selection and holdout and verified in reports.
-
-Permitted model layouts are only `<run>/model_<iteration>.pt` and
-`<run>/training-candidates/candidate_<iteration>.pt`, after resolving symlinks.
-The saved `iter` must match the filename. Historical save records for evicted
-candidate files remain valid but missing files are not evaluated. Periodic and
-candidate checkpoints may share an iteration; each uses a distinct result folder.
-Automatic nomination additionally includes all retained candidate files; it may
-therefore evaluate more than the requested temporal-group count. `--checkpoints`
-can explicitly choose either permitted file kind without reading training logs.
+`$runDir` 指向已经结束的、包含训练日志和检查点的具体运行目录。
+它可以位于其他工作区；不要指向 `cartpole_real_v2` 父目录。
+存在训练候选时，筛选器要求 manifest 状态为 `complete` 且文件清单一致；
+缺失记录、运行中或中断状态不参与筛选。此检查不替代确认原训练进程已经退出。
 
 ```powershell
-# In the new selector worktree; run directory belongs to an already FINISHED run.
-$run = 'ABSOLUTE_FINISHED_TRAINING_RUN_DIRECTORY'
-& $python .\scripts\evaluation\select_checkpoint.py --run-dir $run --task Hexchip-Cartpole-Real-V2-Window16-Tau0-v0 --num_envs 32 --device cuda:0
-# Or explicitly evaluate only the saved training shortlist:
-$chosen = @((Get-Content "$run\training-candidates\candidates.json" -Raw | ConvertFrom-Json).candidates | ForEach-Object { $_.checkpoint })
-& $python .\scripts\evaluation\select_checkpoint.py --run-dir $run --task Hexchip-Cartpole-Real-V2-Window16-Tau0-v0 --checkpoints $chosen --num_envs 32 --device cuda:0
+$runDir = '替换为已经结束的具体训练运行目录绝对路径'
+& $python .\scripts\evaluation\select_checkpoint.py `
+    --run-dir $runDir `
+    --task Hexchip-Cartpole-Real-V2-Window16-Tau0-v0 `
+    --parallel-workers 4 --candidates 3 --window 20 `
+    --num_envs 32 --seeds 73117 73123 --holdout-seeds 83117 83123 `
+    --device cuda:0 --output-dir .\logs\checkpoint-selection
 ```
-For original-tau Window16 choose `Hexchip-Cartpole-Real-V2-Window16-v0` instead.
-This does not modify checkpoints or already running training processes.
+
+自动提名包含三个训练时段候选、末检查点，以及所有仍保留的训练指标候选，
+去重后可能超过四个。`--parallel-workers 4` 仅限制同时评估数，其余排队。
+每候选输出与日志独立；默认不传此参数仍串行。所有候选成功且配置一致后才排名，
+随后只有赢家执行独立 holdout；任一评估失败不会产生完整成功报告。
+holdout 是复核，不参与重新选冠军，也未设置自动真机放行门槛。
+多个进程共享 GPU，显存足够不保证更快，争用或显存不足时降到 2 或 1。
+详见 `docs/training-episode-metrics.md` 的并行取消及进程清理边界。
+
+若只想评估训练保留的前三名，可在上面的命令增加 `--checkpoints $chosen`：
+
+```powershell
+$manifest = Get-Content (Join-Path $runDir 'training-candidates\candidates.json') -Raw | ConvertFrom-Json
+$chosen = @($manifest.candidates | ForEach-Object { $_.checkpoint })
+if ($chosen.Count -eq 0) { throw '没有符合统计条件的训练候选；请使用自动提名周期检查点' }
+```
+
+允许的文件布局仅为 `<run>/model_<iteration>.pt` 与
+`<run>/training-candidates/candidate_<iteration>.pt`，解析符号链接后检查。
+历史已淘汰候选保存记录保留有效，但不存在的文件不会参与评估。
+周期检查点和候选可以同轮次共存，输出目录不会冲突。
+没有启用训练候选的旧实验仍可通过周期检查点筛选，无法补回未保存轮次的权重。
+
+任务必须匹配训练目标：原始 V2 用 `Hexchip-Cartpole-Real-V2-v0`；
+保留原执行器滤波的 Window16 用 `Hexchip-Cartpole-Real-V2-Window16-v0`；
+Window16 且去掉执行器滤波用 `Hexchip-Cartpole-Real-V2-Window16-Tau0-v0`。
+选择阶段与 holdout 使用相同任务并校验报告身份。
+
+交付环境只做基础语法、参数、生产消费链与替身检查，未运行 Isaac GPU 训练或并行评估。
