@@ -19,7 +19,8 @@ def parse_args(argv=None, *, add_launcher_args):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--checkpoint', type=Path, required=True)
     parser.add_argument('--task', default='Hexchip-Cartpole-Real-V2-v0',
-                        choices=['Hexchip-Cartpole-Real-V2-v0', 'Hexchip-Cartpole-Real-V2-Window16-v0', 'Hexchip-Cartpole-Real-V2-Window16-Tau0-v0'])
+                        choices=['Hexchip-Cartpole-Real-V2-v0', 'Hexchip-Cartpole-Real-V2-Window16-v0', 'Hexchip-Cartpole-Real-V2-Window16-Tau0-v0',
+                            'Hexchip-Cartpole-Real-V2-Window16-Tau0-Acc9-Hz400-v0'])
     parser.add_argument('--num_envs', type=int, default=100, help='每个种子的完整回合数量')
     parser.add_argument('--seeds', type=int, nargs='+', default=[101, 202, 303, 404, 505])
     parser.add_argument('--horizon-s', type=float, help='仅评估实例的回合时长；默认保留训练配置')
