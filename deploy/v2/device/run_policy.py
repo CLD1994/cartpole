@@ -67,7 +67,7 @@ def braking_reason(session, velocity_mm_s):
 
 
 def load_contract(path, model):
-    c = json.loads(path.read_text(encoding='utf-8'))
+    c = json.loads(path.read_text(encoding='utf-8-sig'))
     expected = {'schema_version': 1, 'observation_order': ['x', 'theta', 'xdot', 'thetadot'],
                 'observation_units': ['m', 'rad', 'm/s', 'rad/s'],
                 'action_type': 'cart_target_velocity', 'action_scale_m_s': 1.25,
@@ -102,6 +102,17 @@ def state_guard(obs, starting=False):
     if starting and (abs(vx) > .05 or abs(w) > .5):
         return 'initial_velocity_limit'
     return None
+
+
+def guard_snapshot(obs, starting=False):
+    return {'state_si': list(obs.si()) if obs else None,
+            'host_received_at_s': obs.received_at if obs else None,
+            'checked_at_s': CLOCK(), 'starting': starting,
+            'limits': {'max_abs_x_m': .2,
+                       'max_abs_theta_rad': math.radians(10 if starting else 20),
+                       'max_abs_vx_m_s': .05 if starting else None,
+                       'max_abs_omega_rad_s': .5 if starting else None},
+            'reason': state_guard(obs, starting) if obs else 'measurement_unavailable'}
 
 
 def main():
@@ -169,7 +180,8 @@ def main():
                         raise RuntimeError('preflight:' + reason)
                     if session.values['CAL_LENGTH_UM'][0] != profile['measured']['calibrated_travel_um']:
                         raise RuntimeError('profile_travel_mismatch')
-                    reason = state_guard(session.observation, starting=True)
+                    report['initial_state_check'] = guard_snapshot(session.observation, starting=True)
+                    reason = report['initial_state_check']['reason']
                     if reason:
                         raise RuntimeError(reason)
                     if braking_reason(session, 0):
@@ -206,6 +218,7 @@ def main():
                             continue
                         reason = state_guard(obs)
                         if reason:
+                            report['failed_state_check'] = guard_snapshot(obs)
                             raise RuntimeError(reason)
                         last_sample = obs.received_at
                         x, th, vx, w = obs.si()
@@ -224,6 +237,7 @@ def main():
                             raise RuntimeError('precommand_receive_incomplete')
                         latest = session.observation
                         if latest is None or state_guard(latest):
+                            report['failed_state_check'] = guard_snapshot(latest)
                             raise RuntimeError('latest_state_limit')
                         if CLOCK()-obs.received_at > .004 or CLOCK() >= end:
                             raise RuntimeError('command_deadline')
@@ -253,7 +267,9 @@ def main():
                     report['status'] = 'error'
                     report['error'] = f'{type(exc).__name__}: {exc}'
                 finally:
-                    if session is not None and session.phase in (Phase.ACTIVE, Phase.STOPPING):
+                    if session is not None and (session.phase in (Phase.ACTIVE, Phase.STOPPING)
+                                                or session.mode == ('READY', 'NONE')):
+                        report['safe_stop_requested'] = True
                         session.stop()
                         # 使用独立外部截止，异常/第二次Ctrl+C不能触发自动恢复。
                         stop_end = CLOCK()+limits.stop_timeout_s+.1
@@ -264,8 +280,8 @@ def main():
                                 time.sleep(.0002)
                         except BaseException as exc:
                             report['stop_error'] = type(exc).__name__
-                    if (session is not None and report['motion_command_attempted']
-                            and not session.disabled_confirmed):
+                    if (session is not None and (report['motion_command_attempted']
+                            or report.get('safe_stop_requested')) and not session.disabled_confirmed):
                         # 写超时/短写可能已有字节到达；FINISHED不等于已停车。
                         report['stop_unconfirmed'] = True
                         try:
@@ -279,6 +295,9 @@ def main():
         finally:
             report['loop_interval_s'] = summary(intervals)
             report['disabled_confirmed'] = bool(session and session.disabled_confirmed)
+            report['last_observed_firmware_mode'] = session.mode if session else None
+            report['stop_unconfirmed'] = bool((report['motion_command_attempted']
+                or report.get('safe_stop_requested')) and not report['disabled_confirmed'])
             report['session_failure'] = session.failure if session else None
             report['receive_error'] = receiver.error if receiver else None
             report['status'] = ('complete' if report['status'] == 'trial_ended' and report['samples'] and report['disabled_confirmed']
