@@ -1,5 +1,7 @@
 """临时现场事件探针；只依据收到的固件事件，不自动推断机械停转。"""
 from collections import deque
+from queue import Queue, Full
+from threading import Thread
 from session import Phase
 
 
@@ -9,6 +11,10 @@ class EventWaitTimeout(RuntimeError):
 
 class StepLossProbe:
     def __init__(self):
+        self.monitor_only = False
+        self.pre_event_samples = deque(maxlen=400)
+        self.event_window = []
+        self.post_event_samples = 0
         self.expected_run_id = None
         self.wait_started_at = None
         self.events = deque(maxlen=128)
@@ -20,6 +26,17 @@ class StepLossProbe:
         self.first_zero_write_clock_s = None
         self.first_zero_completion_clock_s = None
         self.discarded_model_candidates = 0
+
+    def enable_monitor(self):
+        self.monitor_only = True
+        self._notice_queue = Queue(maxsize=1)
+        def output_once():
+            message = self._notice_queue.get()
+            try:
+                print(message, flush=True)
+            except Exception:
+                pass  # console delivery is optional; report keeps authoritative event
+        Thread(target=output_once, daemon=True, name='step-loss-notice').start()
 
     def receive(self, line, now, active):
         words = line.split()
@@ -47,15 +64,32 @@ class StepLossProbe:
             if active and self.trigger is None:
                 row['disposition'] = 'trigger'
                 self.trigger = dict(row)
+                if self.monitor_only:
+                    self.event_window = list(self.pre_event_samples)
+                    if hasattr(self, '_notice_queue'):
+                        try:
+                            self._notice_queue.put_nowait(f'STEP_LOSS event={event} run={run} device_us={device_us} host_s={now:.6f}：仅记录，模型继续控制')
+                        except Full:
+                            pass
         self.events.append(row)
 
+    def record_sample(self, sample):
+        if not self.monitor_only:
+            return
+        row = dict(sample)
+        if self.trigger is None:
+            self.pre_event_samples.append(row)
+        elif self.post_event_samples < 2000:
+            self.event_window.append(row)
+            self.post_event_samples += 1
+
     def check_wait(self, now):
-        if (self.trigger is None and self.wait_started_at is not None
+        if (not self.monitor_only and self.trigger is None and self.wait_started_at is not None
                 and now >= self.wait_started_at + 120.):
             raise EventWaitTimeout('event_wait_timeout')
 
     def phase(self, now):
-        if self.trigger is None:
+        if self.monitor_only or self.trigger is None:
             return 'model'
         if self.first_zero_completion_clock_s is not None:
             return 'done' if now >= self.first_zero_completion_clock_s + 2. else 'zero'
@@ -83,7 +117,7 @@ class StepLossProbe:
 
     def report(self):
         return {key: (list(value) if isinstance(value, deque) else value)
-                for key, value in vars(self).items()}
+                for key, value in vars(self).items() if not key.startswith('_')}
 
 
 class StepLossEventMixin:

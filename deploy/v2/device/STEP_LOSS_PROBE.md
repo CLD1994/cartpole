@@ -1,3 +1,20 @@
+# 仅记录事件、模型持续控制（当前现场方式）
+
+使用 `--step-loss-monitor --continuous --start-confirmed`，不要同时使用 `--step-loss-probe`。
+仅400Hz单动作真实控制，固件需支持RUN?与每run布防（66416af或兼容）。无需再改固件。
+启动确认RUN，收到同run首次EVENT实时显示event/run/device_us/host_s，模型保持控制，不切低速、不因事件或等待时间停车。未收到事件也持续模型控制；Ctrl+C主动停车，原有其它故障和时序停止仍生效。不是无人值守模式。
+调试门限命令15ms/观测12ms，不添加角度或位置门，不改变默认非调试行为。
+报告`step_loss_monitor.event_window`独立保留事件前最多400和后最多2000条控制决策样本（400Hz名义约1秒+5秒），后续长时间运行不会覆盖；不是全部串口STATE，也不证明设备采样精确时刻或物理步进。只保留首个匹配事件的详细窗口，事件列表有界128条。每条含观测、模型动作、主机命令/时序；不足窗口保留实际数量。无事件不能据静止或轻微震荡推断STEP_LOSS。
+
+```powershell
+$report = Join-Path (Split-Path $onnx -Parent) ('event-monitor-' + [guid]::NewGuid().ToString('N') + '.json')
+& $python .\deploy\v2\device\run_policy.py --port COM11 `
+  --onnx $onnx --contract $contract --profile $sessionProfile `
+  --output $report --continuous --step-loss-monitor --start-confirmed
+```
+
+以下为保留的旧主动低速探针，不是当前仅记录方式：
+
 # 单串口 STEP_LOSS 事件低速恢复探针
 
 仅用于有人在场的现场诊断，显式 `--step-loss-probe --continuous --start-confirmed` 才启用；默认运行器行为不变。只支持 400 Hz 单动作模型。固件须使用 `device-nerve-esp32` 的 `fix/changqing-wdt-steptrace` 分支 支持 `RUN?` 和每次 ENABLE 重新布防的版本，显式开启 STEP_LOSS 仅记录模式，并支持一次异步通知：

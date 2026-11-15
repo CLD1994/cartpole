@@ -267,10 +267,13 @@ def main():
     duration_args = p.add_mutually_exclusive_group()
     duration_args.add_argument('--seconds', type=float, default=.5)
     duration_args.add_argument('--continuous', action='store_true', help='受监控持续控制，直到Ctrl+C或门控停机；不能无人值守')
-    p.add_argument('--step-loss-probe', action='store_true', help='临时现场探针：收到ACTIVE新STEP_LOSS事件后+10mm/s一秒、零速观察2秒后停车；仅400Hz单动作持续模式')
+    event_args = p.add_mutually_exclusive_group()
+    event_args.add_argument('--step-loss-monitor', action='store_true', help='仅记录STEP_LOSS事件及有界前后样本，模型持续控制，不切低速或按事件停车')
+    event_args.add_argument('--step-loss-probe', action='store_true', help='临时现场探针：收到ACTIVE新STEP_LOSS事件后+10mm/s五秒、零速观察2秒后停车；仅400Hz单动作持续模式')
     p.add_argument('--diagnostic-timing', action='store_true', help='DISABLED只读同路径诊断；时序/物理门仅记录，真实故障退出')
     p.add_argument('--start-confirmed', action='store_true', help='现场明确请求本次运动；绝不自动使能')
     a = p.parse_args()
+    event_diag = a.step_loss_probe or a.step_loss_monitor
     if a.continuous and a.diagnostic_timing:
         p.error('--continuous不能与只读诊断组合')
     if not a.diagnostic_timing and not a.start_confirmed:
@@ -280,11 +283,11 @@ def main():
     contract = load_contract(a.contract, a.onnx)
     profile = json.loads(a.profile.read_text(encoding='utf-8-sig'))
     dual = contract['action_type'] == 'cart_target_velocity_acceleration'
-    if a.step_loss_probe and (not a.continuous or a.diagnostic_timing or dual
+    if event_diag and (not a.continuous or a.diagnostic_timing or dual
                              or contract['training_control_hz'] != 400):
         p.error('--step-loss-probe仅支持--continuous、400Hz、单动作真实控制')
-    hard_limit_s = .015 if a.step_loss_probe else COMMAND_GAP_HARD_S
-    observation_limit_s = .012 if a.step_loss_probe else OBSERVATION_MAX_AGE_S
+    hard_limit_s = .015 if event_diag else COMMAND_GAP_HARD_S
+    observation_limit_s = .012 if event_diag else OBSERVATION_MAX_AGE_S
     period_ns = 1_000_000_000 // contract['training_control_hz']
     limits = limits_from_profile(profile)
     if (limits.control_hz != contract['training_control_hz'] or limits.speed_mm_s != 1250
@@ -299,8 +302,8 @@ def main():
               'timing_limits_s': {'command_gap_soft': COMMAND_GAP_SOFT_S, 'command_gap_hard': hard_limit_s, 'observation_max_age': observation_limit_s},
               'contract': contract, 'clock': vars(time.get_clock_info('perf_counter')),
               'continuous': a.continuous, 'requested_seconds': None if a.continuous else a.seconds, 'samples': [], 'received_states': [], 'inference_attempts_s': [], 'would_stop_count_scope': 'gate invocation counts, not independent faults or failed cycles', 'would_stop': {}, 'virtual_command_attempted': False, 'motion_command_sent': False, 'motion_command_attempted': False}
-    if a.step_loss_probe:
-        report['scope'] = '有人监控的STEP_LOSS事件低速探针；不是正式控制或安全验收'
+    if event_diag:
+        report['scope'] = '有人监控的STEP_LOSS事件记录；模型持续控制' if a.step_loss_monitor else '有人监控的STEP_LOSS事件低速探针；不是正式控制或安全验收'
         report['step_loss_probe_config'] = {'velocity_mm_s': 10, 'positive_window_s': 5.,
             'zero_observation_s': 2., 'trigger': 'first eligible EVENT received while ACTIVE',
             'event_delivery_guaranteed': False,
@@ -308,8 +311,11 @@ def main():
             'event_caveat': '启动RUN?确认运行编号，只有同run事件可触发；通知仍可能丢失。', 'event_wait_timeout_s': 120.,
             'timing_profile': 'temporary_probe_15ms_command_12ms_observation',
             'positive_window_scope': 'host write-attempt start deadline, not device receipt or physical duration'}
+    if a.step_loss_monitor:
+        report['step_loss_monitor_config'] = {'model_continues': True, 'event_run_matches_current_firmware_run_verified': False, 'event_wait_timeout_s': None, 'pre_event_sample_limit': 400, 'post_event_sample_limit': 2000, 'scope': '首个同run事件的控制决策样本窗口；非全部串口STATE、非固定物理时长；完成后不被尾缓冲覆盖'}
+        del report['step_loss_probe_config']
     if a.continuous:
-        if not a.step_loss_probe:
+        if not event_diag:
             report['scope'] = '受监控持续控制，直到用户中断或门控停止；不是无人值守或安全认证'
         for key in ('samples', 'inference_attempts_s'):
             report[key] = deque(maxlen=10000)
@@ -359,9 +365,11 @@ def main():
                 try:
                     port.reset_input_buffer()
                     transport = (DiagnosticTransport if a.diagnostic_timing else ControlTransport)(port, dual=dual)
-                    session_class = DiagnosticSession if a.diagnostic_timing else ProbeSession if a.step_loss_probe else BoundSession
+                    session_class = DiagnosticSession if a.diagnostic_timing else ProbeSession if event_diag else BoundSession
                     session = session_class(transport, CLOCK, limits, contract['firmware_coordinates'])
-                    probe = session.step_loss_probe if a.step_loss_probe else None
+                    probe = session.step_loss_probe if event_diag else None
+                    if probe and a.step_loss_monitor:
+                        probe.enable_monitor()
                     if a.diagnostic_timing:
                         session.diagnostic_state_events = report['received_states']
                     receiver = Receiver(transport, session, CLOCK)
@@ -447,7 +455,7 @@ def main():
                         gate(reason)
                     if transport.partial or transport.in_waiting:
                         raise RuntimeError('preflight_receive_incomplete')
-                    if a.step_loss_probe:
+                    if event_diag:
                         session.run_query_pending = True
                         if transport.write(b'RUN?\n') != 5:
                             raise RuntimeError('run_query_write')
@@ -459,8 +467,8 @@ def main():
                         if session.run_reply is None:
                             raise RuntimeError('run_query_unsupported_or_timeout')
                         report['verified_firmware_run_id'] = session.run_reply
-                        report['step_loss_probe_config']['event_run_matches_current_firmware_run_verified'] = True
-                        print('事件探针：最多等待120秒同run事件；收到后+10mm/s五秒，再零速观察2秒并停车。未收到事件不会执行低速探针。', flush=True)
+                        report['step_loss_monitor_config' if a.step_loss_monitor else 'step_loss_probe_config']['event_run_matches_current_firmware_run_verified'] = True
+                        print('事件记录：同run STEP_LOSS仅记录，模型持续控制；Ctrl+C停车。' if a.step_loss_monitor else '事件探针：最多等待120秒同run事件；收到后+10mm/s五秒，再零速观察2秒并停车。未收到事件不会执行低速探针。', flush=True)
                     session.start()
                     grid_start_ns = time.perf_counter_ns()
                     start = next_tick = grid_start_ns / 1e9
@@ -548,7 +556,7 @@ def main():
                                 continue
                         raw = None
                         inference_s = None
-                        if not probe or probe.trigger is None:
+                        if not probe or probe.monitor_only or probe.trigger is None:
                             raw = policy.forward((x, contract['angle_sign']*th, vx, contract['angle_sign']*w))
                             inference_s = CLOCK()-begin
                             report['inference_attempts_s'].append(inference_s)
@@ -625,7 +633,7 @@ def main():
                         command_phase = 'model'
                         # 最后一次poll可能刚收到事件，必须丢弃已计算的模型候选。
                         # 每次写入前重查固定五秒截止，不因重试/重复观测延长。
-                        if probe and probe.trigger is not None:
+                        if probe and not probe.monitor_only and probe.trigger is not None:
                             if raw is not None:
                                 probe.discarded_model_candidates += 1
                                 raw = None
@@ -639,7 +647,7 @@ def main():
                             velocity = session.command(action)
                         completed_ns = time.perf_counter_ns()
                         completed_at = completed_ns / 1e9
-                        if probe and probe.trigger is not None:
+                        if probe and not probe.monitor_only and probe.trigger is not None:
                             probe.completed(velocity, completed_at)
                         command_gap = completed_at-last_command_at
                         totals=report['run_totals']
@@ -663,6 +671,8 @@ def main():
                                                   'grid_lateness_s': grid_lateness_s,
                                                   'precommand_receive': drain,
                                                   'readback_in_flight': dict(refresh.pending) if refresh and refresh.pending else None})
+                        if probe:
+                            probe.record_sample(report['samples'][-1])
                         stage = 'write_completion'
                         if completed_at >= receive_deadline:
                             gate('write_completion_deadline')
@@ -752,8 +762,8 @@ def main():
             report['inference_scope'] = ('retained recent policy.forward attempts including discarded candidates; excludes warmup' if a.continuous else 'all measured policy.forward attempts including discarded candidates; excludes warmup')
             report['completed_candidate_inference_s'] = summary([r['inference_s'] for r in report['samples'] if r['inference_s'] is not None])
             if probe is not None:
-                report['step_loss_probe'] = probe.report()
-                report['probe_completed'] = (probe.trigger is not None and probe.phase(CLOCK()) == 'done' and report['status'] == 'trial_ended')
+                report['step_loss_monitor' if a.step_loss_monitor else 'step_loss_probe'] = probe.report()
+                report['probe_completed'] = (not a.step_loss_monitor and probe.trigger is not None and probe.phase(CLOCK()) == 'done' and report['status'] == 'trial_ended')
             report['disabled_confirmed'] = bool(session and session.disabled_confirmed)
             report['last_observed_firmware_mode'] = session.mode if session else None
             report['stop_unconfirmed'] = bool((report['motion_command_attempted']

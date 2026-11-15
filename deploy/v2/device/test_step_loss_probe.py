@@ -40,6 +40,20 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(port.data,b'RUN?\n')
         with self.assertRaises(ValueError): t.write(b'ENABLE\n')
 
+    def test_monitor_keeps_model_and_freezes_window(self):
+        p=StepLossProbe(); p.expected_run_id=1; p.monitor_only=True; p.wait_started_at=0
+        for n in range(500): p.record_sample({'n':n})
+        p.check_wait(1000)
+        p.receive('EVENT STEP_LOSS 1 1 100',1000,True)
+        self.assertEqual(p.phase(1007),'model')
+        for n in range(3000): p.record_sample({'n':500+n})
+        self.assertEqual(len(p.event_window),2400)
+        self.assertEqual(p.event_window[0]['n'],100)
+        self.assertEqual(p.event_window[-1]['n'],2499)
+        p.receive('EVENT STEP_LOSS 2 1 101',1001,True)
+        self.assertEqual(len(p.event_window),2400)
+        self.assertEqual(p.trigger['event_id'],1)
+
     def test_invalid_event_formats(self):
         for line in ('EVENT STEP_LOSS 0 1 0','EVENT STEP_LOSS 1 0 0',
                      'EVENT STEP_LOSS 1 1 -1','EVENT STEP_LOSS 1 1 0 extra',
