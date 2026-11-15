@@ -10,6 +10,7 @@ class JointVelocityWindow(ManagerTermBase):
 
     Repeated observation computations in one environment step do not add samples.
     Reset slots warm up with instantaneous velocity for the first full window.
+    非整数控制周期窗口使用两个历史位置线性插值，不是额外纯延迟。
     Noise is applied afterwards by ObservationManager, exactly as in the baseline.
     """
 
@@ -19,9 +20,15 @@ class JointVelocityWindow(ManagerTermBase):
         if list(self.robot.joint_names) != ['slider_to_cart', 'cart_to_pole']:
             raise ValueError('velocity window requires cart,pole joint ordering')
         self.span = float(cfg.params['window_s'])
-        self.steps = round(self.span / env.step_dt)
-        if self.steps < 1 or not math.isclose(self.steps * env.step_dt, self.span, abs_tol=1e-9):
-            raise ValueError('velocity window must span an integer number of control steps')
+        if not math.isfinite(self.span) or self.span < env.step_dt:
+            raise ValueError('velocity window must be finite and span at least one control step')
+        ratio = self.span / env.step_dt
+        nearest = round(ratio)
+        if math.isclose(ratio, nearest, abs_tol=1e-9):
+            ratio = float(nearest)
+        self.whole_steps = math.floor(ratio)
+        self.fraction = ratio - self.whole_steps
+        self.steps = math.ceil(ratio)
         q = self.robot.data.joint_pos.torch
         self.history = q.clone().unsqueeze(0).repeat(self.steps + 1, 1, 1)
         self.age = torch.zeros(q.shape[0], dtype=torch.long, device=q.device)
@@ -45,8 +52,12 @@ class JointVelocityWindow(ManagerTermBase):
         self.history[:, self.pending_reset] = q[self.pending_reset]
         self.age[self.pending_reset] = 0
         self.pending_reset.zero_()
-        oldest = (self.head + 1) % (self.steps + 1)
-        estimate = (self.history[self.head] - self.history[oldest]) / self.span
+        recent = (self.head - self.whole_steps) % (self.steps + 1)
+        past = self.history[recent]
+        if self.fraction:
+            older = (recent - 1) % (self.steps + 1)
+            past = past * (1.0 - self.fraction) + self.history[older] * self.fraction
+        estimate = (self.history[self.head] - past) / self.span
         velocity = torch.where((self.age >= self.steps).unsqueeze(1),
                                estimate, self.robot.data.joint_vel.torch)
         return velocity - self.robot.data.default_joint_vel.torch

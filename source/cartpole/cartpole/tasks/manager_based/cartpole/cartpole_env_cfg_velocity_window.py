@@ -20,3 +20,18 @@ class RealCartpoleV2Window16Tau0EnvCfg(RealCartpoleV2Window16EnvCfg):
         self.actions.joint_effort.tau = 0.0
         # 重置事件必须同步固定为零，否则每个回合会重新抽样 10–40 ms。
         self.events.randomize_tracking.params['tau_range'] = (0.0, 0.0)
+
+
+@configclass
+class RealCartpoleV2Window16Tau0Acc9Hz400EnvCfg(RealCartpoleV2Window16Tau0EnvCfg):
+    """400 Hz 策略、9 m/s² 参考加速度上限；保留原 PPO 和奖励参数。"""
+
+    def __post_init__(self):
+        super().__post_init__()
+        # PhysX 每个 0.5 ms 子步更新参考速度；5 个子步执行一次策略。
+        self.sim.dt = 0.0005
+        self.decimation = 5
+        self.sim.render_interval = self.decimation
+        self.actions.joint_effort.acc_max = 9.0
+        # reset 随机化也必须遵守新上限，不能重新抽到 9–10 m/s²。
+        self.events.randomize_tracking.params['acc_max_range'] = (8.0, 9.0)
