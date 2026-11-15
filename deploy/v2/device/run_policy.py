@@ -53,6 +53,51 @@ class BoundSession(Session):
         return {**super().expected_readback, **self.coordinates}
 
 
+class ReadbackCycle:
+    """单组在途的只读刷新；跨控制周期收齐回执，绝不伪造TTL。"""
+    groups = (
+        ('QUERY', ()),
+        ('CALIB?', ('CAL_STATE', 'CAL_LENGTH_UM', 'CAL_SAVED', 'CAL_STORAGE')),
+        ('CONFIG?', ('VEL_MAX', 'ACC_MAX', 'WDT_MS', 'WDT_DEC', 'X_MARGIN_UM',
+                     'POLE_ZERO_URAD', 'POLE_INV', 'X_INV', 'STEP_LOSS_UM')),
+    )
+
+    def __init__(self, transport, history, start):
+        self.transport, self.history = transport, history
+        self.next_at, self.index, self.pending = start+.15, 0, None
+
+    def update(self, session, now):
+        if self.pending is None:
+            return
+        row = self.pending
+        sent = row['sent_clock_s']
+        if now-sent >= .1:
+            raise RuntimeError('readback_response_deadline')
+        command, keys = self.groups[row['group_index']]
+        if command == 'QUERY':
+            complete = session._mode_at >= sent
+        else:
+            complete = all(k in session.values and session.values[k][1] >= sent for k in keys)
+        if complete:
+            row.update(status='complete', completed_clock_s=now, response_s=now-sent)
+            self.pending = None
+
+    def send_if_due(self, now, end):
+        if self.pending is not None or now < self.next_at or end-now < .02:
+            return
+        command, keys = self.groups[self.index]
+        row = {'command': command, 'group_index': self.index, 'expected_keys': list(keys),
+               'sent_clock_s': now, 'status': 'attempted'}
+        self.pending = row
+        self.history.append(row)
+        data = (command+'\n').encode('ascii')
+        if self.transport.write(data) != len(data):
+            raise RuntimeError('readback_short_write')
+        row.update(status='waiting', write_completed_clock_s=CLOCK())
+        self.next_at = now+.15
+        self.index = (self.index+1) % len(self.groups)
+
+
 def braking_reason(session, velocity_mm_s):
     # 仅条件性理想模型：150ms反应预算(含100ms看门狗)+配置减速度+50mm余量。
     # 真实制动能力未测量，不能把此计算称作安全停车证明。
@@ -126,8 +171,8 @@ def main():
     a = p.parse_args()
     if not a.start_confirmed:
         p.error('需要现场明确 --start-confirmed；只读诊断请用 shadow.py')
-    if not math.isfinite(a.seconds) or not 0 < a.seconds <= .5:
-        p.error('--seconds 必须在(0,0.5]' )
+    if not math.isfinite(a.seconds) or not 0 < a.seconds <= 5.:
+        p.error('--seconds 必须在(0,5]' )
     contract = load_contract(a.contract, a.onnx)
     profile = json.loads(PROFILE.read_text(encoding='utf-8'))
     limits = limits_from_profile(profile)
@@ -138,7 +183,7 @@ def main():
         policy.forward((0., 0., 0., 0.))
     # 外部权重初始化前后均核验；在运行期间不可改动导出文件。
     verified_files = verify_model_files(a.onnx, contract)
-    report = {'loop_interval_scope': 'new-observation decision ticks, not serial command completion', 'runner_revision': 2, 'scheduler': 'wait-fresh', 'duplicate_tick_count': 0, 'verified_model_files': verified_files, 'status': 'starting', 'scope': '限时真机联调；不是硬实时或真机验收',
+    report = {'loop_interval_scope': 'new-observation decision ticks, not serial command completion', 'runner_revision': 3, 'readback_refresh': [], 'scheduler': 'wait-fresh', 'duplicate_tick_count': 0, 'verified_model_files': verified_files, 'status': 'starting', 'scope': '限时真机联调；不是硬实时或真机验收',
               'contract': contract, 'clock': vars(time.get_clock_info('perf_counter')),
               'requested_seconds': a.seconds, 'samples': [], 'motion_command_sent': False, 'motion_command_attempted': False}
     a.output.parent.mkdir(parents=True, exist_ok=True)
@@ -147,7 +192,7 @@ def main():
         intervals = []
         stage = 'startup'
         start = last_command_at = next_tick = None
-        drain = None
+        drain = refresh = None
         import serial
         port = serial.Serial(port=None, baudrate=profile['measured']['protocol_baud'], timeout=0, write_timeout=.002)
         port.dtr = port.rts = False
@@ -196,14 +241,18 @@ def main():
                     end = start + a.seconds
                     last_tick = last_sample = None
                     last_command_at = start
+                    if a.seconds > .5:
+                        refresh = ReadbackCycle(transport, report['readback_refresh'], start)
                     while CLOCK() < end:
-                        # 首次原型运行最多0.5秒；运行中不插入元数据查询。
+                        # 长窗口单组轮转刷新；4ms命令截止与1秒元数据TTL不变。
                         stage = 'poll'
                         if transport.in_waiting > 128:
                             raise RuntimeError('active_backlog')
                         if not receiver.poll() or session.phase != Phase.ACTIVE:
                             raise RuntimeError(receiver.error or session.failure or 'session_inactive')
                         now = CLOCK()
+                        if refresh:
+                            refresh.update(session, now)
                         stage = 'gap_check'
                         if now-last_command_at > .004:
                             raise RuntimeError('command_gap_deadline')
@@ -253,6 +302,8 @@ def main():
                             if not receiver.poll() or session.phase != Phase.ACTIVE:
                                 raise RuntimeError(receiver.error or session.failure or 'session_inactive')
                             drain['polls'] += 1
+                            if refresh:
+                                refresh.update(session, CLOCK())
                             latest = session.observation
                             if latest is None or state_guard(latest):
                                 report['failed_state_check'] = guard_snapshot(latest)
@@ -264,6 +315,7 @@ def main():
                                 raise RuntimeError('precommand_receive_deadline')
                             if pending > 128:
                                 raise RuntimeError('precommand_backlog')
+                            drain['readback_in_flight'] = bool(refresh and refresh.pending)
                             if not transport.partial and pending == 0:
                                 break
                             if pending == 0:
@@ -289,10 +341,20 @@ def main():
                                                   'raw_action': raw, 'velocity_mm_s': velocity,
                                                   'inference_s': inference_s,
                                                   'command_gap_s': command_gap,
-                                                  'precommand_receive': drain})
+                                                  'precommand_receive': drain,
+                                                  'readback_in_flight': dict(refresh.pending) if refresh and refresh.pending else None})
                         stage = 'write_completion'
                         if completed_at >= receive_deadline:
                             raise RuntimeError('write_completion_deadline')
+                        if refresh:
+                            # 已成功写入新速度后才安排单条只读查询，不与其他查询叠加。
+                            stage = 'readback_query'
+                            query_at = CLOCK()
+                            if query_at >= min(last_command_at+.004, end):
+                                raise RuntimeError('readback_send_deadline')
+                            refresh.send_if_due(query_at, end)
+                            if CLOCK() >= min(last_command_at+.004, end):
+                                raise RuntimeError('readback_write_deadline')
                     report['status'] = 'trial_ended'
                 except KeyboardInterrupt:
                     report['status'] = 'interrupted'
@@ -308,7 +370,8 @@ def main():
                         'last_command_clock_s': last_command_at, 'next_tick_clock_s': next_tick,
                         'observation_received_clock_s': failed_obs.received_at if failed_obs else None,
                         'host_observation_age_s': failed_at-failed_obs.received_at if failed_obs else None,
-                        'precommand_receive': drain}
+                        'precommand_receive': drain,
+                        'readback_in_flight': dict(refresh.pending) if refresh and refresh.pending else None}
                 finally:
                     if session is not None and (session.phase in (Phase.ACTIVE, Phase.STOPPING)
                                                 or session.mode == ('READY', 'NONE')):
