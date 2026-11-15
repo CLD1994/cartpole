@@ -35,6 +35,35 @@ def load_trace(path):
     return data, times, velocities, initial, actual
 
 
+def initialize_replay_state(env, initial):
+    """Simulation-only explicit state write after reset; do not trust reset clamping."""
+    robot=env.scene['robot']
+    cart,_=robot.find_joints('slider_to_cart');pole,_=robot.find_joints('cart_to_pole')
+    if len(cart)!=1 or len(pole)!=1:raise ValueError('expected unique cart and pole joints')
+    if len(initial)!=4 or not all(math.isfinite(v) for v in initial):
+        raise ValueError('invalid initial state')
+    before=snapshot_state(env)
+    soft_limits=robot.data.soft_joint_vel_limits.torch.detach().cpu().tolist()
+    q=robot.data.joint_pos.torch.clone();v=robot.data.joint_vel.torch.clone()
+    q[:,cart[0]]=initial[0];q[:,pole[0]]=initial[1]
+    v[:,cart[0]]=initial[2];v[:,pole[0]]=initial[3]
+    robot.write_joint_state_to_sim_index(position=q,velocity=v)
+    after=snapshot_state(env)
+    # Independent PhysX backend readback, not ArticulationData's write-through cache.
+    names=list(robot.backend_joint_names)
+    c=names.index('slider_to_cart');p=names.index('cart_to_pole')
+    backend_q=robot.root_view.get_dof_positions().numpy()
+    backend_v=robot.root_view.get_dof_velocities().numpy()
+    backend=[float(backend_q[0,c]),float(backend_q[0,p]),float(backend_v[0,c]),float(backend_v[0,p])]
+    if not all(math.isfinite(v) for v in backend) or any(abs(actual-wanted)>1e-5 for actual,wanted in zip(backend,initial)):
+        raise RuntimeError(f'backend initial-state mismatch: {backend} vs {initial}')
+    if not all(math.isfinite(v) for v in after[0]) or any(abs(actual-wanted)>1e-5 for actual,wanted in zip(after[0],initial)):
+        raise RuntimeError(f'explicit initial-state readback mismatch: {after[0]} vs {initial}')
+    return {'reset_state_before_explicit_write':before,'soft_joint_velocity_limits':soft_limits,
+            'explicit_write_readback':after,'backend_readback':backend,
+            'scope':'PhysX root_view independent readback plus state interface, before first step'}
+
+
 def comparison(samples, actual):
     # Never extrapolate beyond simulated trace; separately expose early termination.
     samples = [s for s in samples if s['velocity_window16_m_s'] is not None]
@@ -78,7 +107,7 @@ def main():
     a.output_dir.mkdir(parents=True,exist_ok=False)
     report={'status':'starting','scope':'open-loop recorded command replay; not hardware or closed-loop validation',
             'trace_sha256':hashlib.sha256(a.trace.read_bytes()).hexdigest(),
-            'tau_s':a.tau_s,'delay_ms':a.delay_ms,'initial_requested':initial,'samples':[],
+            'replay_revision':2,'tau_s':a.tau_s,'delay_ms':a.delay_ms,'initial_requested':initial,'samples':[],
             'limitations':['host completion/parse times, not device timestamps',
                 'initial state was observed before grid origin; time alignment is approximate',
                 'replay ends before final recorded command; its subsequent response is not covered',
@@ -131,7 +160,10 @@ def main():
             try:
                 with torch.inference_mode():
                     env.reset(seed=42)
+                    report['initialization']=initialize_replay_state(env.unwrapped,initial)
                     report['initial_actual']=snapshot_initial_conditions(env.unwrapped)
+                    report['initial_actual']['states']=[report['initialization']['backend_readback']]
+                    report['initial_actual']['state_source']='PhysX root_view independent readback'
                     position_history[0]=snapshot_state(env.unwrapped)[0][0]
                     for k in range(math.floor(duration/dt)):
                         j=bisect.bisect_right(times,k*dt)-1
