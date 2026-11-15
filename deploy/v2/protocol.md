@@ -75,6 +75,7 @@ RESET\n                   清除 FAULT
 QUERY\n                   查询当前模式，回答一行 MODE
 CONFIG <NAME> <value>\n   设置运行参数，回答 OK 或 ERR
 CONFIG?\n                 dump 全部参数（调试与日志记录用）
+CONFIG? <NAME>\n          单项只读查询，回 OK <NAME> <value> 或 ERR <NAME>
 ```
 
 标定与回执原则：`MARK LEFT`/`MARK RIGHT`/`ENABLE` 仅 DISABLED 态接受；拒绝时回 `ERR MARK_LEFT`/`ERR MARK_RIGHT`/`ERR ENABLE`（回执名是单 token），状态保持。`VEL`/`RESET` 在不适用态静默忽略、无回执。标定决策表（`L = E_right − E_left` 合法窗 100000–1000000 µm，域反向得负即拒）与 ENABLE 动作次序见 `calib-spec.md`。
@@ -90,6 +91,7 @@ CONFIG?\n                 dump 全部参数（调试与日志记录用）
 | `QUERY` | 回 `MODE` | 回 `MODE` | 回 `MODE` |
 | `CONFIG` | 接受 | 接受 | 拒绝（`ERR`） |
 | `CONFIG?` | 接受 | 接受 | 接受 |
+| `CONFIG? <NAME>` | 只读接受 | 只读接受 | 只读接受 |
 
 `VEL` 语义：固件以不超过 `ACC_MAX` 的加速度向目标速度过渡，换向经零速；收到新 `VEL` 即更新目标并保持到下一条。非法行静默丢弃，目标不变。
 
@@ -145,3 +147,10 @@ CONFIG?\n                 dump 全部参数（调试与日志记录用）
 - 参数注册表默认值与范围依据实测微调。
 - MT6835 的 SPI 寄存器映射在固件实现阶段确定。
 - 与旧协议（`deploy/protocol.md`）的关系：旧协议随旧装置退役，本文件为新装置唯一协议权威。
+
+
+### 单项配置查询（向后兼容扩展）
+
+`CONFIG? <NAME>` 只读取一个参数，已知名称返回一行 `OK <NAME> <value>`；语法合法但名称未知返回 `ERR <NAME>`，不改变参数或运动状态。非法名称/多余参数等非法行继续静默丢弃。该命令不调用参数赋值、引擎配置或NVS保存。原无参数 `CONFIG?` 仍返回全部参数，不改变旧客户端行为。
+
+需要单项查询的主机必须在运动开始前验证固件支持，不能将旧固件静默忽略当成成功，不得在运行中悄悄回退至全量dump以绕过时序预算。协议没有request-id；主机应保持单组查询在途、完整启动同步和真实回执时间，不将查询发送时间当作参数刷新时间。
