@@ -28,6 +28,8 @@ def parse_args(argv=None, *, add_launcher_args):
                         help='仅评估的小车初速度范围[m/s]；不指定则保留训练范围')
     parser.add_argument('--initial-pole-velocity-range',type=float,nargs=2,metavar=('LOW','HIGH'),
                         help='仅评估的摆杆初角速度范围[rad/s]；不指定则保留训练范围')
+    parser.add_argument('--velocity-observation-window-ms', type=int, choices=[0,16], default=0,
+                        help='仅策略速度输入：0瞬时基线；16ms首末位置差，前16ms保留瞬时速度')
     parser.add_argument('--output-dir', type=Path, default=Path('logs/evaluation'))
     add_launcher_args(parser)
     args = parser.parse_args(argv)
@@ -199,7 +201,10 @@ def main(argv=None):
                   scope='当前配置下的独立仿真评估；不是旧训练环境重建、性能基准或真机验收',
                   sample_scope='每槽位从显式reset起的第一个回合；状态在自动reset前、每控制步末采样',
                   recorder_note='Isaac Lab 3.0 recorder会额外计算观测；相同seed不保证与普通play随机数序列相同，不能用于RTF比较',
-                  state_order=['x_m','theta_rad','xdot_m_s','thetadot_rad_s'])
+                  state_order=['x_m','theta_rad','xdot_m_s','thetadot_rad_s'],
+                  velocity_observation_window_ms=args.velocity_observation_window_ms,
+                  velocity_window_scope=('ideal 16ms endpoint difference at control ticks; unchanged existing velocity noise; first16ms instantaneous; no sensor quantization, invalidity or sampling jitter'
+                                         if args.velocity_observation_window_ms else 'baseline: original instantaneous velocity observations unchanged'))
     project = Path(__file__).resolve().parents[2]
     def git(*arguments):
         completed = subprocess.run(['git','-C',str(project),*arguments],capture_output=True,text=True)
@@ -256,6 +261,9 @@ def main(argv=None):
                     runner.load(str(checkpoint))
                     policy = runner.get_inference_policy(device=env.unwrapped.device)
                     dt = env.unwrapped.step_dt
+                    from velocity_window import VelocityWindow
+                    velocity_window = (VelocityWindow(env.unwrapped,args.velocity_observation_window_ms/1000.)
+                                       if args.velocity_observation_window_ms else None)
                     report.update(step_dt_s=dt,physics_dt_s=env.unwrapped.physics_dt,
                                   horizon_s=env_cfg.episode_length_s,device=str(env.unwrapped.device),
                                   physics_backend=type(env_cfg.sim.physics).__name__,
@@ -266,6 +274,8 @@ def main(argv=None):
                         metrics = EpisodeMetrics(num_envs=args.num_envs,seed=seed,dt=dt)
                         def reset(seed):
                             raw.reset(seed=seed)
+                            if velocity_window is not None:
+                                velocity_window.reset()
                             metrics.set_initial_conditions(**snapshot_initial_conditions(env.unwrapped))
                             policy.reset(torch.ones(args.num_envs,dtype=torch.bool,device=env.unwrapped.device))
                         def step_factory():
@@ -273,7 +283,10 @@ def main(argv=None):
                             active[0] = metrics
                             def step():
                                 nonlocal obs
-                                obs,_,dones,_ = env.step(policy(obs))
+                                policy_obs = velocity_window.apply(obs) if velocity_window is not None else obs
+                                obs,_,dones,_ = env.step(policy(policy_obs))
+                                if velocity_window is not None:
+                                    velocity_window.advance(dones)
                                 policy.reset(dones)
                             return step
                         cohort = run_seed_cohort(metrics,reset=reset,step_factory=step_factory,
