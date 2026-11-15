@@ -6,13 +6,16 @@
 
 ## 续训
 
-在现有 Isaac Lab 开发环境、cartpole 目录运行。保持原有环境数量；下面沿用 512。输出到新目录，不覆盖原模型。`--checkpoint` 会载入 actor、critic 和默认优化器状态；`--max_iterations 1000` 是额外执行 1000 次学习迭代，不是把总轮次设为 1000。学习率与其他 PPO 配置沿用当前配置/恢复状态，不同时调参。
+在现有 Isaac Lab 开发环境、cartpole 目录运行。创建独立工作树，不切换正在运行诊断的工作树；PYTHONPATH 只在此 PowerShell 会话指向新工作树源码，不改共享虚拟环境的 editable 安装。保持原有环境数量；下面沿用 512。输出到新目录，不覆盖原模型。`--checkpoint` 会载入 actor、critic 和默认优化器状态；`--max_iterations 1000` 是额外执行 1000 次学习迭代，不是把总轮次设为 1000。学习率与其他 PPO 配置沿用当前配置/恢复状态，不同时调参。
 
 ```powershell
 git fetch origin
-git switch feat/changqing-train-velocity-window
+git worktree add ..\cartpole-window16 origin/feat/changqing-train-velocity-window
+Set-Location ..\cartpole-window16
+$env:PYTHONPATH = "$($PWD.Path)\source\cartpole;$env:PYTHONPATH"
 $python = 'C:\Users\cldus\IsaacLab\.venv\Scripts\python.exe'
-$checkpoint = '.\logs\rsl_rl\cartpole_real_v2\2026-11-15_07-34-57_resume_model500\model_1050.pt'
+$checkpoint = 'C:\Users\cldus\workspace\cartpole\logs\rsl_rl\cartpole_real_v2\2026-11-15_07-34-57_resume_model500\model_1050.pt'
+& $python -c "import importlib.util; print(importlib.util.find_spec('cartpole').origin)"
 & $python .\scripts\rsl_rl\train.py --task Hexchip-Cartpole-Real-V2-Window16-v0 --checkpoint $checkpoint --num_envs 512 --max_iterations 1000 --run_name resume1050_window16 --viz none --device cuda:0
 ```
 
