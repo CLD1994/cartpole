@@ -13,7 +13,6 @@ typedef struct {
     int acceleration_mm_s2;
     int soft_margin_um;
     int watchdog_ms;
-    int watchdog_decel_mm_s2;
     double state_timeout_s;
     double validity_timeout_s;
     double metadata_timeout_s;
@@ -54,7 +53,7 @@ device_session *device_session_create(device_limits limits,
 void device_session_destroy(device_session *session);
 /* 仅 QUERY / CALIB? / CONFIG?；start 要求元数据在规定时间内收到。 */
 bool device_session_refresh(device_session *session, double now_s);
-/* line 不含换行符；过长/乱码STATE或VEL_VALID不能被当作有效测量。
+/* line 不含换行符；过长/乱码状态帧不能被当作有效测量。
  * false表示错误或已锁存故障，STOPPING期间仍须继续feed/tick至FINISHED。 */
 bool device_session_feed(device_session *session, const char *line, double now_s);
 /* 只改变本地会话状态，不 ENABLE、不 CONFIG、不自动定位。 */

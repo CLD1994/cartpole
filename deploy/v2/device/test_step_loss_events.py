@@ -1,4 +1,5 @@
 import unittest
+from test_state_session import frame
 from step_loss_events import StepLossProbe, StepLossEventMixin
 from session import Session, Phase, Limits
 
@@ -68,9 +69,9 @@ class SessionEventTests(unittest.TestCase):
         s.receive('MODE READY NONE')
         for key,value in {'CAL_STATE':2,'CAL_SAVED':1,'CAL_STORAGE':0,
                           'CAL_LENGTH_UM':853940,'VEL_MAX':1250,'ACC_MAX':9000,
-                          'WDT_MS':100,'WDT_DEC':5000,'X_MARGIN_UM':10000}.items():
+                          'WDT_MS':100,'X_MARGIN_UM':10000}.items():
             s.receive(f'OK {key} {value}')
-        s.receive('VEL_VALID 1 1'); s.receive('STATE 0 0 0 0'); s.start()
+        s.receive(frame(x=0,th=0,vx=0,w=0)); s.start()
         return s
     def test_active_event_keeps_session_and_selects_low_speed(self):
         s=self.active_session(); s.step_loss_probe.expected_run_id=4; s.receive('EVENT STEP_LOSS 1 4 999')

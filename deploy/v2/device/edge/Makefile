@@ -18,3 +18,15 @@ test-receiver:
 	@binary=$$(mktemp /tmp/device-receiver.XXXXXX); \
 	trap 'rm -f "$$binary"' EXIT; \
 	$(CC) $(CFLAGS) receiver.c receiver_test.c -lm -o "$$binary" && "$$binary"
+
+.PHONY: test-state test-integration
+test: test-state test-integration
+test-state:
+	@binary=$$(mktemp /tmp/device-state.XXXXXX); \
+	trap 'rm -f "$$binary"' EXIT; \
+	$(CC) $(CFLAGS) session.c receiver.c state_protocol_test.c -lm -o "$$binary" && "$$binary"
+
+test-integration:
+	@binary=$$(mktemp /tmp/device-state-integration.XXXXXX); \
+	trap 'rm -f "$$binary"' EXIT; \
+	$(CC) $(CFLAGS) session.c receiver.c state_protocol_test.c -lm -o "$$binary" && "$$binary" integration

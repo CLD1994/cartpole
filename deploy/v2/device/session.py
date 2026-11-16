@@ -7,6 +7,8 @@ import math
 from numbers import Integral, Real
 from typing import Callable, Protocol
 
+from state_frame import parse_state
+
 
 class Transport(Protocol):
     def write(self, data: bytes) -> int: ...
@@ -26,7 +28,6 @@ class Limits:
     acceleration_mm_s2: int
     margin_um: int
     watchdog_ms: int = 100
-    watchdog_decel: int = 5000
     state_timeout_s: float = .1
     validity_timeout_s: float = .3
     preflight_timeout_s: float = 1.
@@ -35,8 +36,7 @@ class Limits:
     def __post_init__(self):
         # These integer limits match the firmware CONFIG protocol, not measured capacity.
         integer_ranges = {'speed_mm_s': (1, 2000), 'acceleration_mm_s2': (100, 30000),
-                          'margin_um': (1000, 50000), 'watchdog_ms': (10, 1000),
-                          'watchdog_decel': (100, 30000)}
+                          'margin_um': (1000, 50000), 'watchdog_ms': (10, 1000)}
         for name, value in vars(self).items():
             if name in integer_ranges:
                 low, high = integer_ranges[name]
@@ -49,7 +49,7 @@ class Limits:
     @property
     def config(self):
         return {'VEL_MAX': self.speed_mm_s, 'ACC_MAX': self.acceleration_mm_s2,
-                'WDT_MS': self.watchdog_ms, 'WDT_DEC': self.watchdog_decel,
+                'WDT_MS': self.watchdog_ms,
                 'X_MARGIN_UM': self.margin_um}
 
 
@@ -59,7 +59,7 @@ class Observation:
     theta_urad: int
     velocity_mm_s: int
     angular_velocity_mrad_s: int
-    received_at: float
+    received_at: float  # 新鲜度参考：主机接收时刻扣除设备年龄及相对积压。
 
     def si(self):
         """固件坐标系；不隐式翻转角度、不冒充策略的坐标系。"""
@@ -89,6 +89,66 @@ class Session:
         self._last_time = -math.inf
         self._stop_at = self._last_stop_tx = -math.inf
         self._disable_sent = False
+
+    def _state_failure(self, reason, now):
+        self._fail(reason, now)
+        self.failure = self.failure or reason
+        if self.phase == Phase.OBSERVING:
+            self.phase = Phase.FINISHED
+
+    def _receive_state(self, line, now):
+        frame = parse_state(line)
+        previous = getattr(self, '_frame', None)
+        if previous is not None and frame.boot != previous.boot:
+            self._state_failure('state_boot_changed', now)
+            return
+        if previous is None:
+            self._device_elapsed = 0.0
+            self._device_elapsed_us = 0
+            self._stream_origin = now
+            self._minimum_lag = 0.0
+        else:
+            delta = (frame.tick - previous.tick) & 0xffffffff
+            if delta >= 0x80000000:
+                self._state_failure('state_clock', now)
+                return
+            self._device_elapsed_us += delta
+            self._device_elapsed = self._device_elapsed_us / 1e6
+        lag = now - self._stream_origin - self._device_elapsed
+        self._minimum_lag = min(self._minimum_lag, lag)
+        backlog = max(0., lag - self._minimum_lag)
+        watermarks = dict(getattr(self, '_sample_watermarks', {}))
+        unchanged = previous is not None and delta == 0
+        elapsed_us = self._device_elapsed_us
+        for name, lane in (('cart', frame.cart), ('pole', frame.pole)):
+            if lane is None:
+                continue
+            sample_us = elapsed_us - lane.age_us
+            old = watermarks.get(name)
+            if old is not None:
+                old_lane, old_sample_us = old
+                advance = (lane.seq - old_lane.seq) & 0xffff
+                if advance >= 0x8000 or (advance and previous is not None and delta == 0):
+                    self._state_failure('state_sequence', now)
+                    return
+                if (advance == 0 and (sample_us != old_sample_us or
+                    lane.position != old_lane.position or lane.velocity != old_lane.velocity)) or (
+                    advance != 0 and sample_us <= old_sample_us):
+                    self._state_failure('state_sample_time', now)
+                    return
+                unchanged |= advance == 0
+            watermarks[name] = (lane, sample_us)
+        self._sample_watermarks = watermarks
+        self._frame = frame
+        if frame.cart is None or frame.pole is None:
+            self._fail('measurement_invalid', now)
+            return
+        if unchanged:
+            return  # 重复的任一路不能刷新完整模型观测。
+        at = now - max(frame.cart.age_us, frame.pole.age_us) / 1e6 - backlog
+        self._valid, self._valid_at = True, at
+        self.observation = Observation(frame.cart.position, frame.pole.position,
+                                       frame.cart.velocity, frame.pole.velocity, at)
 
     def _now(self):
         now = self.clock()
@@ -241,23 +301,13 @@ class Session:
             return
         tag = words[0]
         try:
-            if tag == 'VEL_VALID':
-                if len(words) != 3 or any(w not in ('0', '1') for w in words[1:]):
-                    raise ValueError()
-                valid = words[1:] == ['1', '1']
-                if not valid or not self._valid:
-                    self.observation = None
-                self._valid, self._valid_at = valid, now
-                if not valid:
-                    self._fail('measurement_invalid', now)
-            elif tag == 'STATE':
-                if len(words) != 5:
-                    raise ValueError()
-                values = tuple(int(w) for w in words[1:])
-                if any(not -(2**31) <= n < 2**31 for n in values):
-                    raise ValueError()
-                if self._valid and self._fresh(self._valid_at, now, self.limits.validity_timeout_s):
-                    self.observation = Observation(*values, now)
+            if tag == 'STATE':
+                self._receive_state(line, now)
+            elif tag in ('VEL_VALID', 'CART_STATE1'):
+                self._fail('unsupported_protocol', now)
+                self.failure = self.failure or 'unsupported_protocol'
+                if self.phase == Phase.OBSERVING:
+                    self.phase = Phase.FINISHED
             elif tag == 'MODE':
                 if len(words) != 3 or words[1] not in ('DISABLED', 'READY', 'FAULT'):
                     raise ValueError()
@@ -299,6 +349,9 @@ class Session:
             if tag in ('STATE', 'VEL_VALID', 'MODE', 'OK'):
                 self._valid = False
                 self._fail('malformed_' + tag, now)
+                if tag == 'STATE' and self.phase == Phase.OBSERVING:
+                    self.failure = self.failure or 'malformed_STATE'
+                    self.phase = Phase.FINISHED
 
     def tick(self):
         now = self._now()

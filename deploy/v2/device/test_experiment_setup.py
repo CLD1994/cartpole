@@ -7,7 +7,7 @@ class SetupTests(unittest.TestCase):
     def test_manifest_limits_preserve_training_acceleration(self):
         limits = setup.limits_from_manifest({'training_control_hz':400,'action_scale_m_s':1.25,'training_acceleration_m_s2':9})
         self.assertEqual(limits.control_hz,400)
-        self.assertEqual(limits.config,{'VEL_MAX':1250,'ACC_MAX':9000,'WDT_MS':100,'WDT_DEC':5000,'X_MARGIN_UM':10000})
+        self.assertEqual(limits.config,{'VEL_MAX':1250,'ACC_MAX':9000,'WDT_MS':100,'X_MARGIN_UM':10000})
     def test_unrepresentable_acceleration_rejected(self):
         with self.assertRaisesRegex(ValueError,'firmware_unit_precision'):
             setup.limits_from_manifest({'training_control_hz':400,'action_scale_m_s':1.25,'training_acceleration_m_s2':9.0001})
