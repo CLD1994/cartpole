@@ -1,5 +1,18 @@
 # Isaac Lab 3.0 仿真工作流
 
+## 从训练到部署
+
+本流程只负责训练产物，不发送设备命令，也不更改固件参数。
+
+- [训练指标](episode-metrics.md)：完整结束回合、失败与部分回合的统计口径。
+- [动态候选与冻结策略筛选](../../scripts/evaluation/README.md)：默认保留三个候选、默认只评估已保存候选；有界并行后独立 holdout。
+- [可选 400 Hz / Acc9 配方](400hz-acc9.md)：奖励、折扣、窗口观测、动作延迟的明确差异。
+
+原 V2 任务保持回中奖励与原折扣。Window16 系列采用独立平衡配方。训练、评估与导出必须使用同一任务和配置；文件名不能代替配置核验。
+
+训练指标只用于提名，冻结评估与 holdout 不能替代真机验证。主线流程只覆盖单动作，不包含双动作及其协议。单动作部署见 [设备运行器](../../deploy/v2/device/README.md)，支持 400/500 Hz 会话及固件 STEP_LOSS 事件；部署前仍需核对模型合同、设备配置与现场状态。不在训练工作区运行中切换代码。
+
+
 ## 适用环境
 
 本说明以官方 Isaac Lab `v3.0.0`、提交 `e3f7d9ff1f5d7f8280de3ece9000b7117f66bcf4` 为准。源码环境中的 `isaaclab` 子包版本为 `28.0.0`，不应只看包版本数字来推断 Git 发布版本。
@@ -10,7 +23,7 @@
 
 ## 入口及任务注册
 
-本项目使用 RSL-RL。单动作 V2 提供原始任务 `Hexchip-Cartpole-Real-V2-v0`，以及 Window16、Window16-Tau0、Window16-Tau0-Acc9-Hz400 三种独立配方。任务名和差异见 [训练与筛选流程](../../docs/training-deployment-workflow.md)。训练、筛选、回放导出必须显式选择同一任务；原始 V2 不是 400 Hz 配方的别名。
+本项目使用 RSL-RL。单动作 V2 提供原始任务 `Hexchip-Cartpole-Real-V2-v0`，以及 Window16、Window16-Tau0、Window16-Tau0-Acc9-Hz400 三种独立配方。任务名和差异见 [400 Hz 配方](400hz-acc9.md)。训练、筛选、回放导出必须显式选择同一任务；原始 V2 不是 400 Hz 配方的别名。
 
 - `scripts/rsl_rl/train.py`：初始化 Warp、注册本项目任务，调用项目 `train_rsl_rl.run`，接入完整回合日志和可选动态候选保存。
 - `scripts/rsl_rl/play.py`：注册本项目任务，调用公开 `run_play_cli`。
@@ -80,7 +93,7 @@ python scripts/rsl_rl/play.py --task Hexchip-Cartpole-Real-V2-v0 --checkpoint <�
 
 回放会加载模型并导出 JIT/ONNX 文件，再执行策略；模型导出也可能暴露依赖问题。普通回放没有有限步数截止，检查完成后用 Ctrl+C 结束，不把它当作自动结束的冒烟测试。需要录视频时再单独配置录制长度和相关依赖。
 
-回放通过后才能安排更长的训练、比较收益曲线和策略稳定性。仿真策略可运行仍不代表能部署到实物；设备与建模边界见 [训练准备](training-readiness.md)。
+回放通过后才能安排更长的训练、比较收益曲线和策略稳定性。仿真策略可运行仍不代表能部署到实物；设备与建模边界见 [训练准备](sim2real-model.md)。
 
 ## 已核查与待验证
 

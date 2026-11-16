@@ -5,7 +5,7 @@
  *   home/center/vel/state/query/config/reset    一次性子命令。
  *
  * 会话（串口、遥测、模式、运动流程）见 rig.c；控制台命令见 console.c。
- * 职责与安全语义（与 deploy/v2/protocol.md、sim2real-spec.md 对齐）：
+ * 职责与安全语义（与 docs/deployment/protocol.md、docs/training/sim2real-model.md 对齐）：
  *   - 驱动门控：仅当最后已知固件模式为 READY 且 STATE 流新鲜（< CFG_STATE_TIMEOUT_S）时驱动；
  *   - 摆杆门限：|theta| 超过 CFG_ENGAGE_ANGLE_RAD 时不驱动（人手扶到直立附近才接管）；
  *   - 轨道端头：|x| 超过 CFG_TRACK_LIMIT_M 时只封锁向外的速度，保留回程；
@@ -100,7 +100,7 @@ static int control_loop(void)
         }
 
         /* 观测（顺序/单位与训练一致；θ/θ̇ 按部署边界符号映射取反——
-         * 训练侧摆角正方向与实机相反，见 sim2real-spec「部署边界符号映射」） */
+         * 训练侧摆角正方向与实机相反，沿用本文件保留的旧台位部署边界符号约定） */
         float obs[4] = {
             (float)x_m,
             (float)-th_rad,

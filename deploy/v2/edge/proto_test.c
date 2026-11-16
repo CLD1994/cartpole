@@ -55,7 +55,7 @@ static void test_mode_valid(void)
     assert(m.reason == FW_REASON_MT6835);
     assert(proto_parse_line("MODE DISABLED NONE", &m) == PROTO_MODE);
     assert(m.mode == FW_DISABLED);
-    /* HOMING 模式与 HOME_TIMEOUT 原因已随自动回零退役（calib-spec §5） */
+    /* HOMING 模式与 HOME_TIMEOUT 原因已随自动回零退役（docs/archive/legacy-v2/calib-spec.md §5） */
     assert(proto_parse_line("MODE HOMING NONE", &m) == PROTO_UNKNOWN);
     assert(proto_parse_line("MODE FAULT HOME_TIMEOUT", &m) == PROTO_UNKNOWN);
 }
@@ -76,7 +76,7 @@ static void test_config_replies(void)
     assert(strcmp(m.param, "VEL_MAX") == 0 && m.value == 1000);
     assert(proto_parse_line("ERR ACC_MAX", &m) == PROTO_ERR);
     assert(strcmp(m.param, "ACC_MAX") == 0);
-    /* 标定回执名单是单 token（calib-spec §2），走同一 OK <NAME> <value> 语法 */
+    /* 标定回执名单是单 token（docs/archive/legacy-v2/calib-spec.md §2），走同一 OK <NAME> <value> 语法 */
     assert(proto_parse_line("OK MARK_LEFT 123", &m) == PROTO_OK);
     assert(strcmp(m.param, "MARK_LEFT") == 0 && m.value == 123);
     assert(proto_parse_line("OK MARK_RIGHT 530000", &m) == PROTO_OK);

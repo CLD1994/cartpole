@@ -1,4 +1,4 @@
-/* 行协议实现。契约见 deploy/v2/protocol.md；本文件不依赖串口，可在主机上单测。 */
+/* 行协议实现。契约见 docs/deployment/protocol.md；本文件不依赖串口，可在主机上单测。 */
 
 #include "proto.h"
 

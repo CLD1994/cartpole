@@ -7,7 +7,7 @@
 
 The v2 rig drives the cart with a stepper motor: the policy command is a target cart velocity,
 and the firmware tracks it with a ramp (bounded acceleration). The action term approximates
-that behavior per ``deploy/v2/sim2real-spec.md``:
+that behavior per ``docs/training/sim2real-model.md``:
 
     v_cmd = clip(action, -1, 1) * vel_max          (authority scale, randomized)
     dv    = clip((v_cmd - v) * dt / (dt + tau), +-acc_max * dt)   (ramp + first-order tracking)

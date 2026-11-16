@@ -1,9 +1,9 @@
-> **历史参考，不是当前实施或上板步骤。** 本文记录旧台位及其固件阶段，包含当时的器件、RAM 标定和参数假设。当前固件由 [device-nerve-esp32](https://github.com/CLD1994/device-nerve-esp32) 维护，标定与协议请从 [当前部署协议入口](protocol.md) 读取；不要按本文重新实施或覆盖当前固件。
+> **历史参考，不是当前实施或上板步骤。** 本文记录旧台位及其固件阶段，包含当时的器件、RAM 标定和参数假设。当前固件由 [device-nerve-esp32](https://github.com/CLD1994/device-nerve-esp32) 维护，标定与协议请从 [当前部署协议入口](../../deployment/protocol.md) 读取；不要按本文重新实施或覆盖当前固件。
 
 # v2 手动两点标定与运行保护规格
 
 本规格定义手动两点标定（坐标建立）与 READY 运行保护的行为契约。线协议权威仍在
-`deploy/v2/protocol.md`；本规格对其命令集、命令×模式矩阵、模式机与参数注册表的
+[当时的线协议快照](https://github.com/CLD1994/cartpole/blob/3648061c7eb65ab7e4e1505ed7e67ff6d898ca00/deploy/v2/protocol.md)；本规格对其命令集、命令×模式矩阵、模式机与参数注册表的
 修订随实施同步落地。固件实现于 `tmp/PD-STEP`（分支 `cartpole`）。
 
 坐标由操作者手动推动小车建立：左端、右端各标记一次，中点为 x=0。驱动芯片的

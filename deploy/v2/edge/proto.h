@@ -1,7 +1,7 @@
 /* 行协议：解析固件发来的 STATE/MODE/OK/ERR 行，构造发往固件的命令行。
  *
  * 纯字符串处理，不接触串口 —— 解析与格式化可在主机上单测（proto_test.c）。
- * 契约：deploy/v2/protocol.md。
+ * 契约：docs/deployment/protocol.md。
  */
 #ifndef EDGE_PROTO_H
 #define EDGE_PROTO_H

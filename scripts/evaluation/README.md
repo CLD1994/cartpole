@@ -2,7 +2,7 @@
 
 本工具按 `--task` 选择当前代码中的单动作 V2 训练配置来评估指定检查点，不继续训练、不改变训练配置文件、不导出或覆盖模型、不连接真机。默认保留观测噪声与全部训练随机化；它不是恢复旧训练目录的 `env.yaml`。
 
-## 执行
+## 单个检查点评估
 
 在已经激活的 Isaac Lab 3.0 环境及仓库根目录执行。GPU 与 Kit 可保留；统计按仿真时间，不要求实时运行。
 
@@ -24,7 +24,7 @@ Get-Content .\policy-evaluation.log -Tail 30 -Encoding utf8
 
 ## 任务与速度观测
 
-评估器支持原始 V2、Window16、Window16-Tau0 和 Window16-Tau0-Acc9-Hz400 四种单动作任务。完整任务名见 [候选工作流](TRAINING_CANDIDATES.md)。Window16 任务本身包含 16 ms 速度观测，不得再叠加 `--velocity-observation-window-ms 16`。该参数用于原始 V2 的显式观测对照，不会自动把原始任务变成 Window16 训练配方；对照结果应与原条件分别记录。
+评估器支持原始 V2、Window16、Window16-Tau0 和 Window16-Tau0-Acc9-Hz400 四种单动作任务。任务名分别为 `Hexchip-Cartpole-Real-V2-v0`、`Hexchip-Cartpole-Real-V2-Window16-v0`、`Hexchip-Cartpole-Real-V2-Window16-Tau0-v0`、`Hexchip-Cartpole-Real-V2-Window16-Tau0-Acc9-Hz400-v0`；此评估器尚不支持双动作任务。Window16 任务本身包含 16 ms 速度观测，不得再叠加 `--velocity-observation-window-ms 16`。该参数用于原始 V2 的显式观测对照，不会自动把原始任务变成 Window16 训练配方；对照结果应与原条件分别记录。
 
 ## 仅评估的启动条件
 
@@ -67,6 +67,59 @@ python -m unittest discover -s scripts/evaluation -v
 
 测试隔离仿真器并通过公开接口注入数据/回调；没有新增集成测试。真实 Isaac Lab / GPU 的运行结果应另行记录，单元测试不能替代它。
 
+## 训练中保留候选
+
+本流程包含完整回合指标、训练中候选保存及冻结策略评估，不需要在训练分支与筛选分支之间切换。功能只对新启动的进程生效，不修改正在运行的训练。
+
+训练加 `--training-candidates` 后，每轮更新并记录日志后检查最近 100 个 rollout
+（采样批次）的完整回合。必须先积满 100 个 rollout，且窗口内至少累计 256 个完整回合，才参与排名。首先比较
+`sum(successes) / sum(completed)`，相同则比较控制台 `Mean episode length`、
+`Mean reward`，仍相同保留较早轮次。默认保留前三名，不限于 50 的整数倍。
+候选替换只删除本功能生成的候选文件，不删除周期检查点。
+
+成功率统计排除起始随机截断回合；长度与奖励来自官方日志最近 100 个结束回合，
+可能包含起始部分回合。这是两个不同窗口，长度与奖励仅用于同成功率下排序。
+训练回合可能跨多次策略更新，触发指标来自更新前采样，候选保存的是该轮更新后
+策略、价值网络和优化器状态。因此训练指标候选不是冻结策略评估冠军，更不是真机验收。
+候选窗口可以重叠、轮次可以相邻，不能视为独立试验。
+
+产物位于每个新训练目录的 `training-candidates/`：
+
+- `candidates.json`：保留的候选、排序指标、统计范围和当前训练指标首选。
+- `candidate-history.jsonl`：保存与淘汰历史。
+- `candidate_<iteration>.pt`：可续训的完整检查点。
+
+`training-checkpoints.jsonl` 同时记录候选保存事件，筛选器用它关联原始回合计数。
+正常结束输出 `TRAINING_METRIC_BEST`。每次续训重新累计窗口，不继承旧训练统计。
+当前候选功能仅支持单进程训练；不能将额外候选保存 I/O 当作吞吐性能基准。
+
+### 新训练的命令示例
+
+以下示例新建 400 Hz / Acc9 单动作实验，不要为了启用此功能重启已有实验。其他配方应在训练、筛选及导出时统一更换任务名。
+
+```powershell
+$repo = 'C:\Users\cldus\workspace\cartpole'
+$tree = "C:\Users\cldus\workspace\cartpole-training-selection-$(Get-Date -Format yyyyMMdd-HHmmss)"
+$python = 'C:\Users\cldus\IsaacLab\.venv\Scripts\python.exe'
+git -C $repo fetch origin main
+if ($LASTEXITCODE -ne 0) { throw 'fetch 失败' }
+git -C $repo worktree add --detach $tree origin/main
+if ($LASTEXITCODE -ne 0) { throw '创建工作区失败' }
+Set-Location $tree
+$env:PYTHONPATH = "$tree\source\cartpole;$env:PYTHONPATH"
+$env:PYTHONIOENCODING = 'utf-8'
+& $python .\scripts\rsl_rl\train.py `
+    --task Hexchip-Cartpole-Real-V2-Window16-Tau0-Acc9-Hz400-v0 `
+    --num_envs 512 --max_iterations 2000 `
+    --run_name scratch_window16_tau0_acc9_hz400_candidates `
+    --viz none --device cuda:0 --training-candidates
+if ($LASTEXITCODE -ne 0) { throw '训练未正常完成，请先检查日志' }
+```
+
+可调参数：`--candidate-window 100 --candidate-min-episodes 256 --candidate-keep 3
+--candidate-interval 1`。默认 interval=1，不跳过符合条件的轮次。
+续训时额外传 `--checkpoint '绝对检查点路径'`；`--max_iterations` 表示追加轮次。
+
 ## 训练结束后选择检查点
 
 `select_checkpoint.py` 只处理一个已经结束的训练目录。默认读取训练中保存的动态候选，再用冻结策略完整回合评估排名，最后用不同种子复核第一名。它不会覆盖模型，也不会控制训练进程。操作期间不要继续向该训练目录写入模型或切换评估代码。
@@ -83,7 +136,7 @@ python .\scripts\evaluation\select_checkpoint.py `
 Get-Content .\checkpoint-selection.log -Tail 30 -Encoding utf8
 ```
 
-示例中每个候选评估 64 个回合，第一名再复核 64 个回合。`--parallel-workers` 只限制并发数，不改变候选清单；不传时串行执行。批量评估固定 `--viz none`，使用 GPU PhysX。评估条件沿用所选任务的当前配置，可用 `--horizon-s` 和两个初速度区间参数显式覆盖；每个候选使用相同条件，不改变训练配置文件。
+示例中每个候选评估 64 个回合，第一名再复核 64 个回合。`--parallel-workers` 只限制并发数，不改变候选清单；不传时串行执行。多个进程共享 GPU，显存足够不保证更快，争用或显存不足时将并发降到 2 或 1。任一候选失败不会产生完整成功报告；并行取消和进程清理边界见 [训练指标](../../docs/training/episode-metrics.md#并行筛选检查点)。批量评估固定 `--viz none`，使用 GPU PhysX。评估条件沿用所选任务的当前配置，可用 `--horizon-s` 和两个初速度区间参数显式覆盖；每个候选使用相同条件，不改变训练配置文件。
 
 ### 候选来源与排名
 
@@ -93,7 +146,9 @@ Get-Content .\checkpoint-selection.log -Tail 30 -Encoding utf8
 | `--checkpoints <路径...>` | 只评估显式指定的同一训练目录内检查点，覆盖提名策略，不追加模型。 |
 | `--nomination temporal --candidates 3 --window 20` | 将可关联训练记录的检查点按迭代分成 3 个时段提名，并额外保留末检查点与动态候选，去重后可能超过 4 个。用于没有动态候选的旧训练或显式的时段对照。 |
 
-只要目录中存在动态候选文件或 manifest，就要求 manifest 为 `complete` 且清单与文件一致，包括手动指定候选时。默认模式缺失或空清单会报错，不静默回退到时段提名。详见 [动态候选保存与筛选](TRAINING_CANDIDATES.md)。
+只要目录中存在动态候选文件或 manifest，就要求 manifest 为 `complete` 且清单与文件一致，包括手动指定候选时。默认模式缺失或空清单会报错，不静默回退到时段提名。此检查不替代确认原训练进程已经退出；运行中、中断、缺失记录或文件不一致的清单不能用于筛选。
+
+允许的文件布局仅为 `<run>/model_<iteration>.pt` 与 `<run>/training-candidates/candidate_<iteration>.pt`，解析符号链接后检查。历史已淘汰候选的保存记录仍保留，但不存在的文件不会参与评估；周期检查点和候选可同轮次共存，输出目录不会冲突。`--run-dir` 必须指向具体运行目录，不能指向 `cartpole_real_v2` 父目录。旧实验未保存的轮次无法补回权重。
 
 所有模式都读取检查点内部 `iter` 并核对文件轮次，只接受可信的本项目训练产物，不使用任意 pickle 兼容回退。文件编号用于标识而不是质量评分。
 
@@ -119,3 +174,5 @@ python .\scripts\evaluation\select_checkpoint.py `
 输出位于独立的 `logs/checkpoint-selection/selection-<编号>/selection.json`，包含提名映射、日志及模型哈希、逐模型报告路径、排名、独立复核和错误信息。子进程的原始日志和配置也保留在该目录。顶层 `status=complete` 只表示流程完成，不表示成功率达到可用标准。报告中的 `nomination.method` 区分保存候选、手动指定、完整回合时段提名与 TensorBoard 时段提名。
 
 评估报告 schema 3 增加 `cart_mean_abs_velocity_m_s`、`cart_rms_velocity_m_s`、`cart_travel_m` 和 `cart_net_displacement_m`。行程是控制步末绝对速度的矩形积分；首尾位移是终态位置减实际初态位置，两者都不是回中心误差。
+
+进程清理只针对本次运行；已退出父进程遗留的后代进程不保证全部回收。清理异常需按报告的 PID 手动核查。

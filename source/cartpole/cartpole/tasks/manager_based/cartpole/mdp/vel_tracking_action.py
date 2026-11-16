@@ -30,7 +30,7 @@ class JointVelocityTrackingAction(JointEffortAction):
     """Velocity-tracking action implementing the v2 rig's stepper execution model.
 
     The rig's firmware receives a target cart velocity and tracks it with a bounded-acceleration
-    ramp (see deploy/v2/protocol.md). This term approximates the actuator response; its tracking time constant and
+    ramp (see docs/deployment/protocol.md). This term approximates the actuator response; its tracking time constant and
     effort limit still require identification on the target rig:
 
     1. the raw action is delayed by ``delay_steps`` policy steps (transport latency),

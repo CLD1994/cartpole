@@ -6,10 +6,10 @@
 
 | 路径 | 适用对象 |
 |---|---|
-| [`device/run_policy.py`](device/README.md) | 当前 Python 单动作 ONNX 运行器；固定 400/500 Hz，速度尺度 1.25 m/s。 |
-| [`device/edge/`](device/edge/README.md) | C 会话及接收适配接口；尚未集成目标板 NPU 控制循环。 |
-| `pc_runner.py`、[`edge/`](edge/README.md) | 旧 V2 200 Hz 参考控制器。其配置推送、标定及回中流程未适配当前装置，不能直接用于新模型。 |
-| [`../protocol.md`](../protocol.md) | V1 旧装置的 `S`/`P` ASCII 协议，与 V2 不同。 |
+| [`device/run_policy.py`](../../deploy/v2/device/README.md) | 当前 Python 单动作 ONNX 运行器；固定 400/500 Hz，速度尺度 1.25 m/s。 |
+| [`device/edge/`](../../deploy/v2/device/edge/README.md) | C 会话及接收适配接口；尚未集成目标板 NPU 控制循环。 |
+| `pc_runner.py`、[`edge/`](../../deploy/v2/edge/README.md) | 旧 V2 200 Hz 参考控制器。其配置推送、标定及回中流程未适配当前装置，不能直接用于新模型。 |
+| [`../protocol.md`](../../deploy/protocol.md) | V1 旧装置的 `S`/`P` ASCII 协议，与 V2 不同。 |
 
 V2 使用 **460800 8N1、ASCII 行文本**，行首、命令名与枚举值区分大小写。完整行以换行结束；接收器允许可选回车。不是二进制帧协议。
 
