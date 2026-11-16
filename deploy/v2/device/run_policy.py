@@ -17,7 +17,7 @@ from session import Session, Phase
 from step_loss_events import StepLossEventMixin
 
 
-CONFIG_KEYS = ('VEL_MAX', 'ACC_MAX', 'WDT_MS', 'WDT_DEC', 'X_MARGIN_UM',
+CONFIG_KEYS = ('VEL_MAX', 'ACC_MAX', 'WDT_MS', 'X_MARGIN_UM',
                'POLE_ZERO_URAD', 'POLE_INV', 'X_INV', 'STEP_LOSS_UM')
 GRID_PERIOD_NS = 2_000_000
 COMMAND_GAP_SOFT_S = .004
@@ -479,7 +479,7 @@ def main(a=None):
                             gate(reason)
                         if now-obs.received_at > observation_limit_s:
                             # 尚无推理候选：不用旧缓存，只消耗既有命令预算等新有效帧。
-                            # ACTIVE的FAULT/VEL_VALID/metadata失效仍由每次poll立即锁存。
+                            # ACTIVE的FAULT/STATE双路有效性/metadata失效仍由每次poll立即锁存。
                             stage = 'wait_fresh_observation'
                             report['stale_observation_waits'] += 1
                             report['max_stale_observation_age_s'] = max(
@@ -612,7 +612,7 @@ def main(a=None):
                                                   'command_gap_s': command_gap,
                                                   'command_gap_soft_warning': command_gap > COMMAND_GAP_SOFT_S,
                                                   'observation_received_clock_s': obs.received_at,
-                                                  'observation_host_age_s': completed_at-obs.received_at,
+                                                  'host_observation_age_s': completed_at-obs.received_at,
                                                   'grid_slot': candidate_slot,
                                                   'grid_due_clock_s': candidate_due_ns/1e9,
                                                   'grid_lateness_s': grid_lateness_s,

@@ -9,10 +9,10 @@
 
 struct metadata { int64_t value; double at; bool known; };
 enum field { CAL_STATE, CAL_LENGTH, CAL_SAVED, CAL_STORAGE,
-             VEL_MAX, ACC_MAX, WDT_MS, WDT_DEC, MARGIN, FIELD_COUNT };
+             VEL_MAX, ACC_MAX, WDT_MS, MARGIN, FIELD_COUNT };
 static const char *const names[FIELD_COUNT] = {
     "CAL_STATE", "CAL_LENGTH_UM", "CAL_SAVED", "CAL_STORAGE",
-    "VEL_MAX", "ACC_MAX", "WDT_MS", "WDT_DEC", "X_MARGIN_UM"
+    "VEL_MAX", "ACC_MAX", "WDT_MS", "X_MARGIN_UM"
 };
 struct device_session {
     device_limits limits;
@@ -22,6 +22,7 @@ struct device_session {
     struct metadata meta[FIELD_COUNT];
     double now, valid_at, mode_at, stop_at, last_stop_tx;
     bool clock_known, valid_known, mode_known, disable_sent;
+
 };
 
 static void invalidate(device_session *s) {
@@ -76,7 +77,6 @@ static bool metadata_ready(const device_session *s, bool require_fresh) {
         s->meta[VEL_MAX].value == s->limits.speed_mm_s &&
         s->meta[ACC_MAX].value == s->limits.acceleration_mm_s2 &&
         s->meta[WDT_MS].value == s->limits.watchdog_ms &&
-        s->meta[WDT_DEC].value == s->limits.watchdog_decel_mm_s2 &&
         s->meta[MARGIN].value == s->limits.soft_margin_um;
 }
 static bool ready(const device_session *s, bool require_fresh_metadata) {
@@ -96,6 +96,24 @@ static bool integer(const char *p, int64_t *value) {
     *value = (int64_t)v;
     return true;
 }
+static bool decimal32(const char *p, int64_t *value) {
+    const char *digits = *p == '-' ? p + 1 : p;
+    if (!*digits || (*digits == '0' && (digits[1] || p != digits))) return false;
+    for (const char *q = digits; *q; ++q) if (*q < '0' || *q > '9') return false;
+    return integer(p, value) && *value >= INT32_MIN && *value <= INT32_MAX;
+}
+static bool state_frame(device_session *s, char **words, size_t n) {
+    int64_t v[5];
+    if (n != 6) return false;
+    for (size_t i = 0; i < 5; ++i) if (!decimal32(words[i+1], &v[i])) return false;
+    if (v[0] < 0 || v[0] > 3 || v[2] < -3141592 || v[2] > 3141592) return false;
+    if (!(v[0] & 1) && (v[1] || v[3])) return false;
+    if (!(v[0] & 2) && (v[2] || v[4])) return false;
+    if (v[0] != 3) { fail(s, DEVICE_INVALID_MEASUREMENT); return true; }
+    s->valid_known = true; s->view.validity = true; s->valid_at = s->now;
+    s->view.state = (device_state){v[1], v[2], v[3], v[4], s->now, true};
+    return true;
+}
 static bool finite_positive(double x) { return isfinite(x) && x > 0; }
 
 device_session *device_session_create(device_limits l, device_send_fn send, void *context) {
@@ -104,7 +122,6 @@ device_session *device_session_create(device_limits l, device_send_fn send, void
         l.acceleration_mm_s2 < 100 || l.acceleration_mm_s2 > 30000 ||
         l.soft_margin_um < 1000 || l.soft_margin_um > 50000 ||
         l.watchdog_ms < 10 || l.watchdog_ms > 1000 ||
-        l.watchdog_decel_mm_s2 < 100 || l.watchdog_decel_mm_s2 > 30000 ||
         !finite_positive(l.state_timeout_s) || !finite_positive(l.validity_timeout_s) ||
         !finite_positive(l.metadata_timeout_s) || !finite_positive(l.stop_timeout_s)) return NULL;
     device_session *s = calloc(1, sizeof(*s));
@@ -125,35 +142,32 @@ bool device_session_feed(device_session *s, const char *line, double now) {
     device_session_tick(s, now);
     /* 失败锁存：后来的有效行不能恢复同一会话。 */
     if (s->view.phase == DEVICE_FINISHED) return false;
-    if (!line || strlen(line) >= 160) { fail(s, DEVICE_INVALID_LINE); return false; }
+    if (!line || strlen(line) >= 160) {
+        fail(s, DEVICE_INVALID_LINE);
+        /* An oversized STATE is also a protocol error before arming. */
+        if (line && !strncmp(line, "STATE ", 6) && s->view.phase == DEVICE_OBSERVING) {
+            s->view.error = DEVICE_INVALID_LINE;
+            s->view.phase = DEVICE_FINISHED;
+        }
+        return false;
+    }
     char buffer[160]; strcpy(buffer, line);
-    char *words[7]; size_t n = 0;
+    char *words[12]; size_t n = 0;
     for (char *p = strtok(buffer, " \t\r\n"); p; p = strtok(NULL, " \t\r\n")) {
-        if (n == 7) { fail(s, DEVICE_INVALID_LINE); return false; }
+        if (n == 12) goto malformed;
         words[n++] = p;
     }
     if (!n) return true;
-    if (!strcmp(words[0], "VEL_VALID")) {
-        if (n != 3 ||
-            (strcmp(words[1], "0") && strcmp(words[1], "1")) ||
-            (strcmp(words[2], "0") && strcmp(words[2], "1"))) goto malformed;
-        bool valid = !strcmp(words[1], "1") && !strcmp(words[2], "1");
-        if (!valid) {
-            invalidate(s);
-            if (s->view.phase == DEVICE_ACTIVE || s->view.phase == DEVICE_STOPPING)
-                fail(s, DEVICE_INVALID_MEASUREMENT);
-        } else {
-            /* 无效后必须重新收到STATE，不能复用旧缓存。 */
-            s->valid_known = true; s->view.validity = true; s->valid_at = now;
-        }
+    if (!strcmp(words[0], "VEL_VALID") || !strcmp(words[0], "CART_STATE1")) {
+        goto malformed;
     } else if (!strcmp(words[0], "STATE")) {
-        int64_t v[4];
-        if (n != 5) goto malformed;
-        for (int i = 0; i < 4; ++i)
-            if (!integer(words[i+1], &v[i]) || v[i] < INT32_MIN || v[i] > INT32_MAX) goto malformed;
-        if (s->valid_known && s->view.validity && fresh(s->valid_at, now, s->limits.validity_timeout_s)) {
-            s->view.state = (device_state){v[0], v[1], v[2], v[3], now, true};
+        if (strlen(line) > 52 || strncmp(line, "STATE ", 6)) goto malformed;
+        for (size_t i = 0; line[i]; ++i) {
+            if (line[i] == ' ') {
+                if (!i || !line[i+1] || line[i+1] == ' ') goto malformed;
+            } else if (line[i] == '\t' || line[i] == '\r' || line[i] == '\n') goto malformed;
         }
+        if (!state_frame(s, words, n)) goto malformed;
     } else if (!strcmp(words[0], "MODE")) {
         if (n != 3) goto malformed;
         bool disabled = !strcmp(words[1], "DISABLED") && !strcmp(words[2], "NONE");
@@ -190,7 +204,11 @@ bool device_session_feed(device_session *s, const char *line, double now) {
     device_session_tick(s, now);
     return s->view.phase == DEVICE_OBSERVING || s->view.error == DEVICE_OK;
 malformed:
-    fail(s, DEVICE_INVALID_LINE);
+    if (n && (!strcmp(words[0], "STATE") || !strcmp(words[0], "VEL_VALID") || !strcmp(words[0], "CART_STATE1")) && s->view.phase == DEVICE_OBSERVING) {
+        invalidate(s);
+        s->view.error = DEVICE_INVALID_LINE;
+        s->view.phase = DEVICE_FINISHED;
+    } else fail(s, DEVICE_INVALID_LINE);
     return false;
 }
 

@@ -2,6 +2,7 @@ import unittest
 from dataclasses import replace
 
 from session import Limits, Phase, Session
+from test_state_session import frame
 from experiment_setup import limits_from_manifest
 
 
@@ -29,14 +30,16 @@ class SessionTests(unittest.TestCase):
         self.limits = Limits(500, 1250, 10000, 10000)
         self.s = Session(self.port, self.clock, self.limits)
 
+    def state(self, x=0, th=0, vx=0, w=0, flags=3):
+        self.s.receive(frame(x=x, th=th, vx=vx, w=w, flags=flags))
+
     def ready(self):
         self.s.receive('MODE READY NONE')
         for key, value in {'CAL_STATE': 2, 'CAL_SAVED': 1, 'CAL_STORAGE': 0,
                            'CAL_LENGTH_UM': 853325, 'VEL_MAX': 1250, 'ACC_MAX': 10000,
-                           'WDT_MS': 100, 'WDT_DEC': 5000, 'X_MARGIN_UM': 10000}.items():
+                           'WDT_MS': 100, 'X_MARGIN_UM': 10000}.items():
             self.s.receive(f'OK {key} {value}')
-        self.s.receive('VEL_VALID 1 1')
-        self.s.receive('STATE 0 0 0 0')
+        self.state(0, 0, 0, 0)
 
     def test_observe_only_queries(self):
         self.s.observe()
@@ -86,22 +89,21 @@ class SessionTests(unittest.TestCase):
     def test_invalidity_stops_and_latches(self):
         self.ready()
         self.s.start()
-        self.s.receive('VEL_VALID 0 1')
+        self.state(flags=2)
         self.assertIsNone(self.s.observation)
         self.assertEqual(self.port.sent, [b'VEL 0\n'])
         self.ready()
         with self.assertRaises(RuntimeError): self.s.command(1)
 
     def test_warmup_may_recover_before_start(self):
-        self.s.receive('VEL_VALID 0 0')
+        self.state(flags=0)
         self.ready()
         self.s.start()
         self.assertEqual(self.s.phase, Phase.ACTIVE)
 
-    def test_validity_restore_needs_new_state(self):
+    def test_invalid_frame_clears_previous_state(self):
         self.ready()
-        self.s.receive('VEL_VALID 0 1')
-        self.s.receive('VEL_VALID 1 1')
+        self.state(flags=2)
         self.assertIsNone(self.s.observation)
 
     def test_state_timeout_stops(self):
@@ -111,11 +113,11 @@ class SessionTests(unittest.TestCase):
         self.s.tick()
         self.assertEqual(self.s.failure, 'measurement_timeout')
 
-    def test_heartbeat_timeout_even_with_new_state(self):
+    def test_late_atomic_frame_cannot_hide_timeout(self):
         self.ready()
         self.s.start()
         self.clock.time += .301
-        self.s.receive('STATE 0 0 0 0')
+        self.state(0, 0, 0, 0)
         self.s.tick()
         self.assertEqual(self.s.failure, 'measurement_timeout')
 
@@ -155,8 +157,7 @@ class SessionTests(unittest.TestCase):
         self.clock.time += .04
         self.s.tick()
         self.assertNotIn(b'DISABLE\n', self.port.sent)
-        self.s.receive('VEL_VALID 1 1')
-        self.s.receive('STATE 100 0 0 0')
+        self.state(100, 0, 0, 0)
         self.clock.time += .04
         self.s.tick()
         self.assertIn(b'DISABLE\n', self.port.sent)
@@ -177,13 +178,13 @@ class SessionTests(unittest.TestCase):
     def test_outward_soft_boundary_blocked(self):
         self.ready()
         self.s.start()
-        self.s.receive('STATE 417000 0 0 0')
+        self.state(417000, 0, 0, 0)
         self.assertEqual(self.s.command(1), 0)
         self.assertEqual(self.s.command(-1), -1250)
 
     def test_observation_si_keeps_firmware_frame(self):
         self.ready()
-        self.s.receive('STATE 100000 1000000 200 -300')
+        self.state(100000, 1000000, 200, -300)
         self.assertEqual(self.s.observation.si(), (.1, 1., .2, -.3))
 
     def test_clock_regression_stops(self):
@@ -208,10 +209,9 @@ class SessionTests(unittest.TestCase):
     def test_fault_recovery_can_disable_but_not_resume(self):
         self.ready()
         self.s.start()
-        self.s.receive('VEL_VALID 0 1')
+        self.state(flags=2)
         self.clock.time += .04
-        self.s.receive('VEL_VALID 1 1')
-        self.s.receive('STATE 0 0 0 0')
+        self.state(0, 0, 0, 0)
         self.clock.time += .04
         self.s.tick()
         self.s.receive('MODE DISABLED NONE')
@@ -223,8 +223,7 @@ class SessionTests(unittest.TestCase):
         self.ready()
         self.s.start()
         self.clock.time += 1.01
-        self.s.receive('VEL_VALID 1 1')
-        self.s.receive('STATE 0 0 0 0')
+        self.state(0, 0, 0, 0)
         self.s.tick()
         self.assertEqual(self.s.failure, 'metadata_unavailable')
 
@@ -246,8 +245,7 @@ class SessionTests(unittest.TestCase):
         self.ready()
         self.s.start()
         self.clock.time += .4
-        self.s.receive('VEL_VALID 1 1')
-        self.s.receive('STATE 0 0 0 0')
+        self.state(0, 0, 0, 0)
         with self.assertRaises(RuntimeError): self.s.command(1)
         self.assertEqual(self.s.failure, 'measurement_timeout')
 
@@ -256,7 +254,7 @@ class SessionTests(unittest.TestCase):
         self.s.start()
         self.s.stop()
         self.clock.time += .04
-        self.s.receive('STATE 0 0 0 0')
+        self.state(0, 0, 0, 0)
         self.clock.time += .04
         self.s.tick()
         self.assertIn(b'DISABLE\n', self.port.sent)
@@ -296,8 +294,7 @@ class SessionTests(unittest.TestCase):
         self.s.stop()
         self.s.receive('MODE FAULT STEP_LOSS')
         self.clock.time += .04
-        self.s.receive('VEL_VALID 1 1')
-        self.s.receive('STATE 0 0 0 0')
+        self.state(0, 0, 0, 0)
         self.clock.time += .04
         self.s.tick()
         self.s.receive('MODE DISABLED NONE')
@@ -310,8 +307,7 @@ class SessionTests(unittest.TestCase):
         self.s.stop()
         self.s.receive('ERR DISABLE')
         self.clock.time += .04
-        self.s.receive('VEL_VALID 1 1')
-        self.s.receive('STATE 0 0 0 0')
+        self.state(0, 0, 0, 0)
         self.clock.time += .04
         self.s.tick()
         self.s.receive('MODE DISABLED NONE')
@@ -321,15 +317,13 @@ class SessionTests(unittest.TestCase):
     def test_missing_calibration_value_revokes_previous_readback(self):
         self.ready()
         self.s.receive('OK CAL_STATE')
-        self.s.receive('VEL_VALID 1 1')
-        self.s.receive('STATE 0 0 0 0')
+        self.state(0, 0, 0, 0)
         with self.assertRaisesRegex(RuntimeError, 'CAL_STATE'): self.s.start()
 
     def test_missing_config_value_revokes_previous_readback(self):
         self.ready()
         self.s.receive('OK ACC_MAX')
-        self.s.receive('VEL_VALID 1 1')
-        self.s.receive('STATE 0 0 0 0')
+        self.state(0, 0, 0, 0)
         with self.assertRaisesRegex(RuntimeError, 'ACC_MAX'): self.s.start()
 
     def test_missing_active_config_value_latches_failure(self):
@@ -343,10 +337,9 @@ class SessionTests(unittest.TestCase):
         self.ready()
         self.s.start()
         self.s.stop()
-        self.s.receive('VEL_VALID 0 1')
+        self.state(flags=2)
         self.clock.time += .04
-        self.s.receive('VEL_VALID 1 1')
-        self.s.receive('STATE 0 0 0 0')
+        self.state(0, 0, 0, 0)
         self.clock.time += .04
         self.s.tick()
         self.s.receive('MODE DISABLED NONE')
@@ -358,7 +351,7 @@ class SessionTests(unittest.TestCase):
         self.s.start()
         with self.assertRaises(ValueError): self.s.command(2)
         self.clock.time += .5
-        self.s.receive('VEL_VALID 0 1')
+        self.state(flags=2)
         self.clock.time += .51
         self.s.tick()
         self.assertEqual(self.s.phase, Phase.FINISHED)
@@ -367,8 +360,7 @@ class SessionTests(unittest.TestCase):
 
     def test_limits_reject_invalid_integer_fields(self):
         ranges = {'speed_mm_s': (1, 2000), 'acceleration_mm_s2': (100, 30000),
-                  'margin_um': (1000, 50000), 'watchdog_ms': (10, 1000),
-                  'watchdog_decel': (100, 30000)}
+                  'margin_um': (1000, 50000), 'watchdog_ms': (10, 1000)}
         for name, (low, high) in ranges.items():
             for value in (True, '100', None, 100.5, float('nan'), low - 1, high + 1):
                 with self.subTest(name=name, value=value):

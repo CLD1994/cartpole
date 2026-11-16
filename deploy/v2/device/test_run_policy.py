@@ -8,6 +8,13 @@ from run_policy import (ControlTransport, DiagnosticTransport, BoundSession,
 from shadow import Policy
 
 class RunnerTests(unittest.TestCase):
+    def test_guard_report_names_host_receive_time(self):
+        from run_policy import guard_snapshot
+        from session import Observation
+        with patch('run_policy.state_guard', return_value=None), patch('run_policy.CLOCK', return_value=10.):
+            result = guard_snapshot(Observation(0,0,0,0,9.99), Mock())
+        self.assertEqual(result['host_received_at_s'],9.99)
+        self.assertNotIn('freshness_reference_at_s',result)
     def test_normal_expiry_is_separate_from_failure(self):
         from run_policy import check_trial_end, TrialEnd
         check_trial_end(4.99,5)
