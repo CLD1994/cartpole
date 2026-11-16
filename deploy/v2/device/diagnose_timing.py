@@ -6,8 +6,10 @@ import math
 from pathlib import Path
 import time
 
-from shadow import CLOCK, PROFILE, Policy, QueryOnlyTransport, summary
-from check import limits_from_profile
+from shadow import CLOCK, Policy, QueryOnlyTransport, summary
+import model_manifest
+from experiment_setup import limits_from_manifest, PROTOCOL_BAUD, report_path, ANGLE_SIGN
+from cli_output import print_readonly_summary, readonly_entrypoint
 from receiver import Receiver
 from session import Session
 
@@ -67,18 +69,23 @@ class ObservedSource:
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--port', required=True)
-    p.add_argument('--onnx', required=True, type=Path)
-    p.add_argument('--output', required=True, type=Path)
+    p.add_argument('--model', required=True, type=Path, help='模型导出目录')
+    p.add_argument('--json', action='store_true', help='输出机器可读 JSON')
+    p.add_argument('--output', type=Path)
     p.add_argument('--seconds', type=float, default=.5)
     p.add_argument('--scheduler', choices=('legacy', 'wait-fresh'), default='legacy')
     a = p.parse_args()
     if not math.isfinite(a.seconds) or not 0 < a.seconds <= .5:
         p.error('--seconds 必须在(0,0.5]；诊断复用运动原型的半秒窗口')
-    profile = json.loads(PROFILE.read_text(encoding='utf-8'))
-    policy = Policy(a.onnx)
+    model = a.model / 'policy.onnx'
+    manifest = model_manifest.load_manifest(a.model / 'model.json', model)
+    limits = limits_from_manifest(manifest)
+    period = 1 / limits.control_hz
+    a.output = a.output or report_path(a.model, 'timing')
+    policy = Policy(model)
     for _ in range(20):
         policy.forward((0., 0., 0., 0.))
-    report = {'diagnostic_revision': 2, 'status': 'starting', 'motion_sent': False, 'scheduler': a.scheduler,
+    report = {'diagnostic_revision': 3, 'model_manifest': manifest, 'control_period_s': period, 'status': 'starting', 'motion_sent': False, 'scheduler': a.scheduler,
               'scope': '禁用设备只读调度诊断；虚拟决策不是串口动作，不验证闭环或机械响应',
               'differences_from_motion': ['无VEL写入耗时/回执及真实动力学负载',
                   '角量固定按历史映射取反，仅比较调度，不读取或验收运动坐标合同',
@@ -95,12 +102,12 @@ def main():
         poll_s = wait_s = inference_s = None
         try:
             import serial
-            port = serial.Serial(port=None, baudrate=profile['measured']['protocol_baud'], timeout=0, write_timeout=.002)
+            port = serial.Serial(port=None, baudrate=PROTOCOL_BAUD, timeout=0, write_timeout=.002)
             port.dtr = port.rts = False
             port.port = a.port
             with port:
                 source = ObservedSource(port)
-                session = DiagnosticSession(QueryOnlyTransport(port), CLOCK, limits_from_profile(profile))
+                session = DiagnosticSession(QueryOnlyTransport(port), CLOCK, limits)
                 receiver = Receiver(source, session, CLOCK)
                 port.reset_input_buffer()
                 deadline = CLOCK()+.5
@@ -155,7 +162,7 @@ def main():
                         wait_s = CLOCK()-begin
                         continue
                     stage = 'tick'
-                    if now-next_tick > .002:
+                    if now-next_tick > period:
                         raise TimingFailure('control_deadline')
                     obs = session.observation
                     fresh = obs is not None and obs.received_at != last_sample
@@ -166,7 +173,7 @@ def main():
                     if obs is None or now-obs.received_at > .004:
                         raise TimingFailure('observation_late')
                     if a.scheduler == 'legacy':
-                        next_tick = now+.002
+                        next_tick = now+period
                     if not fresh:
                         stage = 'wait_fresh'
                         if a.scheduler == 'wait-fresh':
@@ -175,14 +182,14 @@ def main():
                             wait_s = CLOCK()-begin
                         continue
                     if a.scheduler == 'wait-fresh':
-                        next_tick = now+.002
+                        next_tick = now+period
                     last_sample = obs.received_at
                     stage = 'inference'
                     begin = CLOCK()
                     x, th, vx, w = obs.si()
-                    raw = policy.forward((x, -th, vx, -w))
+                    raw = policy.forward((x, ANGLE_SIGN*th, vx, ANGLE_SIGN*w))
                     inference_s = CLOCK()-begin
-                    if CLOCK()-obs.received_at > .004 or CLOCK()-now > .002:
+                    if CLOCK()-obs.received_at > .004 or CLOCK()-now > period:
                         raise TimingFailure('inference_deadline')
                     stage = 'predecision_poll'
                     # 固定原始截止，不因分片/新STATE到达延长候选动作的预算。
@@ -256,10 +263,10 @@ def main():
             report['receive_error'] = receiver.error if receiver else None
             json.dump(report, output, ensure_ascii=False, indent=2)
             output.write('\n')
-    print(json.dumps({k:v for k,v in report.items() if k not in ('events','virtual_decisions')}, ensure_ascii=False, indent=2))
+    print_readonly_summary(report, a.output, json_output=a.json)
     return 0 if report['status'] == 'complete' else 1
 
 
 if __name__ == '__main__':
-    raise SystemExit(main())
+    raise SystemExit(readonly_entrypoint(main))
 

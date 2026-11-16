@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import Mock, patch
 from run_policy import (ControlTransport, DiagnosticTransport, BoundSession,
                         timing_limits, valid_motion_line, next_grid_slot,
-                        candidate_refresh_allowed, load_contract)
+                        candidate_refresh_allowed)
 from shadow import Policy
 
 class RunnerTests(unittest.TestCase):
@@ -44,24 +44,6 @@ class RunnerTests(unittest.TestCase):
         self.assertFalse(BoundSession.enforce_position_limits)
     def test_dual_policy_refused_before_runtime_import(self):
         with self.assertRaisesRegex(ValueError,'unsupported_action_dimension'): Policy('unused',2)
-    def test_contract_dual_rejected(self):
-        path=Mock(); path.read_text.return_value=json.dumps({'action_type':'cart_target_velocity_acceleration'})
-        with self.assertRaisesRegex(ValueError,'single_action_contract_mismatch'):load_contract(path,'unused')
-    def test_single_contract_400_and_500(self):
-        c={'schema_version':1,'observation_order':['x','theta','xdot','thetadot'],
-           'observation_units':['m','rad','m/s','rad/s'],'action_scale_m_s':1.25,
-           'x_sign':1,'action_sign':1,'action_type':'cart_target_velocity','angle_sign':-1,
-           'firmware_coordinates':{'POLE_ZERO_URAD':0,'POLE_INV':1,'X_INV':0},
-           'export_contract_reviewed':True,'coordinate_evidence_reviewed':True,
-           'timing_mismatch_acknowledged':True,'onsite_stop_ready':True,'evidence_note':'test'}
-        for hz in (400,500):
-            c['training_control_hz']=hz; path=Mock();path.read_text.return_value=json.dumps(c)
-            with patch('run_policy.verify_model_files') as verify:
-                self.assertEqual(load_contract(path,'model')['training_control_hz'],hz)
-                verify.assert_called_once()
-        for key,value in [('training_control_hz',400.0),('action_dim',True),('schema_version',True)]:
-            bad={**c,key:value};path=Mock();path.read_text.return_value=json.dumps(bad)
-            with self.assertRaisesRegex(ValueError,'single_action_contract_mismatch'):load_contract(path,'unused')
 
 
 class ExpiryCallsiteTests(unittest.TestCase):
@@ -94,4 +76,50 @@ class ExpiryCallsiteTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError,'readback_send_deadline'):self.run_nodes(node.body,5.006)
         self.run_nodes(node.body,4.999).send_if_due.assert_called_once_with(4.999,5.)
 
-if __name__=='__main__':unittest.main()
+
+class CalibrationBindingTests(unittest.TestCase):
+    def ready_session(self):
+        from session import Limits
+        s=BoundSession(Mock(), lambda: 10., Limits(400,1250,9000,10000), {'POLE_INV':1,'X_INV':0})
+        s.transport.write.side_effect=len
+        s.mode=('READY','NONE');s._mode_at=10.
+        s.values={k:(v,10.) for k,v in s.expected_readback.items()}
+        s.values['CAL_LENGTH_UM']=(854280,10.)
+        return s
+    def test_zero_required_before_binding(self):
+        s=self.ready_session()
+        self.assertEqual(s._metadata_reason(10.),'readback_POLE_ZERO_URAD')
+    def test_invalid_zero_refused(self):
+        s=self.ready_session();s.values['POLE_ZERO_URAD']=(4000000,10.)
+        self.assertEqual(s._metadata_reason(10.),'readback_POLE_ZERO_URAD')
+    def test_binding_freezes_live_calibration(self):
+        s=self.ready_session();s.values['POLE_ZERO_URAD']=(2179945,10.)
+        snapshot=s.bind_calibration()
+        self.assertEqual(s.expected_readback['POLE_ZERO_URAD'],2179945)
+        self.assertEqual(s.bound_travel_um,854280)
+        s.values['POLE_ZERO_URAD']=(100,10.)
+        self.assertEqual(snapshot['POLE_ZERO_URAD'],2179945)
+        self.assertEqual(s._metadata_reason(10.),'readback_POLE_ZERO_URAD')
+
+class BoundActiveTests(CalibrationBindingTests):
+    def test_bound_zero_change_stops_active_session(self):
+        from session import Phase
+        s=self.ready_session();s.values['POLE_ZERO_URAD']=(2179945,10.)
+        from session import Observation
+        s.bind_calibration();s._valid=True;s._valid_at=10.
+        s.observation=Observation(0,0,0,0,10.);s.phase=Phase.ACTIVE
+        s.receive('OK POLE_ZERO_URAD 2179946')
+        self.assertEqual(s.failure,'readback_changed')
+        self.assertEqual(s.phase,Phase.STOPPING)
+    def test_stale_zero_cannot_be_bound(self):
+        s=self.ready_session();s.values['POLE_ZERO_URAD']=(2179945,8.)
+        with self.assertRaisesRegex(RuntimeError,'preflight:readback_POLE_ZERO_URAD'):
+            s.bind_calibration()
+    def test_device_acceleration_does_not_replace_training_requirement(self):
+        s=self.ready_session();s.values['POLE_ZERO_URAD']=(2179945,10.)
+        s.values['ACC_MAX']=(10000,10.)
+        with self.assertRaisesRegex(RuntimeError,'preflight:readback_ACC_MAX'):
+            s.bind_calibration()
+
+if __name__ == '__main__':
+    unittest.main()

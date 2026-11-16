@@ -1,7 +1,6 @@
 import contextlib
 import io
 import json
-from pathlib import Path
 import unittest
 from unittest.mock import Mock, patch
 
@@ -25,19 +24,15 @@ class CheckTests(unittest.TestCase):
         serial = Mock()
         serial.Serial.return_value.__enter__ = Mock(return_value=port)
         serial.Serial.return_value.__exit__ = Mock(return_value=False)
-        profile = {'configured': {'target_speed_mm_s': 1250, 'acceleration_mm_s2': 10000,
-                                  'soft_limit_margin_um': 10000},
-                   'training': {'control_hz': 500}, 'measured': {'protocol_baud': 460800}}
-        profile_path = Mock(spec=Path)
-        profile_path.read_text.return_value = json.dumps(profile)
+        manifest = {'training_control_hz': 400, 'action_scale_m_s': 1.25, 'training_acceleration_m_s2': 9.0}
         output = io.StringIO()
-        with patch.object(check, 'PROFILE', profile_path), \
+        with patch('model_manifest.load_manifest', return_value=manifest), \
              patch.object(check, 'Session', return_value=session), \
              patch.object(check, 'Receiver', return_value=receiver), \
              patch.object(check.time, 'monotonic', side_effect=[0, 0, 0, .002, .002]), \
              patch.object(check.time, 'sleep'), \
              patch.dict('sys.modules', {'serial': serial}), \
-             patch('sys.argv', ['check', '--port', 'TEST', '--seconds', '.001']), \
+             patch('sys.argv', ['check', '--port', 'TEST', '--model', 'model-dir', '--seconds', '.001', '--json']), \
              contextlib.redirect_stdout(output):
             code = check.main()
         return code, json.loads(output.getvalue())

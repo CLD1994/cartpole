@@ -7,12 +7,14 @@
 在仓库根目录运行：
 
 ```powershell
-python deploy/v2/device/check.py --port COM11 --seconds 2
+python deploy/v2/device/check.py --port COM11 --model "$model" --seconds 2
 ```
 
 需要 `pyserial`。程序仅发送 `QUERY`、`CALIB?`、`CONFIG?`，不发送 `CONFIG`、`ENABLE`、`CONFIRM LEFT` 或 `VEL`。`preflight_reason=null` 只说明本次接收值满足会话入口条件，不证明设备安全、模型匹配或采样到动作的真实延迟。程序不以退出码代替此字段。串口必须独占；不要同时运行旧控制器或固件维护工具。
 
-设备目标参数来自包内 [设备档案](../../../source/cartpole/cartpole/data/device-profile.json)，Python 不导入 Isaac Lab。控制频率目标500 Hz、速度映射上限1250 mm/s、加速度配置10000 mm/s²。这是默认 500 Hz 基线；400 Hz 配方使用独立会话档案及 9000 mm/s² 加速度。Python 调度器支持固定 400/500 Hz，但不保证硬实时，也未实现训练时逐步变化的策略周期。 C 接口接受集成方传入这些值，不能从旧 `edge/config.h` 取默认值。
+设备目标速度、加速度与控制频率来自导出目录的 `model.json`，不是当前设备读数或历史设备档案。台位的波特率、看门狗、软余量与坐标方向由 `experiment_setup.py` 集中定义；现场设备必须满足这些要求。运行器读取当前标定长度和摆角零位作为会话快照，运行中不得改变。不再手工维护模型 contract 与会话 profile 两份 JSON。
+
+默认终端只显示关键结果与报告位置；需要机器读取完整结果时使用 `--json`。报告保留诊断细节，不将长 JSON 自动刷满终端。
 
 ## 会话合同
 
@@ -77,20 +79,32 @@ Python 和 C 均要求 `1 ≤ max_line ≤ max_pending ≤ 1048576`，时间阈�
 
 ## 单动作 ONNX 联调运行器
 
-`run_policy.py` 仅支持四维观测 `[x, theta, xdot, thetadot]` 与一个归一化目标速度动作，缩放为 ±1250 mm/s。合同控制频率为 400 或 500 Hz；400 Hz 要求设备档案加速度为 9000 mm/s²。固件 STATE 可以为 500 Hz，运行器按 2.5/2 ms 绝对栅格选择新观测，不是每收一帧就推理；跳过错过的栅格，不补发突发命令。这不是硬实时承诺。
+`run_policy.py` 仅支持四维观测 `[x, theta, xdot, thetadot]` 与一个归一化目标速度动作。训练频率与加速度由模型清单取得。固件 STATE 可以为 500 Hz，400 Hz 模型按 2.5 ms 绝对栅格选择新观测，不是每收一帧就推理；跳过错过的栅格，不补发突发命令。这不是硬实时承诺。
 
-准备 `model-contract.example.json` 的独立副本，核实模型主文件及全部外部权重 SHA256、坐标方向、控制频率和现场条件。签认是操作者声明，不是自动验收。用 `--profile` 指定本次设备档案，校准行程、频率、加速度、软限位余量必须与现场读回一致；不修改仓库默认档案以冒充实际配置。
+### 一次准备模型
+
+使用训练时同一任务导出 ONNX 后，在仓库根目录运行：
 
 ```powershell
-# $python、$onnx、$contract、$sessionProfile、$hostTree 均为已核实的本次路径。
-$report = Join-Path $exportRoot ('control-' + [guid]::NewGuid().ToString('N') + '.json')
-& $python (Join-Path $hostTree 'deploy\v2\device\run_policy.py') `
-  --port COM11 --onnx $onnx --contract $contract --profile $sessionProfile `
-  --output $report --seconds 5 --start-confirmed
+# 两个路径必须属于同一个已核实的模型。
+& $python scripts/rsl_rl/prepare_model.py --onnx $onnx --checkpoint $checkpoint
 ```
 
-运行器不自动 ENABLE、不标定、不设置固件参数。必须由现场步骤先准备 READY；启动检查失败也会在已知 READY 时尝试零速、停稳、DISABLE。使用 `--continuous` 替代 `--seconds 5` 进入有人监控持续运行，Ctrl+C 请求停车。每次使用新的报告文件；已有文件拒绝覆盖。报告中 `disabled_confirmed` 才代表已收到 DISABLED 确认，单独的退出码不能证明停车。
+准备工具从训练运行目录的 `params/env.yaml` 提取并核验动作、观测和训练时序，计算主文件与全部外部权重散列，在导出目录生成 `model.json`。缺失或不支持的配置明确报错，不依据文件名猜测 400 Hz 或 Acc9。清单记录训练配置、检查点和导出文件的来源；同时指定两个文件是操作者的同源声明，文件散列本身不能证明任意 ONNX 确由指定检查点导出。旧模型也使用这个准备入口，无需重写旧 contract/profile。
 
+### 开始实验
+
+```powershell
+$model = Split-Path $onnx
+& $python deploy/v2/device/run_policy.py --port COM11 --model $model `
+  --continuous --start-confirmed
+```
+
+`--model` 指向同时包含 `policy.onnx`、外部权重和 `model.json` 的目录。短时控制改用 `--seconds 5`。默认自动生成唯一报告；可用 `--output` 指定新文件，但已有文件拒绝覆盖。报告保存模型清单与实际设备标定快照，不需要每次复制 JSON 或修改行程值。
+
+运行器不自动 ENABLE、不标定、不设置固件参数。现场先完成必要的左参考并准备 READY。预检会核对速度、加速度、看门狗和方向；不匹配时明确失败，不用设备当前值反过来改写训练要求。合法的标定长度和零位在首条动作前锁定，之后发生变化则停止。启动检查失败也会在已知 READY 时尝试零速、停稳、DISABLE。
+
+持续运行要求现场监控，Ctrl+C 请求停车。摘要和报告中的 `disabled_confirmed` 才代表已收到 DISABLED 确认，单独的退出码不能证明停车。
 位置保护由固件负责，运行器不施加额外位置门或摆角门。有效测量、坐标/标定一致性、固件状态、读回有效期和命令时限仍独立检查。持续运行逐条刷新 CONFIG? 键值，只有真实新回执延长有效期。
 
 ### 时序配置与只读诊断
