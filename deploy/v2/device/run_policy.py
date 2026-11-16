@@ -15,6 +15,7 @@ from model_integrity import verify_model_files
 from receiver import Receiver
 from session import Session, Phase
 from step_loss_events import StepLossEventMixin
+from angle_pause import AnglePause
 
 
 CONFIG_KEYS = ('VEL_MAX', 'ACC_MAX', 'WDT_MS', 'X_MARGIN_UM',
@@ -233,6 +234,7 @@ def guard_snapshot(obs, session, starting=False):
             'limits': {'max_abs_x_m': None,
                        'position_owner': 'firmware',
                        'max_abs_theta_rad': None,
+                       'angle_limit_scope': 'terminal_gate_disabled; pause_resume_thresholds_in_report_angle_pause',
                        'max_abs_vx_m_s': .05 if starting else None,
                        'max_abs_omega_rad_s': .5 if starting else None},
             'reason': state_guard(obs, session, starting) if obs else 'measurement_unavailable'}
@@ -245,6 +247,9 @@ def parse_args(argv=None):
     p.add_argument('--output', type=Path, help='完整报告；默认在模型 runs 目录生成唯一文件')
     p.add_argument('--acceleration-limit-mm-s2', type=int, help='显式部署加速度上限，精确核验固件读回；不修改模型训练参数')
     p.add_argument('--velocity-limit-mm-s', type=int, help='显式降低部署速度上限；保留模型动作倍率并饱和限幅，不修改固件配置')
+    p.add_argument('--angle-pause-deg', type=float, default=60., help='绝对摆角达到此角度时暂停速度命令')
+    p.add_argument('--angle-resume-deg', type=float, default=58., help='绝对摆角回落至此角度时自动重新推理')
+    p.add_argument('--command-gap-hard-ms', type=float, choices=(6., 9.), help='显式覆盖命令硬期限；不改变观测或推理期限')
     p.add_argument('--json', action='store_true', help='终端输出机器可读摘要 JSON')
     duration_args = p.add_mutually_exclusive_group()
     duration_args.add_argument('--seconds', type=float, default=5.)
@@ -256,6 +261,10 @@ def parse_args(argv=None):
     p.add_argument('--timing-profile', choices=('normal', 'debug'), default='normal',
                    help='debug显式采用15ms命令/12ms观测期限；不是硬实时保证')
     a = p.parse_args(argv)
+    try:
+        AnglePause(a.angle_pause_deg, a.angle_resume_deg)
+    except ValueError:
+        p.error('摆角必须满足 0 <= resume < pause <= 180')
     event_diag = a.step_loss_monitor
     if a.continuous and a.diagnostic_timing:
         p.error('--continuous不能与只读诊断组合')
@@ -277,6 +286,9 @@ def main(a=None):
     model = a.model / 'policy.onnx'
     manifest = load_manifest(a.model / 'model.json', model)
     hard_limit_s, observation_limit_s, inference_limit_s = timing_limits(a.timing_profile)
+    if a.command_gap_hard_ms is not None:
+        hard_limit_s = a.command_gap_hard_ms / 1000.
+    pause = AnglePause(a.angle_pause_deg, a.angle_resume_deg)
     period_ns = 1_000_000_000 // manifest['training_control_hz']
     limits = limits_from_manifest(manifest, velocity_limit_mm_s=getattr(a, "velocity_limit_mm_s", None),
                                   acceleration_limit_mm_s2=getattr(a, "acceleration_limit_mm_s2", None))
@@ -285,7 +297,7 @@ def main(a=None):
         policy.forward((0., 0., 0., 0.))
     # 外部权重初始化前后均核验；在运行期间不可改动导出文件。
     verified_files = verify_model_files(model, manifest)
-    report = {'loop_interval_scope': 'new-observation decision ticks, not serial command completion', 'runner_revision': 17, 'timing_profile': a.timing_profile, 'control_hz': limits.control_hz, 'grid_period_ns': period_ns, 'action_dim': 1, 'host_angle_gate': False, 'diagnostic_timing': a.diagnostic_timing, 'discarded_stale_candidates': 0, 'candidate_refresh_stages': {}, 'stale_observation_waits': 0, 'max_stale_observation_age_s': 0., 'grid_slots_skipped': 0, 'over_period_late_candidates': 0, 'readback_refresh': [], 'scheduler': 'absolute-grid-wait-fresh', 'duplicate_tick_count': 0, 'verified_model_files': verified_files, 'status': 'starting', 'scope': '限时真机联调；不是硬实时或真机验收',
+    report = {'loop_interval_scope': 'new-observation decision ticks, not serial command completion', 'runner_revision': 18, 'timing_profile': a.timing_profile, 'control_hz': limits.control_hz, 'grid_period_ns': period_ns, 'action_dim': 1, 'host_angle_gate': not a.diagnostic_timing, 'host_angle_gate_mode': 'disabled_diagnostic' if a.diagnostic_timing else 'pause_resume', 'diagnostic_timing': a.diagnostic_timing, 'discarded_stale_candidates': 0, 'candidate_refresh_stages': {}, 'stale_observation_waits': 0, 'max_stale_observation_age_s': 0., 'grid_slots_skipped': 0, 'over_period_late_candidates': 0, 'readback_refresh': [], 'scheduler': 'absolute-grid-wait-fresh', 'duplicate_tick_count': 0, 'verified_model_files': verified_files, 'status': 'starting', 'scope': '限时真机联调；不是硬实时或真机验收',
               'timing_limits_s': {'command_gap_soft': COMMAND_GAP_SOFT_S, 'command_gap_hard': hard_limit_s, 'observation_max_age': observation_limit_s},
               'rig_requirements': {'protocol_baud': PROTOCOL_BAUD, 'config': limits.config,
                                    'coordinates': dict(RIG_COORDINATES), 'angle_sign': ANGLE_SIGN,
@@ -303,8 +315,13 @@ def main(a=None):
         report['readback_refresh'] = deque(maxlen=512)
         report['retention'] = {'samples':10000,'inference_attempts':10000,'intervals':10000,
                                'readback_groups':512,'scope':'recent bounded tail, not complete run'}
+    report['angle_pause'] = {'enabled': not a.diagnostic_timing,
+        'enter_deg': a.angle_pause_deg, 'resume_deg': a.angle_resume_deg,
+        'events': [],
+        'pause_count': 0, 'resume_count': 0, 'intentional_completion_gaps': 0}
     report['run_totals'] = {'command_completions':0,'command_gaps_over_4ms':0,
-        'command_gaps_at_or_over_6ms':0,'command_gaps_at_or_over_hard_limit':0,'maximum_command_gap_s':0.,
+        'command_gaps_at_or_over_6ms':0,'command_gaps_at_or_over_hard_limit':0,'maximum_command_gap_s':0.,'maximum_active_command_gap_s':0.,
+        'command_gap_scope':'maximum_command_gap_s includes intentional pauses; active maximum and over-limit counts exclude marked pause gaps',
         'inference_attempts':0,'inference_total_s':0.,'maximum_inference_s':0.}
     if a.diagnostic_timing:
         report['scope'] = 'DISABLED同路径只读诊断；虚拟命令完成不包含真实串口动作写入/设备运动负载'
@@ -318,9 +335,23 @@ def main(a=None):
         row = report['would_stop'].setdefault(reason, {'count': 0, 'first_clock_s': CLOCK(), 'last_clock_s': None})
         row['count'] += 1
         row['last_clock_s'] = CLOCK()
+    def update_pause(observation, now):
+        nonlocal budget_at
+        if a.diagnostic_timing:
+            return None
+        transition = pause.check(observation, now, budget_at, hard_limit_s, observation_limit_s)
+        if transition:
+            info = report['angle_pause']
+            info['pause_count' if transition == 'paused' else 'resume_count'] += 1
+            info['events'].append({'event': transition, 'elapsed_s': now-start,
+                                   'abs_angle_deg': abs(math.degrees(observation.si()[1]))})
+            del info['events'][:-512]
+            if transition == 'resumed':
+                budget_at = now
+        return transition
     def discard_expired_candidate(observation):
         check_trial_end(CLOCK(), end)
-        if not candidate_refresh_allowed(CLOCK(), observation.received_at, last_command_at, end,
+        if not candidate_refresh_allowed(CLOCK(), observation.received_at, budget_at, end,
                                          observation_limit_s, hard_limit_s):
             return False
         report['discarded_stale_candidates'] += 1
@@ -333,7 +364,7 @@ def main(a=None):
         session = receiver = probe = None
         intervals = deque(maxlen=10000) if a.continuous else []
         stage = 'startup'
-        start = end = last_command_at = next_tick = next_slot = None
+        start = end = last_command_at = budget_at = next_tick = next_slot = None
         drain = refresh = None
         # Startup evidence only; no synchronous disk writes in the active control loop.
         initial_manifest = {k:v for k,v in report.items() if not isinstance(v,deque)}
@@ -448,7 +479,7 @@ def main(a=None):
                     next_tick_ns = grid_start_ns
                     end = math.inf if a.continuous else start + a.seconds
                     last_tick = last_sample = None
-                    last_command_at = start
+                    last_command_at = budget_at = start
                     if a.continuous or a.seconds > .5:
                         refresh = ReadbackCycle(transport, report['readback_refresh'], start)
                     while CLOCK() < end:
@@ -462,8 +493,27 @@ def main(a=None):
                         now = now_ns / 1e9
                         if refresh:
                             refresh.update(session, now)
+                        stage = 'angle_pause_check'
+                        # 非暂停仍先检查原命令预算；暂停只豁免故意停发的间隔。
+                        transition = update_pause(session.observation, now)
+                        if transition == 'resumed':
+                            next_slot = next_grid_slot(next_slot, grid_start_ns, now_ns, period_ns)
+                            next_tick_ns = grid_start_ns + next_slot*period_ns
+                            next_tick = next_tick_ns/1e9
+                            last_sample = last_tick = None
+                        if pause.paused and not a.diagnostic_timing:
+                            stage = 'angle_paused'
+                            if state_guard(session.observation, session):
+                                raise RuntimeError('paused_state_guard')
+                            if refresh:
+                                refresh.send_if_due(now, end)
+                            # 读回写入也不允许遮蔽新的观测超时。
+                            update_pause(session.observation, CLOCK())
+                            check_trial_end(CLOCK(), end)
+                            time.sleep(.0001)
+                            continue
                         stage = 'gap_check'
-                        if now-last_command_at >= hard_limit_s:
+                        if now-budget_at >= hard_limit_s:
                             gate('command_gap_deadline')
                         if now_ns < next_tick_ns:
                             stage = 'wait_tick'
@@ -487,9 +537,9 @@ def main(a=None):
                             report['stale_observation_waits'] += 1
                             report['max_stale_observation_age_s'] = max(
                                 report['max_stale_observation_age_s'], now-obs.received_at)
-                            remaining = min(last_command_at+hard_limit_s, end)-CLOCK()
+                            remaining = min(budget_at+hard_limit_s, end)-CLOCK()
                             if remaining <= 0:
-                                if CLOCK() >= last_command_at+hard_limit_s:
+                                if CLOCK() >= budget_at+hard_limit_s:
                                     gate('wait_fresh_command_deadline')
                                 check_trial_end(CLOCK(), end)
                             time.sleep(min(.0001, remaining) if remaining > 0 else .0001)
@@ -497,7 +547,7 @@ def main(a=None):
                         if obs.received_at == last_sample:
                             report['duplicate_tick_count'] += 1
                             stage = 'wait_fresh'
-                            time.sleep(min(.0002, max(0., min(last_command_at+hard_limit_s, obs.received_at+observation_limit_s, end)-CLOCK())))
+                            time.sleep(min(.0002, max(0., min(budget_at+hard_limit_s, obs.received_at+observation_limit_s, end)-CLOCK())))
                             continue
                         if last_tick is not None:
                             intervals.append(now-last_tick)
@@ -517,7 +567,7 @@ def main(a=None):
                         stage = 'inference'
                         begin = CLOCK()
                         check_trial_end(begin, end)
-                        if begin >= min(last_command_at+hard_limit_s, obs.received_at+observation_limit_s, end):
+                        if begin >= min(budget_at+hard_limit_s, obs.received_at+observation_limit_s, end):
                             if discard_expired_candidate(obs):
                                 continue
                             gate('candidate_deadline')
@@ -542,7 +592,7 @@ def main(a=None):
                                 continue
                         # 分片/新字节可在poll末尾到达；仅在固定原始截止内补收。
                         stage = 'precommand_receive'
-                        receive_deadline = min(last_command_at+hard_limit_s, obs.received_at+observation_limit_s, end)
+                        receive_deadline = min(budget_at+hard_limit_s, obs.received_at+observation_limit_s, end)
                         drain = {'deadline_clock_s': receive_deadline, 'polls': 0,
                                  'wait_s': 0., 'started_clock_s': CLOCK()}
                         retry_candidate = False
@@ -566,6 +616,9 @@ def main(a=None):
                                 if latest is None:
                                     raise RuntimeError('latest_state_missing')
                                 gate('latest_state_limit')
+                            if update_pause(latest, CLOCK()) == 'paused':
+                                retry_candidate = True
+                                break  # 已发生暂停：不发送旧候选，恢复后重新推理。
                             pending = transport.in_waiting
                             drain.update(pending_bytes=pending, partial=transport.partial,
                                          elapsed_s=CLOCK()-drain['started_clock_s'])
@@ -602,18 +655,25 @@ def main(a=None):
                         command_gap = completed_at-last_command_at
                         totals=report['run_totals']
                         totals['command_completions']+=1
-                        totals['command_gaps_over_4ms']+=int(command_gap>COMMAND_GAP_SOFT_S)
-                        totals['command_gaps_at_or_over_6ms']+=int(command_gap>=.006)
-                        totals['command_gaps_at_or_over_hard_limit']+=int(command_gap>=hard_limit_s)
+                        intentional_gap = pause.resumed_since_command and not a.diagnostic_timing
+                        pause.resumed_since_command = False
+                        if intentional_gap:
+                            report['angle_pause']['intentional_completion_gaps'] += 1
+                        totals['command_gaps_over_4ms']+=int(not intentional_gap and command_gap>COMMAND_GAP_SOFT_S)
+                        totals['command_gaps_at_or_over_6ms']+=int(not intentional_gap and command_gap>=.006)
+                        totals['command_gaps_at_or_over_hard_limit']+=int(not intentional_gap and command_gap>=hard_limit_s)
                         totals['maximum_command_gap_s']=max(totals['maximum_command_gap_s'],command_gap)
-                        last_command_at = completed_at
+                        if not intentional_gap:
+                            totals['maximum_active_command_gap_s']=max(totals['maximum_active_command_gap_s'],command_gap)
+                        last_command_at = budget_at = completed_at
                         if not a.diagnostic_timing:
                             report['motion_command_sent'] = True
                         report['samples'].append({'elapsed_s': CLOCK()-start, 'state_si': obs.si(),
                                                   'control_source': command_phase, 'raw_action': raw, 'velocity_mm_s': velocity, 'acceleration_mm_s2': acceleration,
                                                   'inference_s': inference_s,
                                                   'command_gap_s': command_gap,
-                                                  'command_gap_soft_warning': command_gap > COMMAND_GAP_SOFT_S,
+                                                  'intentional_angle_pause_gap': intentional_gap,
+                                                  'command_gap_soft_warning': not intentional_gap and command_gap > COMMAND_GAP_SOFT_S,
                                                   'observation_received_clock_s': obs.received_at,
                                                   'host_observation_age_s': completed_at-obs.received_at,
                                                   'grid_slot': candidate_slot,
@@ -637,12 +697,12 @@ def main(a=None):
                             # 已成功写入新速度后才安排单条只读查询，不与其他查询叠加。
                             stage = 'readback_query'
                             query_at = CLOCK()
-                            if query_at >= last_command_at+hard_limit_s:
+                            if query_at >= budget_at+hard_limit_s:
                                 gate('readback_send_deadline')
                             check_trial_end(query_at, end)
                             refresh.send_if_due(query_at, end)
                             query_done = CLOCK()
-                            if query_done >= last_command_at+hard_limit_s:
+                            if query_done >= budget_at+hard_limit_s:
                                 gate('readback_write_deadline')
                             check_trial_end(query_done, end)
                     report['status'] = 'trial_ended'
@@ -702,11 +762,11 @@ def main(a=None):
             report['received_state_gap_scope'] = 'valid ACTIVE STATE parses in measurement window; not device sample/wire arrival timing' if a.diagnostic_timing else 'not_recorded'
             report['summary_scope']='retained recent tail; run_totals are full-run' if a.continuous else 'complete recorded run'
             report['loop_interval_s'] = summary(intervals)
-            report['completion_gap_s'] = summary([r['command_gap_s'] for r in report['samples']])
-            report['completion_gap_scope'] = 'virtual_no_action_write' if a.diagnostic_timing else 'actual_host_write_completion'
-            report['completion_gaps_over_6ms'] = sum(r['command_gap_s'] >= .006 for r in report['samples'])
-            report['completion_gaps_at_or_over_hard_limit'] = sum(r['command_gap_s'] >= hard_limit_s for r in report['samples'])
-            report['completion_gaps_over_4ms'] = sum(r['command_gap_s'] > COMMAND_GAP_SOFT_S for r in report['samples'])
+            report['completion_gap_s'] = summary([r['command_gap_s'] for r in report['samples'] if not r.get('intentional_angle_pause_gap')])
+            report['completion_gap_scope'] = 'virtual_no_action_write' if a.diagnostic_timing else 'actual_host_write_completion_excluding_marked_angle_pause_gaps'
+            report['completion_gaps_over_6ms'] = sum(r['command_gap_s'] >= .006 for r in report['samples'] if not r.get('intentional_angle_pause_gap'))
+            report['completion_gaps_at_or_over_hard_limit'] = sum(r['command_gap_s'] >= hard_limit_s for r in report['samples'] if not r.get('intentional_angle_pause_gap'))
+            report['completion_gaps_over_4ms'] = sum(r['command_gap_s'] > COMMAND_GAP_SOFT_S for r in report['samples'] if not r.get('intentional_angle_pause_gap'))
             report['inference_s'] = summary(report['inference_attempts_s'])
             report['inference_scope'] = ('retained recent policy.forward attempts including discarded candidates; excludes warmup' if a.continuous else 'all measured policy.forward attempts including discarded candidates; excludes warmup')
             report['completed_candidate_inference_s'] = summary([r['inference_s'] for r in report['samples'] if r['inference_s'] is not None])

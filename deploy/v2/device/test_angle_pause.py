@@ -1,0 +1,39 @@
+import math
+import unittest
+from angle_pause import AnglePause
+from session import Observation
+
+def obs(deg, at=1.):
+    return Observation(0, round(math.radians(deg)*1e6), 0, 0, at)
+
+class AnglePauseTests(unittest.TestCase):
+    def test_hysteresis_and_resume_budget(self):
+        p=AnglePause()
+        self.assertEqual(p.check(obs(61),1.,.999,.006,.004),'paused')
+        self.assertEqual(p.check(obs(59,2.),2.,.999,.006,.004),None)
+        self.assertTrue(p.paused)
+        self.assertEqual(p.check(obs(57,3.),3.,.999,.006,.004),'resumed')
+        self.assertFalse(p.paused)
+    def test_expired_active_budget_cannot_enter_pause(self):
+        p=AnglePause()
+        with self.assertRaisesRegex(RuntimeError,'command_gap_deadline'):
+            p.check(obs(80),1.,.99,.006,.004)
+        self.assertFalse(p.paused)
+    def test_pause_still_requires_fresh_measurement(self):
+        p=AnglePause();p.check(obs(80),1.,1.,.006,.004)
+        with self.assertRaisesRegex(RuntimeError,'angle_pause_observation_deadline'):
+            p.check(obs(80),1.005,1.,.006,.004)
+    def test_invalid_thresholds(self):
+        for pair in ((60,60),(60,61),(0,0),(181,58),(float('nan'),58)):
+            with self.assertRaises(ValueError):AnglePause(*pair)
+    def test_repeat_does_not_emit_transition(self):
+        p=AnglePause();p.check(obs(-80),1.,1.,.006,.004)
+        self.assertIsNone(p.check(obs(-80,2),2,1,.006,.004))
+
+    def test_normal_stale_observation_keeps_existing_runner_wait_path(self):
+        self.assertIsNone(AnglePause().check(obs(10),1.005,1.004,.006,.004))
+    def test_cli_explicit_nine_ms_does_not_change_profile(self):
+        from run_policy import parse_args, timing_limits
+        args=parse_args(['--port','COM11','--model','unused','--start-confirmed','--command-gap-hard-ms','9'])
+        self.assertEqual(args.command_gap_hard_ms,9.)
+        self.assertEqual(timing_limits(args.timing_profile),(.006,.004,.002))
