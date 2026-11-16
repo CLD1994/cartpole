@@ -152,3 +152,24 @@ python -m unittest discover -s deploy/v2/device -p 'test_*.py'
 python -m unittest discover -s deploy/v2/device/integration_tests
 make -C deploy/v2/device/edge test
 ```
+
+### 保留训练动作倍率的部署限幅
+
+Python `run_policy.py` 支持显式 `--velocity-limit-mm-s 900`。模型清单与 ONNX 不变：先按训练动作倍率计算并取整目标速度，再将其饱和至部署上限。例如训练倍率 1250 mm/s 时，动作 0.5 输出 625 mm/s，动作 1 输出 900 mm/s。这不是将所有动作重新缩放至 900，也不代表模型曾在该限幅下训练或已经验证稳定。
+
+该参数必须是正整数且不得超过模型倍率；省略时保持模型原契约。预检与运行中读回均要求固件 `VEL_MAX` 精确等于所选部署上限，工具不会自行改固件配置。控制周期、测量有效性、FAULT 和时序门禁保持不变。可另用 `--acceleration-limit-mm-s2 10000` 显式选择部署加速度，允许固件范围 100～30000 mm/s²，预检与运行中读回均必须精确匹配。模型训练加速度仍为原值，例如 9 m/s²；这不是将其改称 10 m/s²。未传该选项时仍要求训练值。报告分别记录训练倍率/加速度、部署上限和分布偏移；增大部署加速度不代表已验证安全或稳定。
+
+仅 Python 入口支持该选项，C 入口及其他检查脚本仍按原模型完整契约运行。先在训练负载已启动且设备为 DISABLED 时做只读同路径诊断：
+
+```powershell
+python deploy/v2/device/run_policy.py --port COM11 --model <导出目录> --velocity-limit-mm-s 900 --acceleration-limit-mm-s2 10000 --diagnostic-timing
+```
+
+确认模型、固件参数、标定、现场状态和训练并发负载下的时序后，先短程验证，再使用受监控持续控制；端口和模型目录必须替换为实际值：
+
+```powershell
+python deploy/v2/device/run_policy.py --port COM11 --model <导出目录> --velocity-limit-mm-s 900 --acceleration-limit-mm-s2 10000 --seconds 0.5 --start-confirmed
+python deploy/v2/device/run_policy.py --port COM11 --model <导出目录> --velocity-limit-mm-s 900 --acceleration-limit-mm-s2 10000 --continuous --start-confirmed
+```
+
+控制推理使用 CPU 单线程；GPU 训练仍可能通过 CPU、内存和系统调度竞争影响控制。保持正常时序门禁，不以 debug 放宽期限掩盖竞争。持续控制需要现场监控，不能无人值守；运行期间不得替换模型文件。

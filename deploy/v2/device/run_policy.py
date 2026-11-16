@@ -243,6 +243,8 @@ def parse_args(argv=None):
     p.add_argument('--port', required=True)
     p.add_argument('--model', required=True, type=Path, help='含 policy.onnx 与 model.json 的导出目录')
     p.add_argument('--output', type=Path, help='完整报告；默认在模型 runs 目录生成唯一文件')
+    p.add_argument('--acceleration-limit-mm-s2', type=int, help='显式部署加速度上限，精确核验固件读回；不修改模型训练参数')
+    p.add_argument('--velocity-limit-mm-s', type=int, help='显式降低部署速度上限；保留模型动作倍率并饱和限幅，不修改固件配置')
     p.add_argument('--json', action='store_true', help='终端输出机器可读摘要 JSON')
     duration_args = p.add_mutually_exclusive_group()
     duration_args.add_argument('--seconds', type=float, default=5.)
@@ -276,7 +278,8 @@ def main(a=None):
     manifest = load_manifest(a.model / 'model.json', model)
     hard_limit_s, observation_limit_s, inference_limit_s = timing_limits(a.timing_profile)
     period_ns = 1_000_000_000 // manifest['training_control_hz']
-    limits = limits_from_manifest(manifest)
+    limits = limits_from_manifest(manifest, velocity_limit_mm_s=getattr(a, "velocity_limit_mm_s", None),
+                                  acceleration_limit_mm_s2=getattr(a, "acceleration_limit_mm_s2", None))
     policy = Policy(model)
     for _ in range(20):
         policy.forward((0., 0., 0., 0.))
@@ -287,7 +290,7 @@ def main(a=None):
               'rig_requirements': {'protocol_baud': PROTOCOL_BAUD, 'config': limits.config,
                                    'coordinates': dict(RIG_COORDINATES), 'angle_sign': ANGLE_SIGN,
                                    'x_sign': 1, 'action_sign': 1},
-              'model_manifest': manifest, 'clock': vars(time.get_clock_info('perf_counter')),
+              'deployment_acceleration': {'training_mm_s2': limits.acceleration_mm_s2, 'firmware_limit_mm_s2': limits.firmware_acceleration_mm_s2, 'distribution_shift': limits.firmware_acceleration_mm_s2 != limits.acceleration_mm_s2}, 'deployment_velocity': {'model_scale_mm_s': limits.speed_mm_s, 'firmware_limit_mm_s': limits.firmware_speed_mm_s, 'mapping': 'training_scale_then_saturation', 'distribution_shift': limits.firmware_speed_mm_s != limits.speed_mm_s}, 'model_manifest': manifest, 'clock': vars(time.get_clock_info('perf_counter')),
               'continuous': a.continuous, 'requested_seconds': None if a.continuous else a.seconds, 'samples': [], 'received_states': [], 'inference_attempts_s': [], 'would_stop_count_scope': 'gate invocation counts, not independent faults or failed cycles', 'would_stop': {}, 'virtual_command_attempted': False, 'motion_command_sent': False, 'motion_command_attempted': False}
     if a.step_loss_monitor:
         report['step_loss_monitor_config'] = {'model_continues': True, 'event_run_matches_current_firmware_run_verified': False, 'event_wait_timeout_s': None, 'pre_event_sample_limit': 400, 'post_event_sample_limit': 2000, 'scope': '首个同run事件的控制决策样本窗口；非全部串口STATE、非固定物理时长；完成后不被尾缓冲覆盖'}
@@ -402,7 +405,7 @@ def main(a=None):
                             if CLOCK()-probe_at >= .2:
                                 raise RuntimeError('single_config_readback_unsupported_or_timeout')
                             entry = session.values.get('VEL_MAX')
-                            if (entry and entry[1] > probe_at and entry[0] == limits.speed_mm_s
+                            if (entry and entry[1] > probe_at and entry[0] == limits.firmware_speed_mm_s
                                     and not transport.partial and transport.in_waiting == 0):
                                 report['single_config_capability'] = {
                                     'verified': True, 'response_s': CLOCK()-probe_at}
@@ -436,7 +439,7 @@ def main(a=None):
                             print('事件记录：同 run STEP_LOSS 仅记录；FAULT 仍停车，Ctrl+C 停止。', flush=True)
                     if not a.json:
                         duration = '持续运行，Ctrl+C 停止' if a.continuous else f'{a.seconds:g} 秒'
-                        print(f'预检通过：{limits.control_hz:g} Hz，{limits.speed_mm_s} mm/s，{limits.acceleration_mm_s2} mm/s²；{duration}。', flush=True)
+                        print(f'预检通过：{limits.control_hz:g} Hz，{limits.speed_mm_s} mm/s 模型倍率，{limits.firmware_speed_mm_s} mm/s 部署限幅，{limits.firmware_acceleration_mm_s2} mm/s² 部署加速度（训练 {limits.acceleration_mm_s2}）；{duration}。', flush=True)
                         print(f'报告：{a.output}', flush=True)
                     session.start()
                     grid_start_ns = time.perf_counter_ns()

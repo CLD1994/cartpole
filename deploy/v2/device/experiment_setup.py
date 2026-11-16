@@ -10,14 +10,16 @@ RIG_COORDINATES = {'POLE_INV': 1, 'X_INV': 0}
 ANGLE_SIGN = -1
 
 
-def limits_from_manifest(manifest):
+def limits_from_manifest(manifest, *, velocity_limit_mm_s=None, acceleration_limit_mm_s2=None):
     def milliscale(name):
         value = manifest[name] * 1000
         if not math.isfinite(value) or not math.isclose(value, round(value), rel_tol=0, abs_tol=1e-9):
             raise ValueError('firmware_unit_precision:' + name)
         return round(value)
     return Limits(manifest['training_control_hz'], milliscale('action_scale_m_s'),
-                  milliscale('training_acceleration_m_s2'), 10000)
+                  milliscale('training_acceleration_m_s2'), 10000,
+                  deployment_speed_mm_s=velocity_limit_mm_s,
+                  deployment_acceleration_mm_s2=acceleration_limit_mm_s2)
 
 
 def report_path(model_directory, kind='run'):

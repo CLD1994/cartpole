@@ -32,12 +32,24 @@ class Limits:
     validity_timeout_s: float = .3
     preflight_timeout_s: float = 1.
     stop_timeout_s: float = 1.
+    deployment_speed_mm_s: int | None = None
+    deployment_acceleration_mm_s2: int | None = None
 
     def __post_init__(self):
         # These integer limits match the firmware CONFIG protocol, not measured capacity.
         integer_ranges = {'speed_mm_s': (1, 2000), 'acceleration_mm_s2': (100, 30000),
                           'margin_um': (1000, 50000), 'watchdog_ms': (10, 1000)}
         for name, value in vars(self).items():
+            if name == "deployment_acceleration_mm_s2":
+                if value is not None and (isinstance(value, bool) or not isinstance(value, Integral)
+                                          or not 100 <= value <= 30000):
+                    raise ValueError("deployment_acceleration_mm_s2 必须是 [100, 30000] 范围内的整数")
+                continue
+            if name == "deployment_speed_mm_s":
+                if value is not None and (isinstance(value, bool) or not isinstance(value, Integral)
+                                          or not 1 <= value <= self.speed_mm_s):
+                    raise ValueError("deployment_speed_mm_s 必须是正整数且不超过模型速度倍率")
+                continue
             if name in integer_ranges:
                 low, high = integer_ranges[name]
                 if isinstance(value, bool) or not isinstance(value, Integral) or not low <= value <= high:
@@ -47,8 +59,16 @@ class Limits:
                 raise ValueError(f'{name} 必须是有限正数')
 
     @property
+    def firmware_speed_mm_s(self):
+        return self.speed_mm_s if self.deployment_speed_mm_s is None else self.deployment_speed_mm_s
+
+    @property
+    def firmware_acceleration_mm_s2(self):
+        return self.acceleration_mm_s2 if self.deployment_acceleration_mm_s2 is None else self.deployment_acceleration_mm_s2
+
+    @property
     def config(self):
-        return {'VEL_MAX': self.speed_mm_s, 'ACC_MAX': self.acceleration_mm_s2,
+        return {'VEL_MAX': self.firmware_speed_mm_s, 'ACC_MAX': self.firmware_acceleration_mm_s2,
                 'WDT_MS': self.watchdog_ms,
                 'X_MARGIN_UM': self.margin_um}
 
@@ -342,6 +362,7 @@ class Session:
         velocity = int(whole)
         if abs(fraction) >= 0.5:
             velocity += 1 if fraction > 0 else -1
+        velocity = max(-self.limits.firmware_speed_mm_s, min(self.limits.firmware_speed_mm_s, velocity))
         if self.enforce_position_limits and abs(self.observation.x_um) >= self.track_limit_um and self.observation.x_um * velocity > 0:
             velocity = 0
         if not self._write(f'VEL {velocity}'):
