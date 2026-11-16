@@ -1,3 +1,5 @@
+> **历史参考，不是当前实施或上板步骤。** 本文记录旧台位及其固件阶段，包含当时的器件、RAM 标定和参数假设。当前固件由 [device-nerve-esp32](https://github.com/CLD1994/device-nerve-esp32) 维护，标定与协议请从 [当前部署协议入口](protocol.md) 读取；不要按本文重新实施或覆盖当前固件。
+
 # 手动两点标定实施计划
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.

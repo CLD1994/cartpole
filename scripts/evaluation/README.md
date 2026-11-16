@@ -1,6 +1,6 @@
 # 冻结策略的完整回合评估
 
-本工具在当前代码的 V2 训练环境配置下评估指定检查点，不继续训练、不改变训练配置文件、不导出或覆盖模型、不连接真机。默认保留观测噪声与全部训练随机化；它不是恢复旧训练目录的 `env.yaml`。
+本工具按 `--task` 选择当前代码中的单动作 V2 训练配置来评估指定检查点，不继续训练、不改变训练配置文件、不导出或覆盖模型、不连接真机。默认保留观测噪声与全部训练随机化；它不是恢复旧训练目录的 `env.yaml`。
 
 ## 执行
 
@@ -8,18 +8,23 @@
 
 ```powershell
 $env:PYTHONIOENCODING = 'utf-8'
-$ckpt = 'C:\Users\cldus\workspace\cartpole\logs\rsl_rl\cartpole_real_v2\2026-11-15_00-22-27\model_999.pt'
+$ckpt = '替换为本次训练检查点的绝对路径'
+$task = 'Hexchip-Cartpole-Real-V2-Window16-Tau0-Acc9-Hz400-v0'
 python .\scripts\evaluation\evaluate_policy.py `
-  --checkpoint "$ckpt" --num_envs 2 --seeds 101 202 `
+  --checkpoint "$ckpt" --task $task --num_envs 2 --seeds 101 202 `
   --device cuda:0 --viz kit --info --render-interval 20 `
   *> .\policy-evaluation.log
 "退出码: $LASTEXITCODE"
 Get-Content .\policy-evaluation.log -Tail 30 -Encoding utf8
 ```
 
-上面的4回合只验证工具启动、跨种子切换和报告完整性，不是策略验收。正式样本量由启动条件、失败情况和所需置信度决定，不要求固定500回合；请显式指定 `--num_envs` 和 `--seeds`。每回合使用训练配置的10仿真秒。`--horizon-s 60` 只延长本次评估实例的时长，可用于后续长程检验；不得与10秒成绩混在一起。若只做批量统计，可自行选择 `--viz none`，物理后端仍为 PhysX。
+示例任务必须换成检查点实际使用的任务；不指定 `--task` 时默认是原始 500 Hz V2，而不是自动读取训练目录。上面的 4 回合只验证工具启动、跨种子切换和报告完整性，不是策略验收。正式样本量由启动条件、失败情况和所需置信度决定，不要求固定500回合；请显式指定 `--num_envs` 和 `--seeds`。每回合使用训练配置的10仿真秒。`--horizon-s 60` 只延长本次评估实例的时长，可用于后续长程检验；不得与10秒成绩混在一起。若只做批量统计，可自行选择 `--viz none`，物理后端仍为 PhysX。
 
 输出保存在新的 `logs/evaluation/evaluation-<唯一编号>`，包含 `report.json`、解析后的 `env.yaml` 与 `agent.yaml`。终端首条 `[OUTPUT]` 给出位置。保存 checkpoint 哈希、代码提交与脏状态、种子、实际 dt/后端/设备等。代码提交和配置快照仍不足以证明旧模型与当前物理资产相同，应单独核对训练版本。检查点格式不兼容或运行异常会产生错误报告并以非零退出。
+
+## 任务与速度观测
+
+评估器支持原始 V2、Window16、Window16-Tau0 和 Window16-Tau0-Acc9-Hz400 四种单动作任务。完整任务名见 [候选工作流](TRAINING_CANDIDATES.md)。Window16 任务本身包含 16 ms 速度观测，不得再叠加 `--velocity-observation-window-ms 16`。该参数用于原始 V2 的显式观测对照，不会自动把原始任务变成 Window16 训练配方；对照结果应与原条件分别记录。
 
 ## 仅评估的启动条件
 
@@ -45,14 +50,14 @@ Get-Content .\policy-evaluation.log -Tail 30 -Encoding utf8
 - 整体成功率按回合数加权，并给出 Wilson 95% 区间；不是对 reset 时日志均值再求平均。区间是近似二项式统计，不证明各随机化工况都有相同成功率。
 - 评估期间不要点击GUI的reset；若未完成槽位被外部重置，工具中止并保留错误与已有回合数据，不跨reset拼接。
 - 任何槽位超出步数护栏仍未完成时，报告 `incomplete`、不发布完整集合成功率、退出码非零。退出码0只表示评估数据采集完整，**不表示策略达到要求**。
-- Isaac Lab 3.0 的 recorder 路径会额外计算一次观测，因此同一个 seed 不保证与普通 play 消耗相同的随机数序列。当前任务没有观测历史项；若以后加入历史/有状态观测，应重新审计此采样方案。
+- Isaac Lab 3.0 的 recorder 路径会额外计算一次观测，因此同一个 seed 不保证与普通 play 消耗相同的随机数序列。Window16 任务已有有状态速度窗口，同一控制步的重复观测不会追加历史，reset 后按窗口长度暖机。其他新历史观测仍需单独核对 recorder 的重复计算行为。
 - 指标采样涉及 GPU→CPU 传输，会增加耗时，因此不可拿此工具的墙钟耗时替代性能诊断。
 
 ## 如何判断
 
 训练中的成功率可作为主要进度指标，但必须明确成功定义以及初始条件。初始分布应对应真机能够可靠进入的启动范围，而不是用不合理的高难度初始化代替实际需求。独立评估用于复核这些条件下的成功率及失败原因，不规定统一样本量或武断阈值。结合每回合初态、失败时间、终态与跟踪参数区分初始恢复失败和保持直立后小车漂移。没有全程轨迹时不能仅凭失败时间断言原因；旧schema1报告没有初态，不能追溯补造。进入真机前还需确认实物执行器、观测、通信时延及保护机制。
 
-旧 `model_999.pt` 训练早于几何修正，应视为待复测候选；能在一个画面中直立是有效观察，但不能代替上述统计。
+检查点文件名不包含物理模型版本。应保留训练提交、任务名与配置；单次画面中的直立观察不能代替完整回合统计。
 
 ## 本地单元测试
 
@@ -64,40 +69,53 @@ python -m unittest discover -s scripts/evaluation -v
 
 ## 训练结束后选择检查点
 
-`select_checkpoint.py` 只处理一个已经结束的训练目录。先从同目录 TensorBoard 日志提名少量检查点，再用冻结策略完整回合评估排名，最后用不同种子复核第一名。它不会覆盖模型，也不会控制训练进程。操作期间不要继续向该训练目录写入模型或切换评估代码。
+`select_checkpoint.py` 只处理一个已经结束的训练目录。默认读取训练中保存的动态候选，再用冻结策略完整回合评估排名，最后用不同种子复核第一名。它不会覆盖模型，也不会控制训练进程。操作期间不要继续向该训练目录写入模型或切换评估代码。
 
 ```powershell
 $env:PYTHONIOENCODING = 'utf-8'
-$run = 'C:\Users\cldus\workspace\cartpole\logs\rsl_rl\cartpole_real_v2\你的训练目录'
+$run = '替换为已经结束的具体训练运行目录绝对路径'
+$task = 'Hexchip-Cartpole-Real-V2-Window16-Tau0-Acc9-Hz400-v0'
 python .\scripts\evaluation\select_checkpoint.py `
-  --run-dir "$run" --candidates 3 --window 20 `
+  --run-dir "$run" --task $task --parallel-workers 3 `
   --num_envs 32 --seeds 101 202 --holdout-seeds 1001 2002 `
   --device cuda:0 *> .\checkpoint-selection.log
 "退出码: $LASTEXITCODE"
 Get-Content .\checkpoint-selection.log -Tail 30 -Encoding utf8
 ```
 
-批量评估固定 `--viz none`，使用 GPU PhysX。默认最多提名4个检查点，每个64回合，第一名再复核64回合。评估条件沿用当前代码，可用 `--horizon-s` 和两个初速度区间参数显式覆盖；每个候选使用相同条件，不改变训练奖励、随机化配置文件。
+示例中每个候选评估 64 个回合，第一名再复核 64 个回合。`--parallel-workers` 只限制并发数，不改变候选清单；不传时串行执行。批量评估固定 `--viz none`，使用 GPU PhysX。评估条件沿用所选任务的当前配置，可用 `--horizon-s` 和两个初速度区间参数显式覆盖；每个候选使用相同条件，不改变训练配置文件。
 
-### 提名与排名规则
+### 候选来源与排名
 
-1. 安全读取检查点中的 `iter`，用它关联日志横轴，不把文件编号或文件时间当作质量分数。只接受当前用户训练的标准 RSL-RL 权重格式，不使用任意 pickle 兼容回退。
-2. 将可匹配日志的检查点按时间顺序分成 `--candidates` 个时段。每个时段根据检查点迭代前 `--window` 轮（含本轮）的 `Train/mean_reward` 平均值提名一个，平分时比较 `Train/mean_episode_length`。额外保留最后保存的检查点并去重。报告保存每个窗口的样本数和确切步数。
-3. 训练日志只用于提名：RSL-RL 5.5.1 的回报和长度是最近100个已结束回合的均值，回合可能跨越策略更新；日志迭代的采样发生在更新前，`model_it` 则在更新后保存。这里不是精确的冻结权重成绩。旧 `Metrics/success_rate` 不参与排名，新统计无法追溯补进旧日志。
-4. 候选独立评估后严格按成功率降序排列。成功率相同时，依次比较**成功回合**平均绝对车速、绝对首尾位移，较小者优先；仍相同时取较早迭代。它不奖励回到中心，也不会让短时间失败因车程小而获得优势。速度指标包含整个回合，尚未单独划分捕获直立与稳定保持阶段。
-5. 仅对第一名运行 `--holdout-seeds`，不再用复核结果重新选模型。复核失败率照实展示，没有预设“可上真机”门槛。所有候选均无成功回合时不推荐模型。
+| 参数 | 候选来源 |
+| --- | --- |
+| 默认 `--nomination saved` | 只评估 `training-candidates/candidates.json` 中保留的动态候选。训练默认保留 3 个；不足 3 个只评估现有候选，不追加周期或末检查点。训练自定义更大的 `--candidate-keep` 时评估清单全部候选。 |
+| `--checkpoints <路径...>` | 只评估显式指定的同一训练目录内检查点，覆盖提名策略，不追加模型。 |
+| `--nomination temporal --candidates 3 --window 20` | 将可关联训练记录的检查点按迭代分成 3 个时段提名，并额外保留末检查点与动态候选，去重后可能超过 4 个。用于没有动态候选的旧训练或显式的时段对照。 |
+
+只要目录中存在动态候选文件或 manifest，就要求 manifest 为 `complete` 且清单与文件一致，包括手动指定候选时。默认模式缺失或空清单会报错，不静默回退到时段提名。详见 [动态候选保存与筛选](TRAINING_CANDIDATES.md)。
+
+所有模式都读取检查点内部 `iter` 并核对文件轮次，只接受可信的本项目训练产物，不使用任意 pickle 兼容回退。文件编号用于标识而不是质量评分。
+
+显式 `temporal` 模式优先使用 `training-episodes.jsonl` 与 `training-checkpoints.jsonl`：按检查点前 `--window` 轮的完整成功数 / 完整结束数提名，同分优先样本更多、然后迭代更早；零完成回合不当作成功率。只有两份新日志都不存在时，才从 TensorBoard 的 `Train/mean_reward` 窗口均值提名，同分比较 `Train/mean_episode_length`。日志不完整或互相矛盾时明确报错。这些训练统计跨越策略更新，不能当作冻结权重成绩。
+
+冻结评估后的排名规则与候选来源无关：
+
+1. 成功率高者优先。
+2. 成功率相同时，比较**成功回合**平均绝对车速，再比较绝对首尾位移，较小者优先；仍相同时取较早迭代。不会让短时间失败因车程小而获益，也不要求回到中心。速度指标尚未划分捕获与稳定保持阶段。
+3. 仅对第一名运行 `--holdout-seeds`，不再用复核结果重新选模型。复核失败率照实展示，没有自动“可上真机”门槛。所有候选均无成功回合时不推荐模型。
 
 结果只称为**已评估候选中的最佳**。提名可能漏掉更好的模型；只按保存的有限检查点比较也不能证明训练过程全局最优。选择种子与复核种子必须互不重复；反复针对复核集合调参后，应换用新的保留种子。相同初始种子不保证不同策略后续自动重置消耗完全相同的随机流，质量/惯量等全部抽样目前也未逐回合记录。
 
-缺少日志/必要标签、重复日志步数、评估异常或报告不完整均明确报错，不静默替代成功率。也可绕过提名，人工指定同一个训练目录里的候选：
+需要比较指定模型时，可人工指定同一个训练目录里的检查点；仍须匹配任务和候选 manifest 的完整性要求：
 
 ```powershell
 python .\scripts\evaluation\select_checkpoint.py `
-  --run-dir "$run" `
+  --run-dir "$run" --task $task `
   --checkpoints "$run\model_400.pt" "$run\model_800.pt" "$run\model_999.pt" `
   --num_envs 32 --seeds 101 202 --holdout-seeds 1001 2002 --device cuda:0
 ```
 
-输出位于独立的 `logs/checkpoint-selection/selection-<编号>/selection.json`，包含提名映射、日志及模型哈希、逐模型报告路径、排名、独立复核和错误信息。子进程的原始日志和配置也保留在该目录。顶层 `status=complete` 只表示流程完成，不表示成功率达到可用标准。提名与冻结评估为独立函数，后续可用有明确口径的新训练统计替换提名，不猜测未知标签格式。
+输出位于独立的 `logs/checkpoint-selection/selection-<编号>/selection.json`，包含提名映射、日志及模型哈希、逐模型报告路径、排名、独立复核和错误信息。子进程的原始日志和配置也保留在该目录。顶层 `status=complete` 只表示流程完成，不表示成功率达到可用标准。报告中的 `nomination.method` 区分保存候选、手动指定、完整回合时段提名与 TensorBoard 时段提名。
 
 评估报告 schema 3 增加 `cart_mean_abs_velocity_m_s`、`cart_rms_velocity_m_s`、`cart_travel_m` 和 `cart_net_displacement_m`。行程是控制步末绝对速度的矩形积分；首尾位移是终态位置减实际初态位置，两者都不是回中心误差。

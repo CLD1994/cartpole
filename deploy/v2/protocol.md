@@ -1,147 +1,66 @@
-# 新装置部署串口协议（Hi3516CV610 ↔ ESP32-S3）
+# 当前 V2 设备协议入口
 
-板对板 UART 直连（3.3 V TTL，共地），**460800 8N1**，ASCII 行文本。链路上分两个面，共用一条物理串口，按行首单词分发：
+当前固件由 [CLD1994/device-nerve-esp32](https://github.com/CLD1994/device-nerve-esp32) 维护。完整命令、参数范围与固件状态转换以该仓库的 [线协议](https://github.com/CLD1994/device-nerve-esp32/blob/main/docs/protocol.md)、[标定保存](https://github.com/CLD1994/device-nerve-esp32/blob/main/docs/calibration.md) 和 [STEP_LOSS 诊断](https://github.com/CLD1994/device-nerve-esp32/blob/main/docs/step-loss-diagnostic.md) 为准。本页只说明 cartpole 当前消费者使用的接口，不维护另一份固件参数注册表。
 
-- **数据面**：ESP32-S3 → CV610 的 200 Hz 状态流（`STATE` 行），只携带物理量遥测，不携带任何控制语义或状态标志。
-- **控制面**：双向的命令与应答。CV610 以命令驱动 ESP32-S3：运动命令（`VEL`）、标定与流程命令（`MARK LEFT`/`MARK RIGHT`/`ENABLE`/`RESET`）、状态查询（`QUERY`）、运行参数配置（`CONFIG`）。固件以模式事件（`MODE` 行）与配置/标定应答（`OK`/`ERR` 行）回应。
+## 部署路径
 
-消息名与枚举值用完整英文单词，不用缩写——在 460800 下可读性的代价为零；字段保持固定顺序的十进制整数，不采用 key=value（每种行只有一个固定格式，键名重复约 40% 字节却不消除任何歧义）。所有行首单词与枚举词**大小写敏感，全大写**。
-
-带宽核算：`STATE` 行最长约 36 字节 × 200 Hz ≈ 7.2 kB/s，`VEL` 命令约 10 字节 × 200 Hz ≈ 2.0 kB/s，事件与配置行偶发，合计占 460800 线路容量（约 46 kB/s）的 20%。
-
-多圈累计、单位换算和符号约定在固件侧完成，坐标原点由手动两点标定（`MARK LEFT`/`MARK RIGHT`）建立，线路上传输的已是物理量，端侧程序不做标定换算。
-
-## 数据面：状态流（200 Hz，周期 5 ms）
-
-```
-STATE <x_um> <theta_urad> <vx_mm_s> <vth_mrad_s>\n
-```
-
-| 字段 | 类型 | 单位 | 含义 |
-|---|---|---|---|
-| `x_um` | int32 | µm | 小车位置。原点 = 两标中点，由手动两点标定建立；+x 方向见符号约定。 |
-| `theta_urad` | int32 | µrad | 摆杆角度。直立 = 0，摆顶向 +x 倾斜为正，按 ±π 环绕输出（不用 21-bit 原始码）。 |
-| `vx_mm_s` | int32 | mm/s | 小车速度，固件基于 1 kHz 位置采样估计。 |
-| `vth_mrad_s` | int32 | mrad/s | 摆角速度，同样由固件估计。 |
-
-速度估计是行为要求，算法不限：静止时速度噪声 σ ≤ 5 mm/s（小车）、σ ≤ 10 mrad/s（摆杆），等效群延迟 ≤ 10 ms。
-
-状态流在所有固件模式下持续发送。**数据面不携带有效性标志；字段有效性由控制面模式推断**——`theta_urad` 来自绝对编码器，任何模式有效；`x_um` 自标定完成（`CAL_DONE`）起有物理意义，此前为上电起累计值。
-
-## 控制面：模式机、命令与应答
-
-### 固件模式机
-
-| 模式 | 电机 | 进入方式 |
-|---|---|---|
-| `DISABLED` | 关闭使能 | 上电默认；FAULT 经 `RESET` 清除后回到此态 |
-| `READY` | 使能，静止或跟踪 `VEL` | DISABLED 且两点标定完成后收到 `ENABLE` |
-| `FAULT` | 斜坡停机后关闭使能 | 故障，见转换表 |
-
-模式转换（完整分类）。坐标由手动两点标定建立，标定语义见 `calib-spec.md`：
-
-| 当前态 | 事件 | 次态 |
-|---|---|---|
-| DISABLED | `MARK LEFT` / `MARK RIGHT`（见标定决策表） | DISABLED |
-| DISABLED | `ENABLE`（标定完成 `CAL_DONE`） | READY |
-| READY | 丢步 / AS5600 或 MT6835 读取失败 | FAULT |
-| FAULT | 收到 `RESET` | DISABLED |
-
-### `MODE` 行：模式事件与查询应答
-
-固件在**每次模式转换时**推送一行，`QUERY` 查询时也回答同一格式：
-
-```
-MODE <mode> <reason>\n
-```
-
-| reason | 含义 |
+| 路径 | 适用对象 |
 |---|---|
-| `NONE` | 无（非 FAULT 转换） |
-| `STEP_LOSS` | 丢步（AS5600 位置与指令位置偏差超阈值） |
-| `AS5600` | 小车编码器读取失败 |
-| `MT6835` | 摆角编码器读取失败 |
+| [`device/run_policy.py`](device/README.md) | 当前 Python 单动作 ONNX 运行器；固定 400/500 Hz，速度尺度 1.25 m/s。 |
+| [`device/edge/`](device/edge/README.md) | C 会话及接收适配接口；尚未集成目标板 NPU 控制循环。 |
+| `pc_runner.py`、[`edge/`](edge/README.md) | 旧 V2 200 Hz 参考控制器。其配置推送、标定及回中流程未适配当前装置，不能直接用于新模型。 |
+| [`../protocol.md`](../protocol.md) | V1 旧装置的 `S`/`P` ASCII 协议，与 V2 不同。 |
 
-`MODE` 行无 ACK，端侧晚开串口会错过开机以来的转换，因此端侧在启动同步和任何需要复核的时刻发 `QUERY` 补一拍。
+V2 使用 **460800 8N1、ASCII 行文本**，行首、命令名与枚举值区分大小写。完整行以换行结束；接收器允许可选回车。不是二进制帧协议。
 
-### 命令
+## 状态与有效性
 
-```
-VEL <v_mm_s>\n            目标速度 [mm/s]，钳位 ±VEL_MAX 后斜坡跟踪
-MARK LEFT\n               记当前实测位置为左端，回 OK MARK_LEFT <E µm>
-MARK RIGHT\n              记右端并完成标定，回 OK MARK_RIGHT <L µm>
-ENABLE\n                  标定完成后使能进 READY，推 MODE READY NONE
-RESET\n                   清除 FAULT
-QUERY\n                   查询当前模式，回答一行 MODE
-CONFIG <NAME> <value>\n   设置运行参数，回答 OK 或 ERR
-CONFIG?\n                 dump 全部参数（调试与日志记录用）
+```text
+STATE <x_um> <theta_urad> <vx_mm_s> <vth_mrad_s>
+VEL_VALID <cart> <pole>
+MODE <mode> <reason>
 ```
 
-标定与回执原则：`MARK LEFT`/`MARK RIGHT`/`ENABLE` 仅 DISABLED 态接受；拒绝时回 `ERR MARK_LEFT`/`ERR MARK_RIGHT`/`ERR ENABLE`（回执名是单 token），状态保持。`VEL`/`RESET` 在不适用态静默忽略、无回执。标定决策表（`L = E_right − E_left` 合法窗 100000–1000000 µm，域反向得负即拒）与 ENABLE 动作次序见 `calib-spec.md`。
+四个 STATE 数值依次为小车位置（µm）、摆角（µrad）、小车速度（mm/s）和角速度（mrad/s）。标定坐标中点为 x=0；摆角按 ±π 环绕。两路传感器均为 MT6835，但固件小车编码器故障的线协议名称仍为 `AS5600`，不能由名称推断当前器件。
 
-命令 × 模式矩阵（完整分类）：
+固件状态报告目标为 500 Hz，与上位机 400/500 Hz 决策周期分开。运行器按绝对栅格消费新观测，不是收到每行就推理。状态行不带设备采样时间戳或序号，主机接收年龄不能证明端到端新鲜度；两路传感器也不保证同步。
 
-| 命令 | DISABLED | READY | FAULT |
-|---|---|---|---|
-| `VEL` | 忽略 | 执行 | 忽略 |
-| `MARK LEFT` / `MARK RIGHT` | 执行或 `ERR`（标定决策表） | `ERR` | `ERR` |
-| `ENABLE` | 执行或 `ERR`（标定决策表） | 忽略 | 忽略 |
-| `RESET` | 忽略 | 忽略 | → DISABLED |
-| `QUERY` | 回 `MODE` | 回 `MODE` | 回 `MODE` |
-| `CONFIG` | 接受 | 接受 | 拒绝（`ERR`） |
-| `CONFIG?` | 接受 | 接受 | 接受 |
+`VEL_VALID` 两项只能为 0/1，固件在变化时及周期心跳报告；任一路无效时不发送新的 STATE。主机会话要求明确有效性并维护超时，不能仅依据 MODE 或一个看似正常的位置值判定测量有效。故障后的数据恢复不自动恢复同一次控制会话。
 
-`VEL` 语义：固件以不超过 `ACC_MAX` 的加速度向目标速度过渡，换向经零速；收到新 `VEL` 即更新目标并保持到下一条。非法行静默丢弃，目标不变。
+## 标定、配置与启动
 
-命令看门狗：超过 `WDT_MS` 未收到有效 `VEL` 命令（链路断、端侧程序死）时，以 `WDT_DEC` 减速到 0，**保持 READY**——看门狗是瞬态保护，不改变模式机，命令恢复即继续跟踪。
+- `QUERY` 查询模式；`CALIB?` 查询行程、保存状态和本次参考状态。
+- 完整标定使用 `MARK LEFT`、`MARK RIGHT`。有可用保存行程时，重启后的左参考确认使用 `CONFIRM LEFT`，不会自动使能。`CAL_STATE=3` 不等于本次定位完成；当前会话预检要求 `CAL_STATE=2`、`CAL_SAVED=1`、`CAL_STORAGE=0`。
+- `CONFIG?` 查询全表；`CONFIG? <NAME>` 只读单键，返回 `OK <NAME> <value>`。持续控制运行器轮转单键查询，避免全表回复突发。
+- `CONFIG <NAME> <value>` 修改配置。持久化与允许模式见固件文档；不要假设全部运行参数都保存在 NVS。
+- `ENABLE` 仍要求有效标定及供电验证；成功后为 `MODE READY NONE`。运行器不替用户调用 ENABLE，不修改固件参数。
 
-软限位窗口 `X_MARGIN_UM`：标定行程 `L` 确定后，有效运动窗口为 `[−L/2+m, +L/2−m]`（`m = X_MARGIN_UM`）。`x` 越出窗口后，`VEL` 中向外的分量被替换为 0，向内不受限；运行中收紧 `X_MARGIN_UM` 立即生效。
+默认设备档案保留 500 Hz / 10000 mm/s² 基线；400 Hz Acc9 模型使用独立 profile，目标加速度为 9000 mm/s²。两者速度尺度均为 1250 mm/s。运行参数是配置值，不是实测机械能力。现场行程、方向与摆角零点必须读回核对，不能用仓库档案覆盖现场事实。
 
-### 参数注册表（`CONFIG` 命令可配置项）
+## 动作与停止
 
-| NAME | 默认值 | 合法范围 | 单位 | 含义 |
-|---|---|---|---|---|
-| `VEL_MAX` | 1000 | 1 – 2000 | mm/s | `VEL` 命令硬钳位 |
-| `ACC_MAX` | 5000 | 100 – 30000 | mm/s² | 斜坡加速度上限 |
-| `WDT_MS` | 100 | 10 – 1000 | ms | 命令看门狗超时 |
-| `WDT_DEC` | 5000 | 100 – 30000 | mm/s² | 看门狗减速用减速度 |
-| `X_MARGIN_UM` | 10000 | 1000 – 50000 | µm | 软限位两端余量（窗口 `[−L/2+m, +L/2−m]`） |
-| `POLE_ZERO_URAD` | 0 | −3141592 – 3141592 | µrad | 摆角零位偏置：输出 θ = 原始读数 − 本值，使机械直立对应 0。标定法：θ₀ 取直立原始读数（可由下垂读数 + 180° 反推，比手扶更准），本值 = θ₀ |
-| `POLE_INV` | 0 | 0 – 1 | — | 摆角符号翻转，使摆顶向 +x 倾斜为正 |
-| `X_INV` | 0 | 0 – 1 | — | 小车 +x 方向翻转，使命令与 `x_um`/`vx_mm_s` 满足符号约定 |
-| `STEP_LOSS_UM` | 3000 | 500 – 20000 | µm | 丢步判定阈值：指令位置与 AS5600 实测偏差超过即 FAULT |
+`VEL <v_mm_s>` 是目标速度，不是力或 PWM。固件按自身加速度限幅跟踪目标；主机每次动作前检查模式、有效性、配置与时序。当前运行器只接受单动作模型，不使用双动作 `VELA` 实验协议。
 
-`CONFIG` 语义：成功时回 `OK <NAME> <value>`（回显归一化后的值），参数立即生效；未知 NAME、超出范围、或当前模式为 FAULT 时回 `ERR <NAME>`。支持持久化标定的固件从 NVS 恢复设备标定；端侧会话只推送 `rig.c` 中的运行限幅和看门狗参数，不覆盖零点或方向。标定与重启参考确认使用固件配套工具，见 [训练准备](training-readiness.md)。运行中收紧限制（调低 `X_MARGIN_UM`/`ACC_MAX` 等）立即约束当前运动；放宽不产生任何主动运动。
+正常停止先发 `VEL 0`，继续接收新状态，再请求 `DISABLE`。READY 下引擎仍非零速时，固件返回 `ERR BUSY`；只有确认 `MODE DISABLED NONE` 才记录禁用成功。FAULT 中的 DISABLE 不清除原故障；RESET 是独立的故障清除操作，不是自动恢复运动。
 
-## 符号约定（实机验证方法）
+固件看门狗、位置保护与上位机时序检查是不同机制。ONNX 运行器不额外设置位置门或摆角门；通用 Python/C 会话默认仍有位置门，详见各自 README。各机制不保证硬实时或物理停车距离。
 
-- +x = 发 `VEL 200` 时小车实际移动的方向；同方向用手把摆顶掰过去时 `theta_urad` 必须增大。任一不符，先改固件符号再联调。
-- `x_um` 沿 +x 增大；两个速度量与各自位置量同号。
+## 可选 STEP_LOSS 事件
 
-## 时序
+固件主线合入 PR #17 后支持可选接口：
 
-- 状态流 200 Hz，控制频率 200 Hz 已定：NPU 推理实测最大 0.38 ms，占 5 ms 周期不到 8%，时序预算成立。
-- 状态流与控制频率解耦：未来改变控制频率，端侧取最新帧的语义不变。
-- 端到端延迟预算：策略输出 → 串口 → 固件斜坡响应 ≈ 1–2 个控制周期 + τ，喂给仿真动作延迟随机化（见 `sim2real-spec.md`）。
+```text
+RUN?
+OK RUN <run_id>
+EVENT STEP_LOSS <event_id> <run_id> <device_us>
+```
 
-## 操作流程（演示当天）
+`CONFIG_CARTFSM_STEP_LOSS_EVENTS` 提供运行身份和首次事件通知；诊断轨迹由独立的 `CONFIG_CARTFSM_STEP_LOSS_DIAGNOSTICS` 开关启用。`CONFIG_CARTFSM_STEP_LOSS_OBSERVE_ONLY` 才决定是否仅记录 STEP_LOSS、保持 READY 并交给上位机处置。三项默认关闭，事件通知或诊断开关本身不等于关闭丢步保护。
 
-1. 上电（DISABLED，状态流已在发送，摆杆自然下垂最安全）。
-2. 端侧开串口，发 `QUERY` 同步当前模式，不依赖可能错过的事件。
-3. 可选：`CONFIG` 推送本台位参数。
-4. 手推小车到最左端 → `MARK LEFT`；推到最右端 → `MARK RIGHT`（回显 `L`，肉眼核对 ≈530 mm）。
-5. 发 `ENABLE`，等 `MODE READY NONE`。
-6. 端侧以小速度 `VEL` 把小车从右端移到 0 附近。
-7. 人手把摆杆扶到直立附近，策略接管。
-8. FAULT 后：`RESET` → `ENABLE` 恢复（RAM 标定保留，无需重新标记）；断电则回第 4 步重新标定。
+主机 `--step-loss-monitor` 校验同一运行身份并保留事件窗口，不切换低速、不改模型动作。正常固件保护进入 FAULT 时仍停止；observe-only 保持 READY 且其他条件满足才继续。`--timing-profile debug` 是独立显式选项，事件记录不会自动放宽时序。事件无 ACK 或重放保证，设备时间与主机接收时间不能直接相减。
 
-## 未决事项
+控制结束并停稳后，用固件仓库的配套工具读取 `STEPLOSS?` / `STEPTRACE?`。当前轨迹为 SLT4 软件 STEP 位置与缓存编码器的非同步证据，不是旧实验 SLT3 的 PCNT/EN/SPI 记录，也不证明物理脉冲或实际失步。
 
-- 460800 两端联调确认；若不行降 230400（带宽占约 40%）。115200 在单词命名下占用约 80%，不再作为可行回退。
-- 速度估计器实测噪声与群延迟是否满足指标。
-- 标定重复性实测（同一端点重复标记读数散布）。
-- `L` 合法窗 100–1000 mm 是否按台位实测行程（≈530 mm）收紧。
-- `X_MARGIN_UM` 默认值与合法范围依据实测微调。
-- 参数注册表默认值与范围依据实测微调。
-- MT6835 的 SPI 寄存器映射在固件实现阶段确定。
-- 与旧协议（`deploy/protocol.md`）的关系：旧协议随旧装置退役，本文件为新装置唯一协议权威。
+## 验证边界
+
+协议与单元测试通过不代表 Windows 串口、实际 ONNX 模型、ESP32 目标构建或真机闭环验收。目标版本与构建开关必须一并记录；旧实验分支现场结果不能替代主线版本验收。

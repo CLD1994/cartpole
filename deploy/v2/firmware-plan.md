@@ -1,3 +1,5 @@
+> **历史参考，不是当前实施或上板步骤。** 本文记录旧台位及其固件阶段，包含当时的器件、RAM 标定和参数假设。当前固件由 [device-nerve-esp32](https://github.com/CLD1994/device-nerve-esp32) 维护，标定与协议请从 [当前部署协议入口](protocol.md) 读取；不要按本文重新实施或覆盖当前固件。
+
 # Cartpole 固件改造实施计划（PD-STEP → protocol.md 线协议）
 
 > **执行者注意：** 必须配合 superpowers:subagent-driven-development（推荐）或 superpowers:executing-plans 技能逐任务执行本计划。步骤用复选框（`- [ ]`）跟踪。
