@@ -13,7 +13,7 @@
 int policy_init(const char *model_path);
 
 /* 同步推理：obs = [cart_pos m, pole_angle rad, cart_vel m/s, pole_vel rad/s]，
- * 顺序与符号与训练一致（sim2real-spec）。成功返回 0 且 *action 为未缩放的
+ * 顺序与符号与训练一致（docs/training/sim2real-model.md）。成功返回 0 且 *action 为未缩放的
  * 原始动作（训练约定 [-1,1]，调用方仍钳位）；失败返回非 0 且 *action 置 0。
  * 库契约：推理失败后句柄失效，只能经 policy_deinit 释放，不得继续推理。 */
 int policy_forward(const float obs[4], float *action);

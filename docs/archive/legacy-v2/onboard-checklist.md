@@ -1,9 +1,9 @@
-> 本页为对应版本的历史验收记录，不是当前设备参数或当前固件操作清单。当前准备入口见 [训练准备](training-readiness.md)。
+> 本页为对应版本的历史验收记录，不是当前设备参数或当前固件操作清单。当前准备入口见 [设备运行器](../../../deploy/v2/device/README.md) 与 [当前协议](../../deployment/protocol.md)。
 
-# cartpole 上板执行清单（固件改造收尾，由台位操作者亲自执行）
+# 旧台位上板验收记录（2026-09-26）
 
 固件源码：`tmp/PD-STEP`（分支 `cartpole`）。线协议权威：
-`deploy/v2/protocol.md`。串口联调工具：固件仓库
+[当时的线协议快照](https://github.com/CLD1994/cartpole/blob/3648061c7eb65ab7e4e1505ed7e67ff6d898ca00/deploy/v2/protocol.md)。串口联调工具：固件仓库
 `tools/cartpole_host.py`（`pip install pyserial`）。
 
 下述 PowerShell 命令均需先激活环境：
@@ -79,7 +79,7 @@ idf.py -B build flash
 
 ## 阶段 D：历史标定记录
 
-本页 C3–C6 记录属于对应历史台位。当前部署不自动写入这些零点或方向参数；当前设备标定与重启参考确认见 [训练准备](training-readiness.md)。
+本页 C3–C6 记录属于对应历史台位。当前部署不自动写入这些零点或方向参数；当前设备标定与重启参考确认见 [训练准备](../../training/sim2real-model.md)。
 
 ## 未决事项出口（本清单完成时逐项关闭）
 

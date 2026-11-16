@@ -1,163 +1,54 @@
-## 当前倒立摆训练准备
+# 倒立摆训练与部署
 
-开始设备相关训练或部署前，请先阅读 [设备档案与训练准备](deploy/v2/training-readiness.md)。设备几何、质量与固定 500Hz 训练基线已有配置；执行器动态仍需辨识，固件观测窗口与可变策略周期尚未接入，不能直接将训练结果部署到真机。
+本项目基于 Isaac Lab，提供倒立摆仿真、PPO 训练、检查点筛选、模型导出和上位机部署工具。项目独立于 Isaac Lab 安装目录；ESP32 固件维护在 [device-nerve-esp32](https://github.com/CLD1994/device-nerve-esp32)。
 
-## Isaac Lab 3.0 使用说明
+## 从哪里开始
 
-训练环境、入口、参数和验证顺序统一见 [Isaac Lab 3.0 仿真工作流](deploy/v2/isaaclab-3-workflow.md)。该说明针对官方 `v3.0.0`（`e3f7d9ff1`），不是当前上游 main。
+| 目标 | 文档入口 |
+|---|---|
+| 安装环境、训练、回放和导出 | [Isaac Lab 3.0 仿真工作流](docs/training/isaaclab-workflow.md) |
+| 使用 400 Hz、9 m/s² 的单动作配方 | [400 Hz / Acc9 配方](docs/training/400hz-acc9.md) |
+| 了解完整回合与成功率的统计口径 | [训练指标](docs/training/episode-metrics.md) |
+| 筛选检查点并进行独立 holdout | [候选产生与冻结评估](scripts/evaluation/README.md) |
+| 连接现有 ESP32 ASCII 固件 | [设备部署与诊断](deploy/v2/device/README.md) |
+| 核对设备档案和训练假设 | [设备档案与训练准备](docs/training/sim2real-model.md) |
+| 核对摆杆几何、惯量与验证边界 | [V2 摆杆模型](docs/training/pole-model.md) |
+| 分析仿真回放速度 | [性能诊断](scripts/diagnostics/README.md) |
 
-本项目通过 `scripts/rsl_rl/train.py` 和 `play.py` 注册任务并调用官方公开入口。无交互窗口使用 `--viz none`，不接受旧参数 `--headless`。本分支的代码核查和单测不等于其精确提交已经通过真实仿真。2026-11-15 的后续开发已取得训练、检查点筛选和模型导出的现场结果；这些结果来自含额外修改的分支，不能直接作为本分支原始提交的完整验收。版本范围与证据边界见工作流中的“已核查与待验证”。
+## 当前主线范围
 
-# Template for Isaac Lab Projects
+- 原始 V2 任务保留固定 500 Hz 基线；Window16、Tau0 和 Acc9-Hz400 是独立任务，不通过修改旧任务含义兼容新模型。
+- 模型输出单一目标速度动作。400 Hz 配方使用 0.5 ms 物理步长、每 5 个物理步决策一次，参考加速度上限为 9 m/s²。它不是可变周期训练。
+- 默认训练候选数量为 3；默认筛选已保存的动态候选，随后对胜者执行独立 holdout。训练指标用于提名，不等于冻结策略评估。
+- `deploy/v2/device/` 提供当前 ASCII 固件的单动作运行器、会话管理及 STEP_LOSS 事件处理。控制节拍、固件状态上报频率和仿真物理步长是不同概念。
+- 双动作训练、VELA 协议部署和自动低速探针仍是独立实验内容，不属于此主线流程。
 
-## Overview
+`deploy/` 中还保留 V1 力控制原型，`deploy/v2/edge/` 和 `deploy/v2/pc_runner.py` 保留旧 V2 部署链路。当前协议入口见 [部署通信协议](docs/deployment/protocol.md)。不要把它们的固件、字段定义或操作命令与 `deploy/v2/device/` 的 ASCII 路径混用。
 
-This project/repository serves as a template for building projects or extensions based on Isaac Lab.
-It allows you to develop in an isolated environment, outside of the core Isaac Lab repository.
+## 环境与安装
 
-**Key Features:**
+训练与可视化使用已安装 Isaac Lab 3.0 的 Python 环境。官方版本范围、启动参数和 Windows PowerShell 示例以[仿真工作流](docs/training/isaaclab-workflow.md)为准；无交互窗口使用 `--viz none`，不要对该训练入口使用旧的 `--headless` 参数。
 
-- `Isolation` Work outside the core Isaac Lab repository, ensuring that your development efforts remain self-contained.
-- `Flexibility` This template is set up to allow your code to be run as an extension in Omniverse.
-
-**Keywords:** extension, template, isaaclab
-
-## Installation
-
-- Install Isaac Lab by following the [installation guide](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html).
-  We recommend using the conda or uv installation as it simplifies calling Python scripts from the terminal.
-
-- Clone or copy this project/repository separately from the Isaac Lab installation (i.e. outside the `IsaacLab` directory):
-
-- Using a python interpreter that has Isaac Lab installed, install the library in editable mode using:
-
-    ```bash
-    # use 'PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-    python -m pip install -e source/cartpole
-
-- Verify that the extension is correctly installed by:
-
-    - Listing the available tasks:
-
-        Note: It the task name changes, it may be necessary to update the search pattern `"Template-"`
-        (in the `scripts/list_envs.py` file) so that it can be listed.
-
-        ```bash
-        # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-        python scripts/list_envs.py
-        ```
-
-    - Running a task:
-
-        ```bash
-        # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-        python scripts/<RL_LIBRARY>/train.py --task=<TASK_NAME>
-        ```
-
-    - Running a task with dummy agents:
-
-        These include dummy agents that output zero or random agents. They are useful to ensure that the environments are configured correctly.
-
-        - Zero-action agent
-
-            ```bash
-            # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-            python scripts/zero_agent.py --task=<TASK_NAME>
-            ```
-        - Random-action agent
-
-            ```bash
-            # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-            python scripts/random_agent.py --task=<TASK_NAME>
-            ```
-
-### Set up IDE (Optional)
-
-To setup the IDE, please follow these instructions:
-
-- Run VSCode Tasks, by pressing `Ctrl+Shift+P`, selecting `Tasks: Run Task` and running the `setup_python_env` in the drop down menu.
-  When running this task, you will be prompted to add the absolute path to your Isaac Sim installation.
-
-If everything executes correctly, it should create a file .python.env in the `.vscode` directory.
-The file contains the python paths to all the extensions provided by Isaac Sim and Omniverse.
-This helps in indexing all the python modules for intelligent suggestions while writing code.
-
-### Setup as Omniverse Extension (Optional)
-
-We provide an example UI extension that will load upon enabling your extension defined in `source/cartpole/cartpole/ui_extension_example.py`.
-
-To enable your extension, follow these steps:
-
-1. **Add the search path of this project/repository** to the extension manager:
-    - Navigate to the extension manager using `Window` -> `Extensions`.
-    - Click on the **Hamburger Icon**, then go to `Settings`.
-    - In the `Extension Search Paths`, enter the absolute path to the `source` directory of this project/repository.
-    - If not already present, in the `Extension Search Paths`, enter the path that leads to Isaac Lab's extension directory directory (`IsaacLab/source`)
-    - Click on the **Hamburger Icon**, then click `Refresh`.
-
-2. **Search and enable your extension**:
-    - Find your extension under the `Third Party` category.
-    - Toggle it to enable your extension.
-
-## Code formatting
-
-We have a pre-commit template to automatically format your code.
-To install pre-commit:
-
-```bash
-pip install pre-commit
-```
-
-Then you can run pre-commit with:
-
-```bash
-pre-commit run --all-files
-```
-
-## Troubleshooting
-
-### Pylance Missing Indexing of Extensions
-
-In some VsCode versions, the indexing of part of the extensions is missing.
-In this case, add the path to your extension in `.vscode/settings.json` under the key `"python.analysis.extraPaths"`.
-
-```json
-{
-    "python.analysis.extraPaths": [
-        "<path-to-ext-repo>/source/cartpole"
-    ]
-}
-```
-
-### Pylance Crash
-
-If you encounter a crash in `pylance`, it is probable that too many files are indexed and you run out of memory.
-A possible solution is to exclude some of omniverse packages that are not used in your project.
-To do so, modify `.vscode/settings.json` and comment out packages under the key `"python.analysis.extraPaths"`
-Some examples of packages that can likely be excluded are:
-
-```json
-"<path-to-isaac-sim>/extscache/omni.anim.*"         // Animation packages
-"<path-to-isaac-sim>/extscache/omni.kit.*"          // Kit UI tools
-"<path-to-isaac-sim>/extscache/omni.graph.*"        // Graph UI tools
-"<path-to-isaac-sim>/extscache/omni.services.*"     // Services tools
-...
-```
-
-### 官方任务与项目任务的零动作性能对照
-
-`env_step_rtf.py` 不加载策略，向环境重复提交同一份设备上的零动作。它只修改本次运行的配置对象，固定 PhysX 和一个环境；默认物理步长为 0.001 秒、每两个物理步推进一次控制。奖励、终止条件、观察和自动重置仍由任务执行。预热不计入耗时，测量结束包含 GPU 完成同步，不在每步额外同步。
-
-在 Isaac Lab 3.0 环境中分别运行：
+将项目放在 Isaac Lab 目录之外，并在对应 Python 环境中安装：
 
 ```powershell
-python .\scripts\diagnostics\env_step_rtf.py --task Isaac-Cartpole --device cuda:0 --viz none --info
-python .\scripts\diagnostics\env_step_rtf.py --task Hexchip-Cartpole-Real-V2-v0 --device cuda:0 --viz none --info
+python -m pip install -e .\source\cartpole
+python .\scripts\rsl_rl\train.py --help
+python .\scripts\rsl_rl\play.py --help
 ```
 
-比较两次 `ENV_STEP_TIMING`，确认 `physics_dt_s=0.001`、`step_dt_s=0.002`、`num_envs=1` 和 `device=cuda:0`。两者都是完整环境的零动作基线，不包含模型推理，也不使用 RSL-RL 包装器。不同任务的动力学、动作含义、终止条件和重置次数可能不同，因此差值不是某一函数的精确成本，更不能等同于相同策略的性能差距。该对照用于决定下一步优先检查框架公共路径还是项目额外逻辑，不衡量控制效果。
+训练、评估和导出必须使用同一任务及兼容配置。权重能加载、文件名相同或进程退出码为 0，都不能代替动作/观测顺序、单位、控制频率和模型文件的核验。
 
-## 训练指标与可选配方
+## 验证边界
 
-完整回合指标、动态候选及冻结策略评估见 [训练流程](docs/training-deployment-workflow.md)。
-[400 Hz / Acc9 / Window16 / Tau0](docs/training-400hz-acc9.md) 为独立单动作配方，原 V2 任务不变。
+已有现场记录包含后续实验分支的训练、筛选、导出及真机平衡控制；这些记录不能作为当前主线精确提交的完整验收。轻量测试、GPU/PhysX 运行、Windows ONNX 推理和硬件闭环分别验证不同层次。部署前按设备文档核对当前标定与会话配置，不把仓库中的历史设备档案当作实时硬件读数。
+
+## 开发与排查
+
+- 开发约束见 [AGENTS.md](AGENTS.md)。
+- Python 格式和静态检查配置位于 `.pre-commit-config.yaml`。安装 `pre-commit` 后可运行 `pre-commit run --all-files`；这不代替仿真或硬件测试。
+- Pylance 无法索引项目时，可在 VS Code 的 `python.analysis.extraPaths` 加入本项目 `source/cartpole`；Isaac Lab 和 Isaac Sim 的索引路径应对应实际安装位置。
+- `ui_extension_example.py` 保留 Omniverse 扩展示例。独立训练不要求启用该界面扩展。
+- [零动作吞吐对照与分段计时](scripts/diagnostics/README.md)不测量真实电机能力，也不衡量策略控制效果。
+
+完整布局、历史资料入口与维护边界见[文档导航](docs/README.md)。

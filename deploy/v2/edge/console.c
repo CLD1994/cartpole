@@ -1,4 +1,4 @@
-/* 交互控制台实现。协议契约见 deploy/v2/protocol.md。 */
+/* 交互控制台实现。协议契约见 docs/deployment/protocol.md。 */
 
 #include "console.h"
 

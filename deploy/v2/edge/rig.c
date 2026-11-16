@@ -1,5 +1,5 @@
 /* 台位会话实现：行为从 main.c 原地迁入，语义不变。
- * 协议契约见 deploy/v2/protocol.md。
+ * 协议契约见 docs/deployment/protocol.md。
  */
 
 #include "rig.h"

@@ -1,7 +1,7 @@
 /* 端侧控制程序常量（新装置 v2）。
  *
  * 权威关系：固件参数（VEL_MAX/ACC_MAX 等）的会话权威在这里，启动时经 CONFIG 命令推送；
- * 协议行为契约见 deploy/v2/protocol.md，仿真契约见 deploy/v2/sim2real-spec.md。
+ * 协议行为契约见 docs/deployment/protocol.md，仿真契约见 docs/training/sim2real-model.md。
  * 换台位只改本文件。
  */
 #ifndef EDGE_CONFIG_H
@@ -12,7 +12,7 @@
 #define CFG_BAUD            460800
 
 /* ---- 控制环 ---- */
-#define CFG_CONTROL_HZ      200.0     /* 旧部署节拍；不可直接部署500Hz新模型，见training-readiness */
+#define CFG_CONTROL_HZ      200.0     /* 旧部署节拍；不可直接部署500Hz新模型，见 docs/training/sim2real-model.md */
 #define CFG_STATE_TIMEOUT_S 0.2       /* 超过此时长无 STATE 行：发 VEL 0 并等待恢复 */
 
 /* ---- 动作映射（策略输出 [-1,1] -> 目标速度） ---- */

@@ -53,7 +53,7 @@ class RealCartpoleV2EnvCfg(CartpoleEnvCfg):
         self.rewards.terminating.weight *= 0.005 / DEVICE["policy_dt"]
         # render_interval (set to decimation by the base class) stays 2
 
-        # --- action: velocity command + bounded-acceleration tracking (see sim2real-spec.md).
+        # --- action: velocity command + bounded-acceleration tracking (see docs/training/sim2real-model.md).
         # The attribute name `joint_effort` is inherited from the base ActionsCfg slot; the term
         # itself is the v2 velocity-tracking action (a JointEffortActionCfg subclass, so the
         # config-class type check passes). ---
@@ -73,7 +73,7 @@ class RealCartpoleV2EnvCfg(CartpoleEnvCfg):
         # 关节顺序为 [小车, 摆杆]；位置单位 [m, rad]，速度单位 [m/s, rad/s]。
         # 标准差依次为 0.05 mm、1 mrad、5 mm/s、10 mrad/s。
         # 速度观测仍来自仿真瞬时关节速度，未复现固件采样窗口与无效状态。
-        # 观测边界见 deploy/v2/sim2real-spec.md。
+        # 观测边界见 docs/training/sim2real-model.md。
         self.observations.policy.joint_pos_rel.noise = GaussianNoiseCfg(
             func=gaussian_noise_from_list, mean=0.0, std=[5.0e-5, 1.0e-3]
         )

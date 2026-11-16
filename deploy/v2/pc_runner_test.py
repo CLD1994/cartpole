@@ -227,7 +227,7 @@ static volatile sig_atomic_t g_stop;
 
 class FrameFixTest(unittest.TestCase):
     """部署边界符号映射：θ、θ̇ 取反，x、ẋ 与动作不变
-    （桌面刚体仿真判别实验定案，见 sim2real-spec 符号映射）。"""
+    （桌面刚体仿真判别实验定案，见 本文件旧台位符号映射）。"""
 
     def test_theta_channels_negated_others_kept(self):
         obs = (0.123, -3.14, 0.5, -1.2)
