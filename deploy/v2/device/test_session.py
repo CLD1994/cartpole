@@ -31,10 +31,7 @@ class SessionTests(unittest.TestCase):
         self.s = Session(self.port, self.clock, self.limits)
 
     def state(self, x=0, th=0, vx=0, w=0, flags=3):
-        self.seq = getattr(self, 'seq', 0) + 1
-        self.device_tick = max(getattr(self, 'device_tick', 0) + 1, int(self.clock.time * 1e6))
-        self.s.receive(frame(tick=self.device_tick, cs=self.seq, ps=self.seq,
-                             x=x, th=th, vx=vx, w=w, flags=flags))
+        self.s.receive(frame(x=x, th=th, vx=vx, w=w, flags=flags))
 
     def ready(self):
         self.s.receive('MODE READY NONE')

@@ -22,12 +22,7 @@ struct device_session {
     struct metadata meta[FIELD_COUNT];
     double now, valid_at, mode_at, stop_at, last_stop_tx;
     bool clock_known, valid_known, mode_known, disable_sent;
-    bool frame_known, seq_known[2];
-    uint32_t boot, tick;
-    uint16_t seq[2];
-    int64_t elapsed_us, sample_us[2];
-    uint32_t sample_position[2], sample_velocity[2];
-    double stream_origin, device_elapsed, minimum_lag;
+
 };
 
 static void invalidate(device_session *s) {
@@ -53,14 +48,6 @@ static void fail(device_session *s, device_error e) {
             s->stop_at = s->now; s->last_stop_tx = s->now; s->disable_sent = false;
             if (!s->send(s->context, "VEL 0\n")) s->view.phase = DEVICE_FINISHED;
         }
-    }
-}
-static void state_failure(device_session *s) {
-    bool observing = s->view.phase == DEVICE_OBSERVING;
-    fail(s, DEVICE_INVALID_MEASUREMENT);
-    if (observing) {
-        s->view.error = DEVICE_INVALID_MEASUREMENT;
-        s->view.phase = DEVICE_FINISHED;
     }
 }
 static bool clock_update(device_session *s, double t) {
@@ -109,75 +96,22 @@ static bool integer(const char *p, int64_t *value) {
     *value = (int64_t)v;
     return true;
 }
-static bool hex_field(const char *p, size_t width, uint32_t *v) {
-    if (strlen(p) != width) return false;
-    uint32_t n = 0;
-    for (size_t i = 0; i < width; ++i) {
-        unsigned char c = (unsigned char)p[i]; unsigned digit;
-        if (c >= '0' && c <= '9') digit = c - '0';
-        else if (c >= 'a' && c <= 'f') digit = c - 'a' + 10;
-        else if (c >= 'A' && c <= 'F') digit = c - 'A' + 10;
-        else return false;
-        n = (n << 4) | digit;
-    }
-    *v = n; return true;
-}
-static int64_t signed32(uint32_t v) {
-    return v <= INT32_MAX ? (int64_t)v : (int64_t)v - INT64_C(4294967296);
+static bool decimal32(const char *p, int64_t *value) {
+    const char *digits = *p == '-' ? p + 1 : p;
+    if (!*digits || (*digits == '0' && (digits[1] || p != digits))) return false;
+    for (const char *q = digits; *q; ++q) if (*q < '0' || *q > '9') return false;
+    return integer(p, value) && *value >= INT32_MIN && *value <= INT32_MAX;
 }
 static bool state_frame(device_session *s, char **words, size_t n) {
-    const size_t widths[] = {8, 8, 1, 4, 4, 4, 4, 8, 8, 8, 8};
-    uint32_t v[11];
-    if (n != 12) return false;
-    for (size_t i = 0; i < 11; ++i) if (!hex_field(words[i+1], widths[i], &v[i])) return false;
-    if (v[2] > 3) return false;
-    for (unsigned lane = 0; lane < 2; ++lane) {
-        if (v[2] & (1u << lane)) { if (v[5+lane] > 20000) return false; }
-        else if (v[3+lane] || v[5+lane] != 65535 || v[7+lane] || v[9+lane]) return false;
-    }
-    int64_t theta = signed32(v[8]);
-    if ((v[2] & 2) && (theta < -3141592 || theta > 3141592)) return false;
-    bool advance = true;
-    bool duplicate_tick = s->frame_known && s->tick == v[1];
-    if (s->frame_known) {
-        if (s->boot != v[0]) {
-            state_failure(s); return true;
-        } else {
-            uint32_t delta = v[1] - s->tick;
-            if (delta >= UINT32_C(2147483648)) { state_failure(s); return true; }
-            if (delta == 0) advance = false;
-            s->elapsed_us += delta;
-            s->device_elapsed = (double)s->elapsed_us / 1e6;
-        }
-    }
-    if (!s->frame_known) { s->stream_origin = s->now; s->device_elapsed = 0; s->minimum_lag = 0; }
-    double lag = s->now - s->stream_origin - s->device_elapsed;
-    if (lag < s->minimum_lag) s->minimum_lag = lag;
-    double backlog = lag - s->minimum_lag;
-    s->boot = v[0]; s->tick = v[1]; s->frame_known = true;
-    for (unsigned lane = 0; lane < 2; ++lane) {
-        if (!(v[2] & (1u << lane))) continue;
-        int64_t sample = s->elapsed_us - v[5+lane];
-        if (s->seq_known[lane]) {
-            uint16_t delta = (uint16_t)(v[3+lane] - s->seq[lane]);
-            if (delta >= 32768) { state_failure(s); return true; }
-            if (delta && duplicate_tick) { state_failure(s); return true; }
-            if (delta ? sample <= s->sample_us[lane] :
-                (sample != s->sample_us[lane] || v[7+lane] != s->sample_position[lane] ||
-                 v[9+lane] != s->sample_velocity[lane])) {
-                state_failure(s); return true;
-            }
-            if (!delta) advance = false;
-        }
-        s->seq[lane] = (uint16_t)v[3+lane]; s->seq_known[lane] = true;
-        s->sample_us[lane] = sample;
-        s->sample_position[lane] = v[7+lane]; s->sample_velocity[lane] = v[9+lane];
-    }
-    if (v[2] != 3) { fail(s, DEVICE_INVALID_MEASUREMENT); return true; }
-    if (!advance) return true;
-    double sample_at = s->now - (double)(v[5] > v[6] ? v[5] : v[6]) / 1e6 - backlog;
-    s->valid_known = true; s->view.validity = true; s->valid_at = sample_at;
-    s->view.state = (device_state){signed32(v[7]), theta, signed32(v[9]), signed32(v[10]), sample_at, true};
+    int64_t v[5];
+    if (n != 6) return false;
+    for (size_t i = 0; i < 5; ++i) if (!decimal32(words[i+1], &v[i])) return false;
+    if (v[0] < 0 || v[0] > 3 || v[2] < -3141592 || v[2] > 3141592) return false;
+    if (!(v[0] & 1) && (v[1] || v[3])) return false;
+    if (!(v[0] & 2) && (v[2] || v[4])) return false;
+    if (v[0] != 3) { fail(s, DEVICE_INVALID_MEASUREMENT); return true; }
+    s->valid_known = true; s->view.validity = true; s->valid_at = s->now;
+    s->view.state = (device_state){v[1], v[2], v[3], v[4], s->now, true};
     return true;
 }
 static bool finite_positive(double x) { return isfinite(x) && x > 0; }
@@ -227,10 +161,12 @@ bool device_session_feed(device_session *s, const char *line, double now) {
     if (!strcmp(words[0], "VEL_VALID") || !strcmp(words[0], "CART_STATE1")) {
         goto malformed;
     } else if (!strcmp(words[0], "STATE")) {
-        const size_t spaces[] = {5, 14, 23, 25, 30, 35, 40, 45, 54, 63, 72};
-        if (strlen(line) != 81) goto malformed;
-        for (size_t i = 0; i < sizeof spaces / sizeof spaces[0]; ++i)
-            if (line[spaces[i]] != ' ') goto malformed;
+        if (strlen(line) > 52 || strncmp(line, "STATE ", 6)) goto malformed;
+        for (size_t i = 0; line[i]; ++i) {
+            if (line[i] == ' ') {
+                if (!i || !line[i+1] || line[i+1] == ' ') goto malformed;
+            } else if (line[i] == '\t' || line[i] == '\r' || line[i] == '\n') goto malformed;
+        }
         if (!state_frame(s, words, n)) goto malformed;
     } else if (!strcmp(words[0], "MODE")) {
         if (n != 3) goto malformed;

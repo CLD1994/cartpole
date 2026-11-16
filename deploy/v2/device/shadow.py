@@ -149,7 +149,7 @@ def main():
                     last_sample = obs.received_at
                     state = obs.si()
                     row = {'elapsed_s': now-start, 'firmware_state_si': state,
-                           'observation_effective_age_s': now-obs.received_at, 'predictions': []}
+                           'host_observation_age_s': now-obs.received_at, 'predictions': []}
                     for sign in signs:
                         begin = CLOCK()
                         action = policy.forward((state[0], sign*state[1], state[2], sign*state[3]))

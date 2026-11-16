@@ -11,22 +11,16 @@ static bool send_line(void *context, const char *line) {
     snprintf(w->lines[w->count++], 64, "%s", line);
     return !w->fail;
 }
-static unsigned test_seq, test_tick;
 static device_session *create(struct wire *w) {
-    test_seq = test_tick = 0;
     device_limits limits = {1250, 10000, 10000, 100, 0.1, 0.3, 1.0, 1.0};
     return device_session_create(limits, send_line, w);
 }
 static const char *state_line(int32_t x, int32_t th, int32_t vx, int32_t w, unsigned flags, double time) {
-    static char line[160]; unsigned seq = ++test_seq;
-    unsigned tick = (unsigned)llround(time * 1e6);
-    if (tick <= test_tick) tick = test_tick + 1;
-    test_tick = tick;
-    snprintf(line, sizeof line, "STATE 12345678 %08x %x %04x %04x %04x %04x %08x %08x %08x %08x",
-        tick, flags, flags & 1 ? seq & 65535 : 0, flags & 2 ? seq & 65535 : 0,
-        flags & 1 ? 0 : 65535, flags & 2 ? 0 : 65535,
-        flags & 1 ? (unsigned)x : 0, flags & 2 ? (unsigned)th : 0,
-        flags & 1 ? (unsigned)vx : 0, flags & 2 ? (unsigned)w : 0);
+    static char line[160];
+    (void)time;
+    snprintf(line, sizeof line, "STATE %u %d %d %d %d", flags,
+        flags & 1 ? x : 0, flags & 2 ? th : 0,
+        flags & 1 ? vx : 0, flags & 2 ? w : 0);
     return line;
 }
 static void prepare(device_session *s) {

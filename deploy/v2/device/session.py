@@ -59,7 +59,7 @@ class Observation:
     theta_urad: int
     velocity_mm_s: int
     angular_velocity_mrad_s: int
-    received_at: float  # 新鲜度参考：主机接收时刻扣除设备年龄及相对积压。
+    received_at: float  # 主机收到完整帧的时刻；不证明设备采样年龄。
 
     def si(self):
         """固件坐标系；不隐式翻转角度、不冒充策略的坐标系。"""
@@ -90,65 +90,15 @@ class Session:
         self._stop_at = self._last_stop_tx = -math.inf
         self._disable_sent = False
 
-    def _state_failure(self, reason, now):
-        self._fail(reason, now)
-        self.failure = self.failure or reason
-        if self.phase == Phase.OBSERVING:
-            self.phase = Phase.FINISHED
-
     def _receive_state(self, line, now):
         frame = parse_state(line)
-        previous = getattr(self, '_frame', None)
-        if previous is not None and frame.boot != previous.boot:
-            self._state_failure('state_boot_changed', now)
-            return
-        if previous is None:
-            self._device_elapsed = 0.0
-            self._device_elapsed_us = 0
-            self._stream_origin = now
-            self._minimum_lag = 0.0
-        else:
-            delta = (frame.tick - previous.tick) & 0xffffffff
-            if delta >= 0x80000000:
-                self._state_failure('state_clock', now)
-                return
-            self._device_elapsed_us += delta
-            self._device_elapsed = self._device_elapsed_us / 1e6
-        lag = now - self._stream_origin - self._device_elapsed
-        self._minimum_lag = min(self._minimum_lag, lag)
-        backlog = max(0., lag - self._minimum_lag)
-        watermarks = dict(getattr(self, '_sample_watermarks', {}))
-        unchanged = previous is not None and delta == 0
-        elapsed_us = self._device_elapsed_us
-        for name, lane in (('cart', frame.cart), ('pole', frame.pole)):
-            if lane is None:
-                continue
-            sample_us = elapsed_us - lane.age_us
-            old = watermarks.get(name)
-            if old is not None:
-                old_lane, old_sample_us = old
-                advance = (lane.seq - old_lane.seq) & 0xffff
-                if advance >= 0x8000 or (advance and previous is not None and delta == 0):
-                    self._state_failure('state_sequence', now)
-                    return
-                if (advance == 0 and (sample_us != old_sample_us or
-                    lane.position != old_lane.position or lane.velocity != old_lane.velocity)) or (
-                    advance != 0 and sample_us <= old_sample_us):
-                    self._state_failure('state_sample_time', now)
-                    return
-                unchanged |= advance == 0
-            watermarks[name] = (lane, sample_us)
-        self._sample_watermarks = watermarks
-        self._frame = frame
         if frame.cart is None or frame.pole is None:
             self._fail('measurement_invalid', now)
             return
-        if unchanged:
-            return  # 重复的任一路不能刷新完整模型观测。
-        at = now - max(frame.cart.age_us, frame.pole.age_us) / 1e6 - backlog
-        self._valid, self._valid_at = True, at
+        # 这是主机收到完整帧的时刻，不证明设备采样或端到端新鲜度。
+        self._valid, self._valid_at = True, now
         self.observation = Observation(frame.cart.position, frame.pole.position,
-                                       frame.cart.velocity, frame.pole.velocity, at)
+                                       frame.cart.velocity, frame.pole.velocity, now)
 
     def _now(self):
         now = self.clock()

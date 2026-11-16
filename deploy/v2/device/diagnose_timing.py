@@ -167,7 +167,7 @@ def main():
                     obs = session.observation
                     fresh = obs is not None and obs.received_at != last_sample
                     report['events'].append({'elapsed_s': now-start, 'new_observation': fresh,
-                        'observation_effective_age_s': now-obs.received_at if obs else None,
+                        'host_observation_age_s': now-obs.received_at if obs else None,
                         'virtual_gap_s': now-last_decision, 'tick_lateness_s': now-next_tick,
                         'poll_s': poll_s, 'previous_wait_s': wait_s, 'pending_bytes_cached': source.last_count})
                     if obs is None or now-obs.received_at > .004:
@@ -250,9 +250,9 @@ def main():
                 'last_virtual_decision_clock_s': last_decision,
                 'actual_virtual_gap_s': now-last_decision if last_decision is not None else None,
                 'next_tick_clock_s': next_tick, 'tick_lateness_s': now-next_tick if next_tick is not None else None,
-                'observation_freshness_reference_s': obs.received_at if obs else None,
+                'observation_received_clock_s': obs.received_at if obs else None,
                 'observation_is_new': obs.received_at != last_sample if obs else False,
-                'observation_effective_age_s': now-obs.received_at if obs else None,
+                'host_observation_age_s': now-obs.received_at if obs else None,
                 'poll_s': poll_s, 'last_wait_s': wait_s, 'last_inference_s': inference_s,
                 'pending_bytes_cached': source.last_count if source else None,
                 'partial': source.partial if source else None, 'last_read': source.last_read if source else None}

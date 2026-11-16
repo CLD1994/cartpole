@@ -20,9 +20,9 @@ class IntegrationTests(unittest.TestCase):
   self.send('\n'.join(lines)+'\n')
  def send(self,text):self.wire.data=text.encode();self.assertTrue(self.r.poll())
  def test_fragmented_atomic_state_and_invalid_pole_stop(self):
-  line=frame()+'\n';self.send(line[:22]);self.assertIsNone(self.s.observation)
-  self.now+=.001;self.send(line[22:]);self.s.start();self.assertEqual(self.s.phase,Phase.ACTIVE)
-  self.now+=.002;self.send(frame(tick=3000,cs=2,ps=2,flags=1)+'\n');self.assertEqual(self.s.phase,Phase.STOPPING);self.assertIsNone(self.s.observation);self.assertIn(b'VEL 0\n',self.wire.sent)
+  line=frame()+'\n';self.send(line[:10]);self.assertIsNone(self.s.observation)
+  self.now+=.001;self.send(line[10:]);self.s.start();self.assertEqual(self.s.phase,Phase.ACTIVE)
+  self.now+=.002;self.send(frame(flags=1)+'\n');self.assertEqual(self.s.phase,Phase.STOPPING);self.assertIsNone(self.s.observation);self.assertIn(b'VEL 0\n',self.wire.sent)
  def test_bad_batch_cannot_deliver_good_frame_first(self):
   self.wire.data=(frame()+'\n').encode()+b'\xff\n';self.assertFalse(self.r.poll());self.assertIsNone(self.s.observation);self.assertEqual(self.r.error,'invalid_ascii')
  def test_partial_frame_timeout_keeps_state_unavailable(self):

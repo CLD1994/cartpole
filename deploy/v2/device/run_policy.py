@@ -228,7 +228,7 @@ def state_guard(obs, session, starting=False):
 
 def guard_snapshot(obs, session, starting=False):
     return {'state_si': list(obs.si()) if obs else None,
-            'freshness_reference_at_s': obs.received_at if obs else None,
+            'host_received_at_s': obs.received_at if obs else None,
             'checked_at_s': CLOCK(), 'starting': starting,
             'limits': {'max_abs_x_m': None,
                        'position_owner': 'firmware',
@@ -611,8 +611,8 @@ def main(a=None):
                                                   'inference_s': inference_s,
                                                   'command_gap_s': command_gap,
                                                   'command_gap_soft_warning': command_gap > COMMAND_GAP_SOFT_S,
-                                                  'observation_freshness_reference_s': obs.received_at,
-                                                  'observation_effective_age_s': completed_at-obs.received_at,
+                                                  'observation_received_clock_s': obs.received_at,
+                                                  'host_observation_age_s': completed_at-obs.received_at,
                                                   'grid_slot': candidate_slot,
                                                   'grid_due_clock_s': candidate_due_ns/1e9,
                                                   'grid_lateness_s': grid_lateness_s,
@@ -659,8 +659,8 @@ def main(a=None):
                         'last_command_clock_s': last_command_at, 'next_tick_clock_s': next_tick,
                         'grid_slot': next_slot,
                         'grid_lateness_s': failed_at-next_tick if next_tick is not None else None,
-                        'observation_freshness_reference_s': failed_obs.received_at if failed_obs else None,
-                        'observation_effective_age_s': failed_at-failed_obs.received_at if failed_obs else None,
+                        'observation_received_clock_s': failed_obs.received_at if failed_obs else None,
+                        'host_observation_age_s': failed_at-failed_obs.received_at if failed_obs else None,
                         'precommand_receive': drain,
                         'readback_in_flight': dict(refresh.pending) if refresh and refresh.pending else None}
                 finally:
