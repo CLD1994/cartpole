@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""限时策略联调入口：无自动使能/配置；需要明确模型合同及现场启动请求。"""
+"""单动作实验入口：模型目录包含训练清单，设备标定自动读取；不自动使能或配置。"""
 import argparse
 from collections import deque
 import json
 import math
 from pathlib import Path
 import time
+import sys
 
-from shadow import CLOCK, PROFILE, Policy, summary
-from check import limits_from_profile
+from shadow import CLOCK, Policy, summary
+from experiment_setup import (limits_from_manifest, PROTOCOL_BAUD, RIG_COORDINATES,
+                              ANGLE_SIGN, report_path, result_summary)
 from model_integrity import verify_model_files
 from receiver import Receiver
 from session import Session, Phase
@@ -90,12 +92,34 @@ class BoundSession(Session):
     """把本次台位坐标参数纳入既有新鲜读回及运行中变化检查。"""
     enforce_position_limits = False  # User-selected firmware-owned position limits.
     def __init__(self, transport, clock, limits, coordinates):
-        self.coordinates = coordinates
+        self.coordinates = dict(coordinates)
         super().__init__(transport, clock, limits)
 
     @property
     def expected_readback(self):
         return {**super().expected_readback, **self.coordinates}
+
+    @property
+    def readback_names(self):
+        return super().readback_names | {'POLE_ZERO_URAD'}
+
+    def _metadata_reason(self, now):
+        reason = super()._metadata_reason(now)
+        if reason:
+            return reason
+        zero = self.values.get('POLE_ZERO_URAD')
+        if (zero is None or not -3141592 <= zero[0] <= 3141592
+                or not self._fresh(zero[1], now, self.limits.preflight_timeout_s)):
+            return 'readback_POLE_ZERO_URAD'
+        return None
+
+    def bind_calibration(self):
+        reason = self._metadata_reason(self._now())
+        if reason:
+            raise RuntimeError('preflight:' + reason)
+        self.coordinates['POLE_ZERO_URAD'] = self.values['POLE_ZERO_URAD'][0]
+        self.bound_travel_um = self.values['CAL_LENGTH_UM'][0]
+        return {key: entry[0] for key, entry in self.values.items()}
 
 
 class ProbeSession(StepLossEventMixin, BoundSession):
@@ -182,38 +206,6 @@ class ReadbackCycle:
         self.index = (self.index+1) % len(self.groups)
 
 
-def load_contract(path, model):
-    c = json.loads(path.read_text(encoding='utf-8-sig'))
-    expected = {'schema_version': 1, 'observation_order': ['x', 'theta', 'xdot', 'thetadot'],
-                'observation_units': ['m', 'rad', 'm/s', 'rad/s'],
-                'action_scale_m_s': 1.25,
-                'x_sign': 1, 'action_sign': 1}
-    if (type(c.get('training_control_hz')) is not int
-            or type(c.get('action_dim', 1)) is not int
-            or type(c.get('schema_version')) is not int
-            or c.get('action_type') != 'cart_target_velocity' or c.get('action_dim', 1) != 1
-            or c.get('training_control_hz') not in (400, 500)):
-        raise ValueError('single_action_contract_mismatch')
-    if any(c.get(k) != v for k, v in expected.items()):
-        raise ValueError('model_contract_mismatch')
-    if type(c.get('angle_sign')) is not int or c['angle_sign'] not in (-1, 1):
-        raise ValueError('angle_sign_required')
-    verify_model_files(model, c)
-    coordinates = c.get('firmware_coordinates')
-    if (not isinstance(coordinates, dict) or set(coordinates) != {'POLE_ZERO_URAD', 'POLE_INV', 'X_INV'}
-            or any(type(v) is not int for v in coordinates.values())
-            or coordinates['POLE_INV'] not in (0, 1) or coordinates['X_INV'] not in (0, 1)
-            or not -3141592 <= coordinates['POLE_ZERO_URAD'] <= 3141592):
-        raise ValueError('firmware_coordinates_required')
-    # 声明仅用于避免误启动，不是物理验证证据；来源需由操作者审阅。
-    if any(c.get(k) is not True for k in ('export_contract_reviewed', 'coordinate_evidence_reviewed',
-                                         'timing_mismatch_acknowledged', 'onsite_stop_ready')):
-        raise ValueError('contract_review_incomplete')
-    if not isinstance(c.get('evidence_note'), str) or not c['evidence_note'].strip():
-        raise ValueError('evidence_note_required')
-    return c
-
-
 def verify_bound_calibration(session):
     # Keep calibration validity/freshness and stable coordinates without a host position gate.
     if session._metadata_reason(CLOCK()):
@@ -246,13 +238,12 @@ def guard_snapshot(obs, session, starting=False):
             'reason': state_guard(obs, session, starting) if obs else 'measurement_unavailable'}
 
 
-def main():
+def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--port', required=True)
-    p.add_argument('--onnx', required=True, type=Path)
-    p.add_argument('--contract', required=True, type=Path)
-    p.add_argument('--profile', type=Path, default=PROFILE, help='本次标定与训练设备配置；不修改固件')
-    p.add_argument('--output', required=True, type=Path)
+    p.add_argument('--model', required=True, type=Path, help='含 policy.onnx 与 model.json 的导出目录')
+    p.add_argument('--output', type=Path, help='完整报告；默认在模型 runs 目录生成唯一文件')
+    p.add_argument('--json', action='store_true', help='终端输出机器可读摘要 JSON')
     duration_args = p.add_mutually_exclusive_group()
     duration_args.add_argument('--seconds', type=float, default=5.)
     duration_args.add_argument('--continuous', action='store_true', help='受监控持续控制，直到Ctrl+C或门控停机；不能无人值守')
@@ -262,7 +253,7 @@ def main():
     p.add_argument('--start-confirmed', action='store_true', help='现场明确请求本次运动；绝不自动使能')
     p.add_argument('--timing-profile', choices=('normal', 'debug'), default='normal',
                    help='debug显式采用15ms命令/12ms观测期限；不是硬实时保证')
-    a = p.parse_args()
+    a = p.parse_args(argv)
     event_diag = a.step_loss_monitor
     if a.continuous and a.diagnostic_timing:
         p.error('--continuous不能与只读诊断组合')
@@ -270,24 +261,33 @@ def main():
         p.error('需要现场明确 --start-confirmed；只读诊断请用 shadow.py')
     if not math.isfinite(a.seconds) or not 0 < a.seconds <= (10. if a.diagnostic_timing else 5.):
         p.error('--seconds 运动在(0,5]，只读诊断在(0,10]' )
-    contract = load_contract(a.contract, a.onnx)
-    profile = json.loads(a.profile.read_text(encoding='utf-8-sig'))
     if event_diag and a.diagnostic_timing:
         p.error('--step-loss-monitor不能与只读诊断组合')
+    a.output = a.output or report_path(a.model)
+    return a
+
+
+def main(a=None):
+    from model_manifest import load_manifest
+    a = a or parse_args()
+    a.serial_open_attempted = False
+    event_diag = a.step_loss_monitor
+    model = a.model / 'policy.onnx'
+    manifest = load_manifest(a.model / 'model.json', model)
     hard_limit_s, observation_limit_s, inference_limit_s = timing_limits(a.timing_profile)
-    period_ns = 1_000_000_000 // contract['training_control_hz']
-    limits = limits_from_profile(profile)
-    if (limits.control_hz != contract['training_control_hz'] or limits.speed_mm_s != 1250
-            or (contract['training_control_hz'] == 400 and limits.acceleration_mm_s2 != 9000)):
-        raise ValueError('profile_contract_mismatch')
-    policy = Policy(a.onnx)
+    period_ns = 1_000_000_000 // manifest['training_control_hz']
+    limits = limits_from_manifest(manifest)
+    policy = Policy(model)
     for _ in range(20):
         policy.forward((0., 0., 0., 0.))
     # 外部权重初始化前后均核验；在运行期间不可改动导出文件。
-    verified_files = verify_model_files(a.onnx, contract)
-    report = {'loop_interval_scope': 'new-observation decision ticks, not serial command completion', 'runner_revision': 16, 'timing_profile': a.timing_profile, 'control_hz': limits.control_hz, 'grid_period_ns': period_ns, 'action_dim': 1, 'host_angle_gate': False, 'diagnostic_timing': a.diagnostic_timing, 'discarded_stale_candidates': 0, 'candidate_refresh_stages': {}, 'stale_observation_waits': 0, 'max_stale_observation_age_s': 0., 'grid_slots_skipped': 0, 'over_period_late_candidates': 0, 'readback_refresh': [], 'scheduler': 'absolute-grid-wait-fresh', 'duplicate_tick_count': 0, 'verified_model_files': verified_files, 'status': 'starting', 'scope': '限时真机联调；不是硬实时或真机验收',
+    verified_files = verify_model_files(model, manifest)
+    report = {'loop_interval_scope': 'new-observation decision ticks, not serial command completion', 'runner_revision': 17, 'timing_profile': a.timing_profile, 'control_hz': limits.control_hz, 'grid_period_ns': period_ns, 'action_dim': 1, 'host_angle_gate': False, 'diagnostic_timing': a.diagnostic_timing, 'discarded_stale_candidates': 0, 'candidate_refresh_stages': {}, 'stale_observation_waits': 0, 'max_stale_observation_age_s': 0., 'grid_slots_skipped': 0, 'over_period_late_candidates': 0, 'readback_refresh': [], 'scheduler': 'absolute-grid-wait-fresh', 'duplicate_tick_count': 0, 'verified_model_files': verified_files, 'status': 'starting', 'scope': '限时真机联调；不是硬实时或真机验收',
               'timing_limits_s': {'command_gap_soft': COMMAND_GAP_SOFT_S, 'command_gap_hard': hard_limit_s, 'observation_max_age': observation_limit_s},
-              'contract': contract, 'clock': vars(time.get_clock_info('perf_counter')),
+              'rig_requirements': {'protocol_baud': PROTOCOL_BAUD, 'config': limits.config,
+                                   'coordinates': dict(RIG_COORDINATES), 'angle_sign': ANGLE_SIGN,
+                                   'x_sign': 1, 'action_sign': 1},
+              'model_manifest': manifest, 'clock': vars(time.get_clock_info('perf_counter')),
               'continuous': a.continuous, 'requested_seconds': None if a.continuous else a.seconds, 'samples': [], 'received_states': [], 'inference_attempts_s': [], 'would_stop_count_scope': 'gate invocation counts, not independent faults or failed cycles', 'would_stop': {}, 'virtual_command_attempted': False, 'motion_command_sent': False, 'motion_command_attempted': False}
     if a.step_loss_monitor:
         report['step_loss_monitor_config'] = {'model_continues': True, 'event_run_matches_current_firmware_run_verified': False, 'event_wait_timeout_s': None, 'pre_event_sample_limit': 400, 'post_event_sample_limit': 2000, 'scope': '首个同run事件的控制决策样本窗口；非全部串口STATE、非固定物理时长；完成后不被尾缓冲覆盖'}
@@ -336,16 +336,17 @@ def main():
         initial_manifest = {k:v for k,v in report.items() if not isinstance(v,deque)}
         json.dump(initial_manifest,output,ensure_ascii=False,indent=2);output.flush()
         import serial
-        port = serial.Serial(port=None, baudrate=profile['measured']['protocol_baud'], timeout=0, write_timeout=.002)
+        port = serial.Serial(port=None, baudrate=PROTOCOL_BAUD, timeout=0, write_timeout=.002)
         port.dtr = port.rts = False
         port.port = a.port
         try:
+            a.serial_open_attempted = True
             with port:
                 try:
                     port.reset_input_buffer()
                     transport = (DiagnosticTransport if a.diagnostic_timing else ControlTransport)(port)
                     session_class = DiagnosticSession if a.diagnostic_timing else ProbeSession if event_diag else BoundSession
-                    session = session_class(transport, CLOCK, limits, contract['firmware_coordinates'])
+                    session = session_class(transport, CLOCK, limits, RIG_COORDINATES)
                     probe = session.step_loss_probe if event_diag else None
                     if probe and a.step_loss_monitor:
                         probe.enable_monitor()
@@ -376,9 +377,8 @@ def main():
                     reason = session.preflight_reason()
                     if reason:
                         raise RuntimeError('preflight:' + reason)
-                    if session.values['CAL_LENGTH_UM'][0] != profile['measured']['calibrated_travel_um']:
-                        raise RuntimeError('profile_travel_mismatch')
-                    session.bound_travel_um = session.values['CAL_LENGTH_UM'][0]
+                    report['device_snapshot'] = session.bind_calibration()
+                    report['coordinate_mapping'] = {'x_sign': 1, 'action_sign': 1, 'angle_sign': ANGLE_SIGN}
                     report['position_boundary'] = {
                         'calibrated_travel_um': session.bound_travel_um,
                         'position_owner': 'firmware',
@@ -432,7 +432,12 @@ def main():
                             raise RuntimeError('run_query_unsupported_or_timeout')
                         report['verified_firmware_run_id'] = session.run_reply
                         report['step_loss_monitor_config']['event_run_matches_current_firmware_run_verified'] = True
-                        print('事件记录：同run STEP_LOSS仅记录；FAULT仍停车，Ctrl+C停止。', flush=True)
+                        if not a.json:
+                            print('事件记录：同 run STEP_LOSS 仅记录；FAULT 仍停车，Ctrl+C 停止。', flush=True)
+                    if not a.json:
+                        duration = '持续运行，Ctrl+C 停止' if a.continuous else f'{a.seconds:g} 秒'
+                        print(f'预检通过：{limits.control_hz:g} Hz，{limits.speed_mm_s} mm/s，{limits.acceleration_mm_s2} mm/s²；{duration}。', flush=True)
+                        print(f'报告：{a.output}', flush=True)
                     session.start()
                     grid_start_ns = time.perf_counter_ns()
                     start = next_tick = grid_start_ns / 1e9
@@ -517,7 +522,7 @@ def main():
                                 continue
                         raw = None
                         inference_s = None
-                        raw = policy.forward((x, contract['angle_sign']*th, vx, contract['angle_sign']*w))
+                        raw = policy.forward((x, ANGLE_SIGN*th, vx, ANGLE_SIGN*w))
                         inference_s = CLOCK()-begin
                         report['inference_attempts_s'].append(inference_s)
                         totals=report['run_totals']
@@ -720,10 +725,30 @@ def main():
             output.seek(0);output.truncate()
             json.dump(report, output, ensure_ascii=False, indent=2)
             output.write('\n')
-    print(json.dumps({k:v for k,v in report.items() if k not in ('samples', 'received_states', 'inference_attempts_s')}, ensure_ascii=False, indent=2))
+    if a.json:
+        print(json.dumps({k:v for k,v in report.items() if k not in ('samples', 'received_states', 'inference_attempts_s')}, ensure_ascii=False, indent=2))
+    else:
+        print(result_summary(report, a.output))
     return 0 if report['status'] in ('complete','stopped_by_user') else 1
 
 
-if __name__ == '__main__':
-    raise SystemExit(main())
+def entrypoint(argv=None):
+    args = parse_args(argv)
+    args.serial_open_attempted = False
+    try:
+        return main(args)
+    except Exception as exc:
+        # 正常控制异常由 main 保留报告并停车；这里处理初始化/报告文件等外围失败。
+        error = f'{type(exc).__name__}: {exc}'
+        opened = args.serial_open_attempted
+        if args.json:
+            print(json.dumps({'status': 'error', 'error': error,
+                              'serial_open_attempted': opened}, ensure_ascii=False))
+        else:
+            state = '串口已尝试打开，请检查设备状态' if opened else '未打开串口，未发送运动指令'
+            print(f'运行失败：{error}\n{state}。', file=sys.stderr)
+        return 1
 
+
+if __name__ == '__main__':
+    raise SystemExit(entrypoint())

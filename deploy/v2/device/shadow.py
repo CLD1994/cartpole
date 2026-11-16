@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 from pathlib import Path
@@ -13,7 +12,9 @@ import time
 # 接收时间戳必须共享 perf_counter，不能混用不同起点的时钟。
 CLOCK = time.perf_counter
 
-from check import PROFILE, limits_from_profile
+import model_manifest
+from experiment_setup import limits_from_manifest, PROTOCOL_BAUD, report_path
+from cli_output import print_readonly_summary, readonly_entrypoint
 from receiver import Receiver
 from session import Session
 
@@ -75,27 +76,27 @@ def summary(values):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--port', required=True)
-    p.add_argument('--onnx', type=Path, required=True)
+    p.add_argument('--model', type=Path, required=True, help='模型导出目录')
+    p.add_argument('--json', action='store_true', help='输出机器可读 JSON')
     p.add_argument('--seconds', type=float, default=10.)
     p.add_argument('--angle-sign', choices=('both', 'positive', 'negative'), default='both',
                    help='默认分别记录两种角量映射，不自动判断哪种正确')
-    p.add_argument('--output', type=Path, required=True, help='新建JSON报告，拒绝覆盖已有文件')
+    p.add_argument('--output', type=Path, help='新建JSON报告，拒绝覆盖已有文件')
     args = p.parse_args()
     if not math.isfinite(args.seconds) or not 0 < args.seconds <= 60:
         p.error('--seconds 必须在(0,60]')
-    profile_bytes = PROFILE.read_bytes()
-    profile = json.loads(profile_bytes)
-    limits = limits_from_profile(profile)
-    policy = Policy(args.onnx.resolve(strict=True))
+    model = args.model / 'policy.onnx'
+    manifest = model_manifest.load_manifest(args.model / 'model.json', model)
+    limits = limits_from_manifest(manifest)
+    args.output = args.output or report_path(args.model, 'shadow')
+    policy = Policy(model)
     # 模型初始化/预热在打开串口前完成，避免初始化延迟占据接收周期。
     for _ in range(20):
         policy.forward((0., 0., 0., 0.))
     signs = (1, -1) if args.angle_sign == 'both' else ((1,) if args.angle_sign == 'positive' else (-1,))
     report = {'mode': 'shadow', 'status': 'running', 'motion_sent': False,
               'scope': '只读观测和CPU推理；不是闭环、坐标方向确认或设备采样延迟验证',
-              'onnx': str(args.onnx.resolve()),
-              'onnx_main_file_sha256': hashlib.sha256(args.onnx.read_bytes()).hexdigest(),
-              'device_profile_sha256': hashlib.sha256(profile_bytes).hexdigest(),
+              'onnx': str(model), 'model_manifest': manifest,
               'clock': {'selected': 'perf_counter',
                         'perf_counter': vars(time.get_clock_info('perf_counter')),
                         'monotonic': vars(time.get_clock_info('monotonic'))},
@@ -109,7 +110,7 @@ def main():
         last_sample = last_tick = None
         try:
             import serial
-            port = serial.Serial(port=None, baudrate=profile['measured']['protocol_baud'],
+            port = serial.Serial(port=None, baudrate=PROTOCOL_BAUD,
                                  timeout=0, write_timeout=.01)
             port.dtr = False
             port.rts = False
@@ -178,11 +179,10 @@ def main():
                 report['receive_error'] = receiver.error
             json.dump(report, output, ensure_ascii=False, indent=2)
             output.write('\n')
-    print(json.dumps({k:v for k,v in report.items() if k != 'samples'}, ensure_ascii=False, indent=2))
-    print(f'有效新观测推理次数: {len(report["samples"])}；报告: {args.output.resolve()}')
+    print_readonly_summary(report, args.output, json_output=args.json)
     return 0 if report['status'] == 'complete' else 1
 
 
 if __name__ == '__main__':
-    raise SystemExit(main())
+    raise SystemExit(readonly_entrypoint(main))
 

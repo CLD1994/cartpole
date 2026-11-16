@@ -2,7 +2,7 @@ import unittest
 from dataclasses import replace
 
 from session import Limits, Phase, Session
-from check import limits_from_profile
+from experiment_setup import limits_from_manifest
 
 
 class Port:
@@ -385,10 +385,10 @@ class SessionTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, name):
                         replace(self.limits, **{name: value})
 
-    def test_profile_adapter_uses_injected_profile(self):
-        profile = {'training': {'control_hz': 450}, 'configured': {
-            'target_speed_mm_s': 1000, 'acceleration_mm_s2': 8000, 'soft_limit_margin_um': 12000}}
-        self.assertEqual(limits_from_profile(profile).speed_mm_s, 1000)
+    def test_manifest_adapter_uses_training_limits(self):
+        manifest = {'training_control_hz': 400, 'action_scale_m_s': 1.0,
+                    'training_acceleration_m_s2': 8.0}
+        self.assertEqual(limits_from_manifest(manifest).speed_mm_s, 1000)
 
 
 if __name__ == '__main__':
