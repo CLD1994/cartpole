@@ -168,7 +168,7 @@ class RealCartpoleV2EnvCfg(CartpoleEnvCfg):
             mode="reset",
             params={
                 "asset_cfg": SceneEntityCfg("robot"),
-                "damping_range": {"slider_to_cart": (0.0, 2.0), "cart_to_pole": (0.0, 0.01)},
+                "damping_range": {"slider_to_cart": (0.1, 0.6), "cart_to_pole": (0.0, 0.01)},
             },
         )
         # 参考跟踪动态范围；当前装置的速度、加速度与响应参数需要实测辨识。
