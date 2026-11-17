@@ -63,11 +63,12 @@ class ExpiryCallsiteTests(unittest.TestCase):
     def run_nodes(self, nodes, now):
         import ast
         from run_policy import check_trial_end
+        from gap_timeline import GapTimeline
         def gate(reason):raise RuntimeError(reason)
         refresh=Mock()
         context=dict(CLOCK=lambda:now, end=5., budget_at=4.999,
                      hard_limit_s=.006, gate=gate, check_trial_end=check_trial_end,
-                     refresh=refresh, remaining=-.001)
+                     refresh=refresh, remaining=-.001, timeline=GapTimeline(False), cycle=0)
         exec(compile(ast.fix_missing_locations(ast.Module(body=nodes,type_ignores=[])), '<runner-branch>', 'exec'),context)
         return refresh
     def test_wait_fresh_expiry_and_real_gap(self):

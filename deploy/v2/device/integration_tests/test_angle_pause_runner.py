@@ -83,7 +83,7 @@ class RunnerCombinationTests(unittest.TestCase):
             if not diagnostic:raise RuntimeError(reason)
         env=dict(vars(r));env.update(CLOCK=clock,time=SimpleNamespace(perf_counter_ns=lambda:round(clock.now*1e9),sleep=clock.sleep),
             session=session,receiver=receiver,transport=port,policy=SimpleNamespace(forward=forward),
-            report=report,a=SimpleNamespace(diagnostic_timing=diagnostic),pause=r.AnglePause(),gate=gate,
+            timeline=r.GapTimeline(False),cycle=0,report=report,a=SimpleNamespace(diagnostic_timing=diagnostic),pause=r.AnglePause(),gate=gate,
             hard_limit_s=.009,observation_limit_s=.004,inference_limit_s=.002,
             budget_at=10.,last_command_at=10.,start=10.,end=10.+duration,
             grid_start_ns=10_000_000_000,next_tick_ns=10_000_000_000,next_tick=10.,next_slot=0,

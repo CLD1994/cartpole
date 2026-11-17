@@ -16,6 +16,7 @@ from receiver import Receiver
 from session import Session, Phase
 from step_loss_events import StepLossEventMixin
 from angle_pause import AnglePause
+from gap_timeline import GapTimeline
 from state_frame import parse_state
 
 
@@ -301,6 +302,7 @@ def parse_args(argv=None):
     p.add_argument('--angle-pause-deg', type=float, default=60., help='绝对摆角达到此角度时暂停速度命令')
     p.add_argument('--angle-resume-deg', type=float, default=58., help='绝对摆角回落至此角度时自动重新推理')
     p.add_argument('--command-gap-hard-ms', type=float, choices=(6., 9.), help='显式覆盖命令硬期限；不改变观测或推理期限')
+    p.add_argument('--gap-timeline', action='store_true', help='记录有界主机分段计时到最终报告，不改变控制时限')
     p.add_argument('--json', action='store_true', help='终端输出机器可读摘要 JSON')
     duration_args = p.add_mutually_exclusive_group()
     duration_args.add_argument('--seconds', type=float, default=5.)
@@ -340,6 +342,8 @@ def main(a=None):
     if a.command_gap_hard_ms is not None:
         hard_limit_s = a.command_gap_hard_ms / 1000.
     pause = AnglePause(a.angle_pause_deg, a.angle_resume_deg)
+    timeline = GapTimeline(a.gap_timeline)
+    cycle = 0
     period_ns = 1_000_000_000 // manifest['training_control_hz']
     limits = limits_from_manifest(manifest, velocity_limit_mm_s=getattr(a, "velocity_limit_mm_s", None),
                                   acceleration_limit_mm_s2=getattr(a, "acceleration_limit_mm_s2", None))
@@ -524,15 +528,20 @@ def main(a=None):
                     while CLOCK() < end:
                         # 长窗口轮转刷新；命令6ms硬限、观测4ms及1秒元数据TTL独立。
                         stage = 'poll'
+                        cycle += 1
+                        timeline.mark('loop_poll_begin', cycle)
                         if transport.in_waiting > 128:
                             raise RuntimeError('active_backlog')
                         if not receiver.poll() or session.phase != Phase.ACTIVE:
                             raise RuntimeError(receiver.error or session.failure or 'session_inactive')
                         now_ns = time.perf_counter_ns()
+                        timeline.mark('poll_done', cycle)
                         now = now_ns / 1e9
                         if refresh:
                             refresh.update(session, now)
+                            timeline.mark('readback_update_done', cycle)
                         stage = 'angle_pause_check'
+                        timeline.mark(stage, cycle)
                         # 非暂停仍先检查原命令预算；暂停只豁免故意停发的间隔。
                         transition = update_pause(session.observation, now)
                         if transition == 'resumed':
@@ -542,6 +551,7 @@ def main(a=None):
                             last_sample = last_tick = None
                         if pause.paused and not a.diagnostic_timing:
                             stage = 'angle_paused'
+                            timeline.mark(stage, cycle)
                             if state_guard(session.observation, session):
                                 raise RuntimeError('paused_state_guard')
                             if refresh:
@@ -549,22 +559,32 @@ def main(a=None):
                             # 读回写入也不允许遮蔽新的观测超时。
                             update_pause(session.observation, CLOCK())
                             check_trial_end(CLOCK(), end)
-                            time.sleep(.0001)
+                            sleep_requested = .0001
+                            timeline.mark('sleep_begin', cycle, sleep_requested)
+                            time.sleep(sleep_requested)
+                            timeline.mark('sleep_return', cycle)
                             continue
                         stage = 'gap_check'
+                        timeline.mark(stage, cycle)
                         if now-budget_at >= hard_limit_s:
                             gate('command_gap_deadline')
                         if now_ns < next_tick_ns:
                             stage = 'wait_tick'
-                            time.sleep(min(.0002, next_tick-now))
+                            timeline.mark(stage, cycle)
+                            sleep_requested = min(.0002, next_tick-now)
+                            timeline.mark('sleep_begin', cycle, sleep_requested)
+                            time.sleep(sleep_requested)
+                            timeline.mark('sleep_return', cycle)
                             continue
                         stage = 'tick'
+                        timeline.mark(stage, cycle)
                         # 栅格迟到仅记录；实际命令6ms/原观测4ms为独立硬停止条件。
                         obs = session.observation
                         if obs is None:
                             raise RuntimeError('observation_missing')
                         # 已观察到的危险状态必须先停止，不能因缓存旧而等待恢复。
                         stage = 'cached_state_guard'
+                        timeline.mark(stage, cycle)
                         reason = state_guard(obs, session)
                         if reason:
                             report['failed_state_check'] = guard_snapshot(obs, session)
@@ -573,6 +593,7 @@ def main(a=None):
                             # 尚无推理候选：不用旧缓存，只消耗既有命令预算等新有效帧。
                             # ACTIVE的FAULT/STATE双路有效性/metadata失效仍由每次poll立即锁存。
                             stage = 'wait_fresh_observation'
+                            timeline.mark(stage, cycle)
                             report['stale_observation_waits'] += 1
                             report['max_stale_observation_age_s'] = max(
                                 report['max_stale_observation_age_s'], now-obs.received_at)
@@ -581,12 +602,19 @@ def main(a=None):
                                 if CLOCK() >= budget_at+hard_limit_s:
                                     gate('wait_fresh_command_deadline')
                                 check_trial_end(CLOCK(), end)
-                            time.sleep(min(.0001, remaining) if remaining > 0 else .0001)
+                            sleep_requested = min(.0001, remaining) if remaining > 0 else .0001
+                            timeline.mark('sleep_begin', cycle, sleep_requested)
+                            time.sleep(sleep_requested)
+                            timeline.mark('sleep_return', cycle)
                             continue
                         if obs.received_at == last_sample:
                             report['duplicate_tick_count'] += 1
                             stage = 'wait_fresh'
-                            time.sleep(min(.0002, max(0., min(budget_at+hard_limit_s, obs.received_at+observation_limit_s, end)-CLOCK())))
+                            timeline.mark(stage, cycle)
+                            sleep_requested = min(.0002, max(0., min(budget_at+hard_limit_s, obs.received_at+observation_limit_s, end)-CLOCK()))
+                            timeline.mark('sleep_begin', cycle, sleep_requested)
+                            time.sleep(sleep_requested)
+                            timeline.mark('sleep_return', cycle)
                             continue
                         if last_tick is not None:
                             intervals.append(now-last_tick)
@@ -597,6 +625,7 @@ def main(a=None):
                         if now_ns-candidate_due_ns > period_ns:
                             report['over_period_late_candidates'] += 1
                         stage = 'state_guard'
+                        timeline.mark(stage, cycle)
                         reason = state_guard(obs, session)
                         if reason:
                             report['failed_state_check'] = guard_snapshot(obs, session)
@@ -604,6 +633,7 @@ def main(a=None):
                         last_sample = obs.received_at
                         x, th, vx, w = obs.si()
                         stage = 'inference'
+                        timeline.mark(stage, cycle)
                         begin = CLOCK()
                         check_trial_end(begin, end)
                         if begin >= min(budget_at+hard_limit_s, obs.received_at+observation_limit_s, end):
@@ -616,6 +646,7 @@ def main(a=None):
                         inference_s = None
                         raw = policy.forward((x, ANGLE_SIGN*th, vx, ANGLE_SIGN*w))
                         inference_s = CLOCK()-begin
+                        timeline.mark('inference_return', cycle)
                         report['inference_attempts_s'].append(inference_s)
                         totals=report['run_totals']
                         totals['inference_attempts']+=1
@@ -631,6 +662,7 @@ def main(a=None):
                                 continue
                         # 分片/新字节可在poll末尾到达；仅在固定原始截止内补收。
                         stage = 'precommand_receive'
+                        timeline.mark(stage, cycle)
                         receive_deadline = min(budget_at+hard_limit_s, obs.received_at+observation_limit_s, end)
                         drain = {'deadline_clock_s': receive_deadline, 'polls': 0,
                                  'wait_s': 0., 'started_clock_s': CLOCK()}
@@ -644,9 +676,11 @@ def main(a=None):
                                 gate('precommand_receive_deadline')
                             if transport.in_waiting > 128:
                                 raise RuntimeError('precommand_backlog')
+                            timeline.mark('precommand_poll_begin', cycle)
                             if not receiver.poll() or session.phase != Phase.ACTIVE:
                                 raise RuntimeError(receiver.error or session.failure or 'session_inactive')
                             drain['polls'] += 1
+                            timeline.mark('precommand_poll_done', cycle)
                             if refresh:
                                 refresh.update(session, CLOCK())
                             latest = session.observation
@@ -673,12 +707,16 @@ def main(a=None):
                                 break
                             if pending == 0:
                                 begin = CLOCK()
-                                time.sleep(min(.0001, max(0., receive_deadline-begin)) if begin < receive_deadline else .0001)
+                                sleep_requested = min(.0001, max(0., receive_deadline-begin)) if begin < receive_deadline else .0001
+                                timeline.mark('sleep_begin', cycle, sleep_requested)
+                                time.sleep(sleep_requested)
+                                timeline.mark('sleep_return', cycle)
                                 drain['wait_s'] += CLOCK()-begin
                         if retry_candidate:
                             continue  # 不使用旧raw；外层拿到更新帧后从头推理。
                         action = max(-1., min(1., raw))
                         stage = 'prewrite'
+                        timeline.mark(stage, cycle)
                         if CLOCK() >= receive_deadline:
                             if discard_expired_candidate(obs):
                                 continue
@@ -688,9 +726,11 @@ def main(a=None):
                         report['virtual_command_attempted' if a.diagnostic_timing else 'motion_command_attempted'] = True
                         acceleration = None
                         command_phase = 'model'
+                        timeline.mark('command_call', cycle)
                         velocity = session.command(action)
                         completed_ns = time.perf_counter_ns()
                         completed_at = completed_ns / 1e9
+                        timeline.mark('command_return', cycle)
                         command_gap = completed_at-last_command_at
                         totals=report['run_totals']
                         totals['command_completions']+=1
@@ -723,6 +763,7 @@ def main(a=None):
                         if probe:
                             probe.record_sample(report['samples'][-1])
                         stage = 'write_completion'
+                        timeline.mark(stage, cycle)
                         if completed_at >= receive_deadline:
                             gate('write_completion_deadline')
                         # 成功写入且通过硬截止后才推进；短间隔相位恢复并非固定周期保证。
@@ -735,12 +776,14 @@ def main(a=None):
                         if refresh:
                             # 已成功写入新速度后才安排单条只读查询，不与其他查询叠加。
                             stage = 'readback_query'
+                            timeline.mark(stage, cycle)
                             query_at = CLOCK()
                             if query_at >= budget_at+hard_limit_s:
                                 gate('readback_send_deadline')
                             check_trial_end(query_at, end)
                             refresh.send_if_due(query_at, end)
                             query_done = CLOCK()
+                            timeline.mark('readback_check_return', cycle)
                             if query_done >= budget_at+hard_limit_s:
                                 gate('readback_write_deadline')
                             check_trial_end(query_done, end)
@@ -766,6 +809,8 @@ def main(a=None):
                         'precommand_receive': drain,
                         'readback_in_flight': dict(refresh.pending) if refresh and refresh.pending else None}
                 finally:
+                    timeline.mark('control_loop_exit', cycle)
+                    timeline.freeze()
                     report['active_elapsed_s']=CLOCK()-start if start is not None else None
                     if not a.diagnostic_timing and session is not None and (session.phase in (Phase.ACTIVE, Phase.STOPPING)
                                                 or session.mode == ('READY', 'NONE')):
@@ -815,6 +860,7 @@ def main(a=None):
             report['last_observed_firmware_mode'] = session.mode if session else None
             report['stop_unconfirmed'] = bool((report['motion_command_attempted']
                 or report.get('safe_stop_requested')) and not report['disabled_confirmed'])
+            report['gap_timeline'] = timeline.snapshot()
             report['first_invalid_state'] = session.first_invalid_state if session else None
             report['session_failure'] = session.failure if session else None
             report['receive_error'] = receiver.error if receiver else None
