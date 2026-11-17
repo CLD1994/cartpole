@@ -363,7 +363,7 @@ def main(a=None):
         policy.forward((0., 0., 0., 0.))
     # 外部权重初始化前后均核验；在运行期间不可改动导出文件。
     verified_files = verify_model_files(model, manifest)
-    report = {'loop_interval_scope': 'new-observation decision ticks, not serial command completion', 'runner_revision': 18, 'timing_profile': a.timing_profile, 'control_hz': limits.control_hz, 'grid_period_ns': period_ns, 'action_dim': 1, 'host_angle_gate': not a.diagnostic_timing, 'host_angle_gate_mode': 'disabled_diagnostic' if a.diagnostic_timing else 'pause_resume', 'diagnostic_timing': a.diagnostic_timing, 'discarded_stale_candidates': 0, 'candidate_refresh_stages': {}, 'stale_observation_waits': 0, 'max_stale_observation_age_s': 0., 'grid_slots_skipped': 0, 'over_period_late_candidates': 0, 'readback_refresh': [], 'scheduler': 'absolute-grid-wait-fresh', 'duplicate_tick_count': 0, 'verified_model_files': verified_files, 'status': 'starting', 'scope': '限时真机联调；不是硬实时或真机验收',
+    report = {'loop_interval_scope': 'new-observation decision ticks, not serial command completion', 'runner_revision': 19, 'timing_profile': a.timing_profile, 'control_hz': limits.control_hz, 'grid_period_ns': period_ns, 'action_dim': 1, 'host_angle_gate': not a.diagnostic_timing, 'host_angle_gate_mode': 'disabled_diagnostic' if a.diagnostic_timing else 'pause_resume', 'diagnostic_timing': a.diagnostic_timing, 'discarded_stale_candidates': 0, 'candidate_refresh_stages': {}, 'stale_observation_waits': 0, 'max_stale_observation_age_s': 0., 'grid_slots_skipped': 0, 'over_period_late_candidates': 0, 'readback_refresh': [], 'scheduler': 'absolute-grid-wait-fresh', 'duplicate_tick_count': 0, 'verified_model_files': verified_files, 'status': 'starting', 'scope': '限时真机联调；不是硬实时或真机验收',
               'timing_limits_s': {'command_gap_soft': COMMAND_GAP_SOFT_S, 'command_gap_hard': hard_limit_s, 'observation_max_age': observation_limit_s},
               'rig_requirements': {'protocol_baud': PROTOCOL_BAUD, 'config': limits.config,
                                    'coordinates': dict(RIG_COORDINATES), 'angle_sign': ANGLE_SIGN,
@@ -579,8 +579,6 @@ def main(a=None):
                         stage = 'poll'
                         cycle += 1
                         timeline.mark('loop_poll_begin', cycle)
-                        if transport.in_waiting > 128 and (not pause.paused or receiver.active_backlog_seen > 128):
-                            raise RuntimeError('active_backlog')
                         if not receiver.poll() or session.phase != Phase.ACTIVE:
                             raise RuntimeError(receiver.error or session.failure or 'session_inactive')
                         now_ns = time.perf_counter_ns()
@@ -624,6 +622,11 @@ def main(a=None):
                         now = now_ns / 1e9
                         if now-budget_at >= hard_limit_s:
                             gate('command_gap_deadline')
+                        if not receiver.backlog_ready(session.observation):
+                            stage = 'backlog_recovery'
+                            timeline.mark(stage, cycle)
+                            time.sleep(min(.0001, max(0., min(budget_at+hard_limit_s, end)-CLOCK())))
+                            continue
                         if now_ns < next_tick_ns:
                             stage = 'wait_tick'
                             timeline.mark(stage, cycle)
@@ -754,8 +757,9 @@ def main(a=None):
                                     retry_candidate = True
                                     break
                                 gate('precommand_receive_deadline')
-                            if transport.in_waiting > 128:
-                                raise RuntimeError('precommand_backlog')
+                            if not receiver.backlog_ready(obs):
+                                retry_candidate = True
+                                break
                             timeline.mark('precommand_poll_begin', cycle)
                             if not receiver.poll() or session.phase != Phase.ACTIVE:
                                 raise RuntimeError(receiver.error or session.failure or 'session_inactive')
@@ -780,8 +784,9 @@ def main(a=None):
                                     retry_candidate = True
                                     break
                                 gate('precommand_receive_deadline')
-                            if pending > 128:
-                                raise RuntimeError('precommand_backlog')
+                            if not receiver.backlog_ready(obs):
+                                retry_candidate = True
+                                break
                             drain['readback_in_flight'] = bool(refresh and refresh.pending)
                             if discard_write_budget(obs, receive_deadline):
                                 retry_candidate = True
@@ -806,6 +811,8 @@ def main(a=None):
                             gate('prewrite_fixed_deadline')
                             if a.diagnostic_timing and CLOCK() >= obs.received_at+observation_limit_s:
                                 continue
+                        if not receiver.backlog_ready(obs):
+                            continue  # Discard action; drain and reinfer within the unchanged budget.
                         acceleration = None
                         command_phase = 'model'
                         timeline.mark('prewrite_budget_check', cycle)
@@ -970,6 +977,9 @@ def main(a=None):
         print(json.dumps({k:v for k,v in report.items() if k not in ('samples', 'received_states', 'inference_attempts_s')}, ensure_ascii=False, indent=2))
     else:
         print(result_summary(report, a.output))
+        backlog = (report.get('threaded_receiver') or {}).get('backlog_recovery', {})
+        if backlog.get('warnings'):
+            print(f"接收积压警告 {backlog['warnings']} 次，已恢复 {backlog['recoveries']} 次；恢复前未发送旧动作。详情见报告。")
     return 0 if report['status'] in ('complete','stopped_by_user') else 1
 
 

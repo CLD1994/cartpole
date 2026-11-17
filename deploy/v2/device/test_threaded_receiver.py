@@ -66,7 +66,8 @@ class ThreadedTests(unittest.TestCase):
             def read(self,count):data=self.data;self.data=b'';return data
         r=ThreadedReceiver(Source(),Mock(),lambda:10.);r.active=True
         r.raw.poll();r.poll()
-        self.assertEqual(r.source_pending,0);self.assertGreater(r.in_waiting,128)
+        self.assertEqual(r.source_pending,0);self.assertEqual(r.in_waiting,0)
+        self.assertGreater(r.active_backlog_seen,128);self.assertTrue(r.backlog_pending)
     def test_inflight_poll_prevents_clean_receive_view(self):
         r=ThreadedReceiver(Mock(),Mock(),lambda:10.);r._polling=True
         self.assertTrue(r.partial)

@@ -12,6 +12,9 @@ class ThreadedReceiver:
         self.capacity=capacity;self.queue=deque();self.lock=threading.Lock()
         self.pending_bytes=0;self._partial=False;self._busy=False;self._polling=False
         self.source_pending=0;self.active=False;self.active_backlog_seen=0
+        self.backlog_pending=False;self.backlog_boundary_at=None
+        self.backlog_warnings=0;self.backlog_recoveries=0;self.backlog_waits=0
+        self.backlog_events=deque(maxlen=64)
         self.pause_requested=False;self.pause_ack=False;self.policy_at=-float('inf');self.resume_pending=False
         self._poll_active=False;self.policy_switches=0;self.resume_wait_counts={}
         self.strict_limits=ReceiveLimits();self.paused_limits=ReceiveLimits(max_read_s=.1,max_poll_s=.1,partial_timeout_s=.1)
@@ -30,6 +33,7 @@ class ThreadedReceiver:
                 owner.source_pending=count
                 if (owner._poll_active if owner._polling else owner.active) and isinstance(count,int) and count>128:
                     owner.active_backlog_seen=max(owner.active_backlog_seen,count)
+                    with owner.lock:owner._note_backlog(count, 'serial')
                 return count
             def read(self,count):return source.read(count)
         self.raw=Receiver(ObservedSource(),Sink(),clock)
@@ -37,7 +41,39 @@ class ThreadedReceiver:
     def partial(self):return self._partial or self._busy or self._polling
     @property
     def in_waiting(self):
-        return max(self.pending_bytes,self.source_pending,self.active_backlog_seen)
+        return max(self.pending_bytes,self.source_pending)
+    def _note_backlog(self, count, source):
+        # Caller holds the queue lock. Keep peaks as evidence, never as live bytes.
+        if not self.backlog_pending:
+            self.backlog_warnings+=1
+            self.backlog_events.append({'warning':self.backlog_warnings,'source':source,
+                'bytes':count,'detected_at':self.clock(),'drained_at':None,'recovered_at':None})
+        self.backlog_pending=True
+        self.backlog_boundary_at=None
+    def backlog_ready(self, observation):
+        """Drain, then require a later host receipt; never retimestamp queued samples.
+
+        This is only a host queue boundary, not proof of device sampling age.
+        The caller retains its original command deadline while waiting.
+        """
+        if not self.lock.acquire(blocking=False):return False
+        try:
+            if self.error:return False
+            if self.backlog_pending:
+                self.backlog_waits+=1
+                if self.partial or self.in_waiting:return False
+                if self.backlog_boundary_at is None:
+                    self.backlog_boundary_at=self.clock()
+                    self.backlog_events[-1]['drained_at']=self.backlog_boundary_at
+                    return False
+                if observation is None or observation.received_at <= self.backlog_boundary_at:
+                    return False
+                self.backlog_pending=False;self.backlog_recoveries+=1
+                self.backlog_events[-1]['recovered_at']=self.clock()
+            # An inference made before the drain stays unusable even after recovery.
+            return (self.backlog_boundary_at is None or
+                    (observation is not None and observation.received_at > self.backlog_boundary_at))
+        finally:self.lock.release()
     def request_pause(self):
         self.pause_requested=True;self.resume_pending=False;self.active=False
     def _select_policy(self):
@@ -54,6 +90,7 @@ class ThreadedReceiver:
     def resume_ready(self, observation):
         # Host queue drain and receipt boundary only, not device sampling proof.
         if self.error:return self._resume_wait('reader_error')
+        if not self.backlog_ready(observation):return self._resume_wait('backlog_recovery')
         if observation is None:return self._resume_wait('missing_observation')
         if self.partial or self.in_waiting:return self._resume_wait('receive_not_drained')
         if observation.received_at <= self.policy_at:
@@ -69,6 +106,8 @@ class ThreadedReceiver:
                 self.error=self.error or 'receive_queue_overflow'
                 return
             self.queue.append((line,received_at));self.pending_bytes+=len(line)+1;self.queued_count+=1
+            if self.pending_bytes>128 and (self._poll_active if self._polling else self.active):
+                self._note_backlog(self.pending_bytes, 'frame_queue')
     def start(self):
         if self.worker is not None:raise RuntimeError('reader_already_started')
         self.worker=threading.Thread(target=self._run,name='control-serial-reader',daemon=True)
@@ -79,15 +118,16 @@ class ThreadedReceiver:
                 self.priority_report=priority_report
                 while not self.stop_event.is_set():
                     begin=self.clock()
-                    self._polling=True
+                    with self.lock:self._polling=True
                     self._select_policy()
                     try:
                         ok = (self.raw.poll(previous_poll_limit_s=self._previous_poll_limit_s)
                               if self._previous_poll_limit_s is not None else self.raw.poll())
                         if not ok:self.error=self.error or self.raw.error or 'reader_failed'
                     finally:
-                        self._partial=bool(self.raw._pending)
-                        self._polling=False
+                        with self.lock:
+                            self._partial=bool(self.raw._pending)
+                            self._polling=False
                     self.poll_count+=1;self.maximum_poll_s=max(self.maximum_poll_s,self.clock()-begin)
                     time.sleep(.0001)
         except BaseException as exc:
@@ -120,6 +160,10 @@ class ThreadedReceiver:
                 'pending_bytes':self.pending_bytes,'last_source_pending_bytes':self.source_pending,
                 'active_source_backlog_peak_bytes':self.active_backlog_seen,'error':self.error,'poll_count':self.poll_count,
                 'maximum_reader_poll_s':self.maximum_poll_s,
+                'backlog_recovery':{'warnings':self.backlog_warnings,'recoveries':self.backlog_recoveries,
+                    'pending':self.backlog_pending,'wait_checks':self.backlog_waits,
+                    'events':list(self.backlog_events),'retained_events':64,
+                    'scope':'host drain then later receipt; not device sampling freshness'},
                 'pause_policy':{'requested':self.pause_requested,'acknowledged':self.pause_ack,'policy_at':self.policy_at if self.policy_at != -float('inf') else None,'resume_pending':self.resume_pending,'switches':self.policy_switches,'resume_wait_counts':dict(self.resume_wait_counts)},'thread_priority':self.priority_report,
                 'scope':'receipt timestamps are host reader parse times, not device sampling; no latest-frame overwrite'}
 

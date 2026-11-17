@@ -42,7 +42,7 @@ class Port:
         return len(data)
 
 class RunnerCombinationTests(unittest.TestCase):
-    def run_loop(self, angle, duration, policy_hook=None, diagnostic=False, fault_at=None, retry_slow=False, hard_limit=.009, no_new_state=False):
+    def run_loop(self, angle, duration, policy_hook=None, diagnostic=False, fault_at=None, retry_slow=False, hard_limit=.009, no_new_state=False, backlog_ready=None):
         clock=Clock();port=Port(clock,lambda:angle(clock.now-10))
         port.no_new_state=no_new_state
         original_read=port.read
@@ -60,6 +60,7 @@ class RunnerCombinationTests(unittest.TestCase):
         receiver.request_pause=lambda:None
         receiver.resume_ready=lambda obs:True
         receiver.active_backlog_seen=0
+        receiver.backlog_ready=backlog_ready or (lambda obs:True)
         report={'angle_pause':{'events':[],'pause_count':0,'resume_count':0,'intentional_completion_gaps':0},
             'readback_refresh':[],'run_totals':dict.fromkeys(('command_completions','command_gaps_over_4ms',
             'command_gaps_at_or_over_6ms','command_gaps_at_or_over_hard_limit','maximum_command_gap_s','maximum_active_command_gap_s',

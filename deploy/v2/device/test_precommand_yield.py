@@ -20,7 +20,7 @@ class PrecommandYieldTests(unittest.TestCase):
         def gate(reason): raise RuntimeError(reason)
         context=dict(discard_write_budget=lambda *a:False, write_budget=NS(cutoff=lambda d:d), CLOCK=lambda:clock[0],end=1.,receive_deadline=deadline,
             check_trial_end=lambda *a:None,discard_expired_candidate=lambda o:False,
-            obs=object(),gate=gate,transport=transport,receiver=NS(poll=poll,error='fault' if fault else None),
+            obs=object(),gate=gate,transport=transport,receiver=NS(backlog_ready=lambda obs:True,poll=poll,error='fault' if fault else None),
             session=session,Phase=NS(ACTIVE='active'),timeline=NS(mark=lambda *a:None),cycle=1,
             drain={'polls':0,'wait_s':0.,'started_clock_s':0.},refresh=None,
             state_guard=lambda *a:False,report={},update_pause=lambda *a:None,time=NS(sleep=sleep))
