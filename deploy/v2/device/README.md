@@ -1,311 +1,136 @@
-# 当前设备的主机会话接口
+# 设备会话与单动作闭环运行器
 
-本目录提供 Python/C 设备会话状态机、有界接收器、Python 只读检查与单动作 ONNX 运行器。会话层本身只处理协议、有效性、启动条件和禁用回执；`run_policy.py` 在其上实现模型推理与 400/500 Hz 调度。它们不自动使能、不回零、不回中，也不会替操作者确认左端位置。旧 `../pc_runner.py` 与 `../edge/main.c` 是独立的 200 Hz 参考入口，不能直接运行新的 400/500 Hz 模型。
+本目录提供 Python/C 设备会话接口，以及 Python 单动作 ONNX 真机运行器。当前运行器版本为 21；它不自动 ENABLE、不归零、不改标定或固件配置。双动作参考入口 `../pc_runner.py` 与 `../edge/main.c` 不适用于此处的单动作模型。
 
-## 读取设备状态
+## 准备模型与启动
 
-在仓库根目录运行：
-
-```powershell
-python deploy/v2/device/check.py --port COM11 --model "$model" --seconds 2
-```
-
-需要 `pyserial`。程序仅发送 `QUERY`、`CALIB?`、`CONFIG?`，不发送 `CONFIG`、`ENABLE`、`CONFIRM LEFT` 或 `VEL`。`preflight_reason=null` 只说明本次接收值满足会话入口条件，不证明设备安全、模型匹配或采样到动作的真实延迟。程序不以退出码代替此字段。串口必须独占；不要同时运行旧控制器或固件维护工具。
-
-设备目标速度、加速度与控制频率来自导出目录的 `model.json`，不是当前设备读数或历史设备档案。台位的波特率、看门狗、软余量与坐标方向由 `experiment_setup.py` 集中定义；现场设备必须满足这些要求。运行器读取当前标定长度和摆角零位作为会话快照，运行中不得改变。不再手工维护模型 contract 与会话 profile 两份 JSON。
-
-默认终端只显示关键结果与报告位置；需要机器读取完整结果时使用 `--json`。报告保留诊断细节，不将长 JSON 自动刷满终端。
-
-## 会话合同
-
-Python 使用 `Session(transport, clock, limits)`。串口协作者只实现完整写入或错误；时钟使用单调秒数。C 使用显式时间和发送回调，详见 `edge/session.h`。调用方必须保证写入有界、独占串口，并周期调用超时检查及 `refresh` 查询；状态机不能中断卡死的外部 I/O。
-
-| 阶段 | 条件与行为 |
-| --- | --- |
-| 观察 | 清空旧预检缓存，只发查询。允许编码器预热后恢复，不发送运动。 |
-| 启动 | 调用方显式请求。最近1秒内收到READY/NONE、有效标定、配置读回；最近100ms内收到两路有效且采样推进的统一STATE。启动本身不ENABLE也不发VEL。 |
-| 活动 | 每次动作前检查数据及1秒内的模式/参数读回；调用方每0.5秒显式刷新查询，过期锁存停止；有限动作[-1,1]乘目标速度得到mm/s。通用会话默认在越过标定长度与软余量派生的边界时封锁向外目标；ONNX 运行器显式关闭这层主机位置门，由固件处理位置保护。 |
-| 停止 | 停发非零目标，发送VEL0；后续新鲜零速STATE只允许请求DISABLE。只有请求之后的MODE DISABLED NONE才确认禁用。ERR BUSY可重试，但1秒截止不延长。 |
-| 结束 | 不允许自动重启。数据恢复不能解除本次失败锁存；必须另建会话并重新查询。 |
-
-创建会话时，Python 的固件配置字段只接受整数，不接受布尔值、字符串或小数；C 使用整数类型。两端均按当前固件协议校验：速度1–2000mm/s、加减速度100–30000mm/s²、看门狗10–1000ms、软余量1000–50000µm。频率和超时时间必须是有限正数。协议允许范围不是机械能力保证，预检仍要求设备读回匹配，并检查实际行程可容纳余量。
-
-完整启动读回包括 `CAL_STATE=2`、`CAL_SAVED=1`、`CAL_STORAGE=0`、100–1000mm范围内的 `CAL_LENGTH_UM`，以及与注入参数匹配的 `VEL_MAX`、`ACC_MAX`、`WDT_MS`、`X_MARGIN_UM`。默认看门狗等待100ms，正常、看门狗与受控故障停车共用 `ACC_MAX`。检查器不替用户修改不匹配的配置。已知查询字段的回执缺值或格式错误时，对应旧读回立即失效，必须重新收到合法值。
-
-`CAL_STATE=3` 表示保存记录存在但本次左参考未确认。操作者应在固件工具中完成实物定位与 `confirm-left`，核对后另行 `enable`。会话接口不能根据当前位置数字证明小车在真实左端。
-
-有效性变为0、STATE或有效性超时、活动期间的固件故障/模式变化、关键回执变化、坏格式状态行和无效动作都会阻止继续发非零目标，并清除缓存。停止过程中继续接收恢复数据仅用于有界停车/禁用确认，不恢复运动。发送失败终止会话；失去通信时无法凭软件确认停车。停车阶段收到测量无效、固件故障或非 `ERR BUSY` 错误时，仍保留首次失败；即使之后确认禁用，也只表示禁用完成，不表示控制会话成功。上层必须检查禁用确认与失败原因，不得用“函数返回了”代替结果。
-
-`Observation.si()`只做单位转换，保留固件坐标符号。模型适配方必须核实导出模型的观测顺序、符号、归一化、动作含义和设备档案，不能未经核实继承旧入口的摆角翻转。训练模型没有在本工作区运行过，不能把会话单测通过当成策略闭环完成。
-
-## 验证与边界
-
-```bash
-python -m unittest discover -s deploy/v2/device -p 'test_*.py'
-make -C deploy/v2/device/edge test
-```
-
-这些单元测试注入发送与时间，通过公开接口验证状态转换，不连接设备。维护者还需在合并后的固件上验证协议组合、目标机串口读写时限、模型推理与控制循环，以及停止/禁用结果。没有在本次工作中运行硬件集成测试。
-
-正式状态行仅包含测量值与两路有效位。主机接收时刻不等于采样时刻，串口积压不能靠接收超时证明已消除。停机读数也不证明机械静止、无打滑或电机实际电流。软边界是最后一层命令限制，不提前规划制动距离。外部推理或接收适配器发现异常时调用公开的 `abort` 接口，锁存停止；不要伪造协议行触发内部处理。本接口不授予高速度试验或无人在场运行的条件。
-
-只读检查器退出码为0表示本次检查结束时预检满足、没有接收错误且没有会话失败；否则退出码为1。JSON中的 `preflight_reason`、`receive_error` 与 `session_failure` 分别说明三个层次的结果。退出码0不表示已启动策略、设备已使能或物理运动已经验证。
-
-## 有界接收适配
-
-Python 的 `Receiver(source, session, clock, limits)` 和 C 的 `edge/receiver.h` 负责把字节流拆成完整协议行。Python 只读检查器已经使用此接口。C 集成方提供查询待读字节数、读取字节和时钟回调；本目录不提供 C 操作系统串口驱动。接收器与会话必须共享同一单调时间轴，串口必须独占，读回调必须非阻塞，写回调也必须有界。接收器只能在回调返回后发现超时，不能中断卡死的驱动。
-
-Python 和 C 均要求 `1 ≤ max_line ≤ max_pending ≤ 1048576`，时间阈值为有限正数。Python 的字节计数只接受整数，所有参数拒绝布尔值，时间阈值也不接受字符串。非法配置在创建接收器时拒绝，不执行 I/O。
-
-默认 Python 阈值如下，C 调用方通过 `device_receive_limits` 显式传入同类阈值：
-
-| 项目 | 阈值 | 超过时的行为 |
-| --- | --- | --- |
-| 待读队列 | 1024字节 | 不把积压数据交给会话，锁存接收故障。 |
-| 单行 | 256字节，不含换行符，包含可选的回车符 | 丢弃本批，锁存接收故障。 |
-| 两次轮询起点间隔 | 20ms | 在读取前锁存故障。 |
-| 一次队列查询和读取 | 10ms | 返回后丢弃本批，锁存故障。 |
-| 未完成行的等待时间 | 20ms | 读前和读后均检查，跨过期限也丢弃本批。 |
-
-每次 `poll` 先检查会话期限，至多进行一次读取，读后再次检查会话期限和队列大小。只有整批字节均为允许的ASCII字符、所有行长度有效，才向会话交付完整行；剩余分片等待下一次轮询。错误不会通过后续正常数据清除。接收器调用公开 `abort` 接口，活动会话进入停止流程，观察会话直接结束。
-
-`poll` 的真假值仅表示这批接收是否符合接收契约，不代表会话健康或停车完成。停止阶段应继续轮询到会话结束，并分别检查会话失败原因与禁用确认。一次失败后，接收器先丢弃到下一换行边界，再恢复完整行交付，避免截断数据冒充回执。持续积压或I/O错误可能一直阻止回执交付，最终只能得到未确认停机；接收器不会无限排空队列或自动恢复控制。Python 会话抛出的致命异常（例如单调时钟无效）向调用方传播，不能仅凭 `Receiver.error` 判断这类终止。
-
-这些阈值用于发现主机停顿、积压、损坏和迟到分片，不证明设备采样新鲜。低于阈值的旧缓存仍可能到达；协议不含设备时间或样本身份，不能据此承诺端到端采样延迟。非阻塞串口、轮询阈值在Windows及目标板上的适用性、C驱动绑定、会话与接收器的真实组合，以及持续控制负载下的停止确认，仍需现场验证。接收器单元测试使用公开接口约束的会话和I/O替身，不包含硬件；另有真实接收器与会话组合的集成测试。
-
-### 动作整数化
-
-会话接收有限的归一化动作 `[-1, 1]`，乘以注入的速度上限后转换成整数 mm/s。Python 与 C 均取最近整数，恰好半单位时远离零，例如 `0.5 → 1`、`-0.5 → -1`。范围外或非有限动作仍触发失效停车，不在会话内部静默钳位；模型输出钳位属于上层策略适配的职责。
-
-## 单动作 ONNX 联调运行器
-
-`run_policy.py` 仅支持四维观测 `[x, theta, xdot, thetadot]` 与一个归一化目标速度动作。训练频率与加速度由模型清单取得。固件 STATE 可以为 500 Hz，400 Hz 模型按 2.5 ms 绝对栅格选择新观测，不是每收一帧就推理；跳过错过的栅格，不补发突发命令。这不是硬实时承诺。
-
-### 一次准备模型
-
-使用训练时同一任务导出 ONNX 后，在仓库根目录运行：
+在仓库根目录运行。先用与训练任务一致的导出流程取得 ONNX，再生成模型清单：
 
 ```powershell
-# 两个路径必须属于同一个已核实的模型。
 & $python scripts/rsl_rl/prepare_model.py --onnx $onnx --checkpoint $checkpoint
-```
-
-准备工具从训练运行目录的 `params/env.yaml` 提取并核验动作、观测和训练时序，计算主文件与全部外部权重散列，在导出目录生成 `model.json`。缺失或不支持的配置明确报错，不依据文件名猜测 400 Hz 或 Acc9。清单记录训练配置、检查点和导出文件的来源；同时指定两个文件是操作者的同源声明，文件散列本身不能证明任意 ONNX 确由指定检查点导出。旧模型也使用这个准备入口，无需重写旧 contract/profile。
-
-### 开始实验
-
-```powershell
 $model = Split-Path $onnx
-& $python deploy/v2/device/run_policy.py --port COM11 --model $model `
-  --continuous --start-confirmed
 ```
 
-`--model` 指向同时包含 `policy.onnx`、外部权重和 `model.json` 的目录。短时控制改用 `--seconds 5`。默认自动生成唯一报告；可用 `--output` 指定新文件，但已有文件拒绝覆盖。报告保存模型清单与实际设备标定快照，不需要每次复制 JSON 或修改行程值。
+导出目录必须包含 `policy.onnx`、所需外部权重与 `model.json`。准备工具读取训练目录 `params/env.yaml`，记录训练配置及文件散列；缺失或不支持的配置明确报错，不根据文件名猜参数。无需手工维护 contract/profile 两套 JSON。
 
-运行器不自动 ENABLE、不标定、不设置固件参数。现场先完成必要的左参考并准备 READY。预检会核对速度、加速度、看门狗和方向；不匹配时明确失败，不用设备当前值反过来改写训练要求。合法的标定长度和零位在首条动作前锁定，之后发生变化则停止。启动检查失败也会在已知 READY 时尝试零速、停稳、DISABLE。
-
-持续运行要求现场监控，Ctrl+C 请求停车。摘要和报告中的 `disabled_confirmed` 才代表已收到 DISABLED 确认，单独的退出码不能证明停车。
-位置保护由固件负责，运行器不施加额外位置门或摆角门。有效测量、坐标/标定一致性、固件状态、读回有效期和命令时限仍独立检查。持续运行逐条刷新 CONFIG? 键值，只有真实新回执延长有效期。
-
-### 时序配置与只读诊断
-
-- 默认 `--timing-profile normal`：命令完成间隔硬限 6 ms、观测年龄 4 ms、决策计算预算 2 ms。
-- `--timing-profile debug`：显式实验选项，命令 15 ms、观测 12 ms，不额外施加 2 ms 决策预算；其他故障检查仍有效。报告记录选择，事件记录不会暗中放宽时序。
-- `--diagnostic-timing --seconds 5`：要求 DISABLED 的只读同路径测量，不加 `--start-confirmed`。VEL/DISABLE 仅虚拟完成，不能据此证明运动时序合格。
-- `shadow.py`：只读推理；`diagnose_timing.py`：只读节拍分析。两者均不代替真机验证。
-
-### 固件主线事件诊断配套
-
-`--step-loss-monitor` 选择可选的事件记录。启动发 `RUN?` 并解析正式 `OK RUN <run_id>`，仅接纳同运行编号的新 `EVENT STEP_LOSS <event_id> <run_id> <device_us>`，保存首个事件前最多 400、之后最多 2000 个控制决策样本。通知可能丢失；没有事件不代表没有故障。
-
-事件本身不切换低速、不修改模型动作、不放宽时序。**是否继续控制由固件模式决定**：固件 observe-only 保持 READY 时继续；正常保护模式进入 FAULT 时仍立即结束控制并执行既有停车处理。EVENTS 开关不等于 OBSERVE_ONLY，后者必须由现场另行明确配置。事件时间为设备时钟，收到时间为主机时钟，不能直接相减。
-
-轨迹导出直接使用 `CLD1994/device-nerve-esp32` 已合并 PR #17 的主线配套版本的 `tools/step_trace_capture.py`，在控制结束且设备静止后读取 SLT4；不要同时争用串口，不沿用 SLT3 的 PCNT/EN/SPI 字段解释。SLT4 为软件 STEP 位置与缓存编码器的非同步观测，不证明物理脉冲、物理失步或实际移动。
+只读核对（需要 `pyserial`）：
 
 ```powershell
-$trace = Join-Path $exportRoot ('step-trace-' + [guid]::NewGuid().ToString('N') + '.json')
-& $python (Join-Path $firmwareTree 'tools\step_trace_capture.py') --port COM11 --baud 460800 --out $trace
+& $python deploy/v2/device/check.py --port COM11 --model $model --seconds 2
 ```
 
-本整理只验证纯 Python 协议/调度边界与模拟传输；目标 Windows 调度、USB 串口、实际 ONNX 模型和固件配套需现场验证。双动作 VELA 与自动低速切换实验不在此运行器范围内。
+只发送查询，不发送运动或配置写入。`preflight_reason=null` 表示本次接收值满足接口条件，不是闭环性能验证。默认终端显示摘要，`--json` 输出机器可读摘要。
 
-## 统一状态帧
+现场完成标定、确认参考并使能到 READY 后，当前短延迟容错实验命令为：
 
-固件以500Hz发送一条原子状态帧，格式为：
+```powershell
+& $python deploy/v2/device/run_policy.py --port COM11 --model $model `
+  --continuous --start-confirmed --command-gap-hard-ms 25 `
+  --retry-slow-inference --thread-priority above-normal --gap-timeline
+```
+
+**25 ms 是显式实验选项，不是默认值或实时保证。** `--seconds 5` 可替换持续运行；Ctrl+C 请求结束。默认报告写入模型目录的 `runs`，也可用 `--output` 指定不存在的新文件。运行期间不得替换模型文件或让其他程序占用同一串口。
+
+`--diagnostic-timing --seconds 5` 为 DISABLED 下的同路径只读诊断，不需要 `--start-confirmed`，不会真实发送 VEL/DISABLE，不作为运动或停机验证。
+
+## 模型与设备参数
+
+模型观察顺序为 `[x, theta, xdot, thetadot]`，动作是一个归一化目标速度。频率、动作倍率和训练加速度来自 `model.json`；台位波特率、看门狗、边距和方向约定在 `experiment_setup.py`。运行器读取当前标定长度与摆角零位作为会话快照，运行中变化会停止。
+
+默认要求固件速度、加速度与模型匹配。Python 运行器可显式指定：
+
+- `--velocity-limit-mm-s 900`：保留训练动作倍率，计算目标速度后饱和至部署上限，不重新缩放整个动作区间。上限不得超过模型倍率。
+- `--acceleration-limit-mm-s2 10000`：选择部署加速度，仍记录原训练值；不修改模型或固件。
+
+预检及运行中读回必须与选定参数精确匹配。部署限幅不证明模型在该配置下训练过或已经稳定。其他检查脚本和 C 接口不自动继承这些覆盖选项。
+
+标定须为 `CAL_STATE=2`、`CAL_SAVED=1`、`CAL_STORAGE=0`，且长度在支持范围内。`CAL_STATE=3` 表示保存记录存在但本次参考未确认，应通过固件工具在实物位置执行 `confirm-left`，不能用坐标数字代替实际定位。
+
+## 状态协议与有效性
 
 ```text
 STATE flags x_um theta_urad vx_mm_s vth_mrad_s
 ```
 
-正式线格式为 `STATE flags x_um theta_urad vx_mm_s vth_mrad_s\n`。六个token使用单空格分隔，整数采用规范十进制（不收加号、负零或前导零）。flags取0..3，bit0小车有效、bit1摆杆有效；四个值为int32，摆角范围±3141592µrad。无效路对应两值必须为0，解码为None而非真实零。模型要求两路同时有效。
+六个 token 使用单空格、规范十进制整数。`flags` 为 0..3：bit0 小车有效，bit1 摆杆有效。四个量为 int32，摆角范围 ±3141592 µrad；无效路的两个值必须为 0，消费者解释为无效而不是真实零。旧四值 STATE、独立 VEL_VALID 与旧紧凑时间帧不兼容。
 
-有效位由固件在组帧时依据传感器状态判断。帧不携带boot/tick/age/seq，主机不检测样本重复、采样时间倒退或设备身份。重复测量可能是静止，正常刷新主机接收时刻；主机接收年龄不等于采样年龄。MODE/ERR、通信超时、命令超时、坏帧与接收积压门禁仍保留，停止后不自动ENABLE或恢复会话。设备重启后应显式新建会话；仅靠该帧不能保证识别所有重启。
+固件通常以 500 Hz 上报。每行含 LF 为 16..53 字节，500 Hz 最坏约 26500 B/s；460800 波特、8N1 下占约 57.5% 线速。这是吞吐预算，不保证延迟。
 
-持续到达的旧有效帧可能绕过接收间隔超时。默认max_pending=1024只是字节积压上限，并非4ms端到端采样新鲜度证明。控制报告的host_observation_age_s明确仅计主机收到完整帧以来的时间。
+帧不包含启动标识、采样时间、年龄或序号。重复数值可能是静止，不能据此判旧样本。所有主机接收年龄和排空边界仅描述主机观测，不证明设备采样新鲜度，也不能可靠识别所有设备重启。
 
-实际线长含LF为16..53字节；500Hz最坏26500B/s、8N1约265000bit/s，约占460800波特57.5%。这是格式与吞吐预算，不代表串口时延或调度保障。旧四值STATE、独立VEL_VALID及此前紧凑时间帧均不兼容。
+短暂摆杆读帧失败由配套固件在完整成功窗口、健康状态与设备侧限龄内保留有效估计。主机收到双路有效 STATE 后正常推理，即使数值重复也不断发 VEL。主机不自行把无效占位零或缓存旧值伪装成有效数据。
 
-Python单元和组合测试分开运行：
+正式闭环遇到小车有效、摆杆无效的 `STATE 1` 时等待恢复，不立即以 `measurement_invalid` 退出；期间停发 VEL、继续收帧和刷新元数据。新鲜双路有效帧通过接收策略切换及排空确认后重新推理。固件 FAULT、小车无效、坏帧或约 100 ms 无 STATE 仍结束会话。等待超过固件 WDT 时会触发其减速策略，主机不自动 ENABLE。只读诊断和通用 Session 不启用此特定摆杆恢复策略。
 
-```sh
-python -m unittest discover -s deploy/v2/device -p 'test_*.py'
-python -m unittest discover -s deploy/v2/device/integration_tests
-make -C deploy/v2/device/edge test
-```
+## 调度、时限与短延迟恢复
 
-### 保留训练动作倍率的部署限幅
+400 Hz 模型使用 2.5 ms 绝对时间栅格选择新接收观测；错过栅格跳过，不补发突发命令。推理使用 CPU 单线程，不能消除操作系统调度、驱动或其他负载造成的暂停。
 
-Python `run_policy.py` 支持显式 `--velocity-limit-mm-s 900`。模型清单与 ONNX 不变：先按训练动作倍率计算并取整目标速度，再将其饱和至部署上限。例如训练倍率 1250 mm/s 时，动作 0.5 输出 625 mm/s，动作 1 输出 900 mm/s。这不是将所有动作重新缩放至 900，也不代表模型曾在该限幅下训练或已经验证稳定。
+| 配置 | 命令间隔硬限 | 候选观测年龄 | 推理判据 |
+| --- | --- | --- | --- |
+| 默认 normal | 6 ms | 4 ms | 决策阶段超过 2 ms 判慢 |
+| debug | 15 ms | 12 ms | 不施加 normal 的 2 ms 预算 |
+| 当前 normal 实验命令 | 显式 25 ms | 仍为 4 ms | 配合 `--retry-slow-inference` 丢弃慢候选后恢复 |
 
-该参数必须是正整数且不得超过模型倍率；省略时保持模型原契约。预检与运行中读回均要求固件 `VEL_MAX` 精确等于所选部署上限，工具不会自行改固件配置。控制周期、测量有效性、FAULT 和时序门禁保持不变。可另用 `--acceleration-limit-mm-s2 10000` 显式选择部署加速度，允许固件范围 100～30000 mm/s²，预检与运行中读回均必须精确匹配。模型训练加速度仍为原值，例如 9 m/s²；这不是将其改称 10 m/s²。未传该选项时仍要求训练值。报告分别记录训练倍率/加速度、部署上限和分布偏移；增大部署加速度不代表已验证安全或稳定。
+`--command-gap-hard-ms` 只覆盖命令硬限，不改变固件 WDT 或观测期限。命令间隔不是累加或滑窗，是距上一条完整写入返回的时间。写入返回不代表固件已收讫。
 
-仅 Python 入口支持该选项，C 入口及其他检查脚本仍按原模型完整契约运行。先在训练负载已启动且设备为 DISABLED 时做只读同路径诊断：
+当前 Python 运行器使用唯一接收线程。它按原顺序保存完整帧和接收时间；控制线程独占 Session 和写入。无效帧、FAULT、回执不得被最新有效帧覆盖。线程间 FIFO 容量为 64 帧，底层缓冲上限 1024 字节，单行上限 256 字节。
 
-```powershell
-python deploy/v2/device/run_policy.py --port COM11 --model <导出目录> --velocity-limit-mm-s 900 --acceleration-limit-mm-s2 10000 --diagnostic-timing
-```
+活动期短暂慢读、慢推理和超过 128 字节的积压统一进入恢复：
 
-确认模型、固件参数、标定、现场状态和训练并发负载下的时序后，先短程验证，再使用受监控持续控制；端口和模型目录必须替换为实际值：
+1. 记录警告，丢弃旧候选，不重复发送旧动作。
+2. 按原顺序消费，等待队列、半帧和在途读取排空。
+3. 记录排空边界，等待之后收到的有效帧，重新推理。
+4. 恢复等待不延长原活动命令期限；达到选定硬限仍结束。
 
-```powershell
-python deploy/v2/device/run_policy.py --port COM11 --model <导出目录> --velocity-limit-mm-s 900 --acceleration-limit-mm-s2 10000 --seconds 0.5 --start-confirmed
-python deploy/v2/device/run_policy.py --port COM11 --model <导出目录> --velocity-limit-mm-s 900 --acceleration-limit-mm-s2 10000 --continuous --start-confirmed
-```
+线程接收器读窗口超过 10 ms、轮询间隔超过 20 ms 但低于 100 ms 时记录慢窗口并恢复，而非立刻丢字节、失步或退出。100 ms 级持续延迟、坏字节、读契约错误、容量溢出与半帧超时仍是错误。活动期半帧期限为 20 ms。通用 `Receiver` 默认仍严格执行 10/20 ms；C 接口也不自动获得 Python 线程运行器的恢复语义。
 
-控制推理使用 CPU 单线程；GPU 训练仍可能通过 CPU、内存和系统调度竞争影响控制。保持正常时序门禁，不以 debug 放宽期限掩盖竞争。持续控制需要现场监控，不能无人值守；运行期间不得替换模型文件。
+写前保留 **1 ms** 经验预算。候选放不进剩余期限就丢弃，不能借新帧时间戳延长旧动作寿命。写入完成后才发现候选超过观测年龄时，命令无法撤回：记录 `write_budget.completion_age_warnings` 并重新排空、取新帧推理。命令硬期限仍独立生效。经验预算不保证后续写入一定按时完成。
+
+`--thread-priority above-normal` 仅在本次运行提高控制和接收线程的 Windows 优先级，退出恢复；不设置实时优先级、不改变进程优先级，也不保证硬实时。
 
 ## 摆角暂停与恢复
 
-运行器默认在绝对摆角达到 60° 时暂停发送全部 VEL；回到 58° 内后重新推理并恢复。可通过 `--angle-pause-deg` 与 `--angle-resume-deg` 设置滞回范围。这是本次部署的显式阈值，不是从模型清单读取的训练参数。暂停不主动 DISABLE，不自动 ENABLE；只读 `--diagnostic-timing` 不启用暂停。
+默认 `abs(theta) >= 20°` 暂停 VEL；新鲜有效观测回到 `abs(theta) <= 18°` 才重新推理恢复。可用 `--angle-pause-deg`、`--angle-resume-deg` 显式设置。当前 V2 训练在绝对摆角严格大于 20° 时终止；部署在达到 20° 时暂停、回到 18° 内恢复。历史模型及其清单不会因训练默认值更新而自动改变，部署门控也不是从旧模型边界自动推导。
 
-暂停期间继续读取状态、刷新配置和检查 MODE、FAULT、坏帧、接收积压及观测期限。既有活动命令已经超时时，不会用大摆角遮蔽故障。暂停豁免的是故意不发送 VEL 的命令间隔，不是通信失效。恢复使用新的命令预算和新的推理结果；故障仍走原停车流程。
+暂停不主动 DISABLE、不退出流程、不自动 ENABLE。只读诊断不启用摆角暂停。停发后固件在 WDT 到期才按配置减速，并非即时停止。
 
-停发速度后，固件在看门狗期限到达后才以部署加速度减速，并非即时停止。以 900 mm/s、10000 mm/s² 和 100 ms 看门狗估算，理想停发至停止约 190 ms、位移约 130.5 mm，不是实际停车上界。恢复时设备可能尚未静止；现场必须保留净空和独立停止手段。
+暂停期间旧观测仅等待，不能用旧低角度恢复；仍检查通信、元数据、坏帧、小车有效性与 FAULT。接收暂停策略使用 100 ms 读/轮询/半帧期限。恢复需排空并完成活动接收策略交接，使用交接后的新鲜双路有效观测。重新建立栅格及命令预算，不补发历史动作。暂停前已经超期不能借大摆角掩盖。
 
-本次实验可显式使用 `--command-gap-hard-ms 9`。未指定时 normal 仍为 6 ms，debug 仍为 15 ms；此参数只覆盖命令硬期限，不改变观测或推理期限。
+## 停止与故障
 
-报告逐条保留真实 `command_gap_s`，跨暂停的第一条命令标记 `intentional_angle_pause_gap`。全部命令最大间隔包含暂停；`maximum_active_command_gap_s`、超限计数和正常间隔摘要排除已标记的故意暂停间隔。暂停/恢复事件保留最近 512 条，累计次数不截断。
+通用 Session 要求启动时近期 READY/NONE、有效标定、配置及双路测量；显式启动不发送 ENABLE。运行器定期刷新元数据，拒绝不一致的配置或模式变化。
 
+停止流程请求 VEL 0，在可用停稳证据后请求 DISABLE，并等待其后的 `MODE DISABLED NONE`；BUSY 可在有界期限内重试。**只有 `disabled_confirmed=true` 才代表收到禁用确认。** FAULT 保留原故障时可能无法得到 DISABLED，完整写入 VEL 0 或进程退出均不能替代禁用确认。故障退出后不自动恢复控制。
 
-### 主机间隔分段诊断
+位置保护由固件负责；ONNX 运行器不额外实施通用 Session 的位置方向门。归一化动作取整采用半单位远离零。持续运行需要现场监控，软件报告不能证明机械停稳、无打滑或真实加速度。
 
-需要定位偶发命令间隔超时，可追加 `--gap-timeline`。它不改变控制频率、时限或停车策略，只将最近 4096 个阶段边界保留在内存，退出控制后冻结，并在最终报告的 `gap_timeline` 输出。不开启时不读取新增诊断时钟。
+## 可选事件与报告
 
-每条事件包含循环编号、主机单调纳秒时间、当前线程 CPU 纳秒时间及相对上一边界的差值；`sleep_begin` 另记请求休眠秒数。相邻边界用于区分等待、接收、推理、命令调用、报告记账与读回检查。`command_call` 到 `command_return` 包含会话检查和串口写调用，不等于线上发送时间；`loop_poll_begin` 到 `poll_done` 包含积压查询、读取、解析及会话处理。`readback_check_return` 不意味着该轮实际发送查询，需结合原读回记录。
+`--step-loss-monitor` 查询 RUN 身份，只记录匹配运行的 STEP_LOSS 及有界前后轨迹，不切换低速、不因事件本身停车。是否继续由固件模式与其他条件决定，FAULT 仍停止。需要固件明确支持事件协议；没有事件不能证明没有丢步。固件时钟与主机时钟不能直接相减。
 
-墙钟时间减线程 CPU 时间不能进一步区分系统抢占、内核等待、其他线程或运行时影响，线程 CPU 时钟粒度也可能较粗。记录自身有开销，时间差包括记录开销；这些数据不证明固件收讫、设备采样或机械动作时间。报告保留的是尾部，不是完整运行轨迹。
+控制结束后可使用配套固件 `tools/step_trace_capture.py` 读取诊断轨迹，勿与运行器同时占串口。轨迹版本必须按其协议解释，不能据软件 STEP 计数证明实际脉冲或机械位移。
 
-接收器时间线还区分 `receiver_count_call/return`、`receiver_read_call/return` 和 `receiver_remaining_call/return`：分别围住两次 `in_waiting` 与中间实际 `read(count)`，记录已读取的 count、remaining 及返回字节数，不额外查询串口。count 为零时记录 `receiver_read_skipped`，不声称执行 read。第二次查询的返回标记在原有 `end` 时钟采集之后；其 `read_window_s` 是原控制判定使用的 `end - now`，诊断不扣除自身开销、不改变 10 ms 门槛。异常调用可能只有 call 没有 return，需结合 `receive_error` 判断。
+重要报告字段：
 
-这些是 Python 调用区间，不是 Windows API 的内部测量。`read` 内部也可能查询队列和等待系统调用，因此只能定位到调用边界，不能据此断言具体系统调用阻塞、硬件延迟或线程抢占。
+- `error`、`session_failure`、`receive_error`：应用、会话与接收层原因。
+- `first_invalid_state`：首个无效帧，不一定是最终退出原因。
+- `pole_recovery`、`angle_pause`：有意等待和恢复。
+- `threaded_receiver.slow_windows`、`backlog_recovery`：慢窗口与排空恢复证据。
+- `slow_inference`、`write_budget`：被丢候选及写后年龄违约。
+- `failure_snapshot.actual_command_gap_s`：快照时距最近一次完整写入的间隔；写后失败可能已更新起点，需结合样本 `active_command_gap_s` 判断。
+- `run_totals`：已完成指令之间的统计；最大成功间隔不包含末尾未再完成写入的超期空档。
 
+`--gap-timeline` 保存最近 4096 个主机阶段边界，退出后写报告，不在热循环打印。墙钟与线程 CPU 时间仅帮助定位调用区间，不能独立区分系统抢占、GIL、驱动等待或真实计算。线程模式报告中的控制时间线与接收线程统计不同；不能把控制线程时间当接收调用内部时间。
 
-### 独立接收线程闭环版本
+跨摆角或摆杆有意暂停的首条命令分别标记 `intentional_angle_pause_gap`、`intentional_pole_recovery_gap`。`active_command_gap_s` 从恢复后建立的活动预算起点计算，硬超限计数使用它，恢复首写也不能豁免硬限；其他软间隔计数排除有意暂停标记，原始命令间隔仍保留。报告许多明细为有界尾部，不是完整轨迹。
 
-本隔离版本的 `run_policy.py` 使用唯一接收线程；接收线程只执行串口读取、原协议校验并按顺序缓存完整帧与主机接收时间。控制线程独占会话状态、所有串口写入及停机。所有 STATE、无效帧、MODE 和回包均依次处理，不以最新有效帧覆盖故障证据。FIFO 上限 64 帧，溢出明确失败。锁只用于短暂队列交接，控制线程不等待锁；读取批次未完成或交接锁忙时，不把接收缓存报告为已排空。
+## 验证
 
-4 ms 原始观测期限、60°/58°暂停恢复和原读取期限保持不变。活动期间底层串口或已解析 FIFO 积压超过 128 字节，记录警告并等待恢复，不因历史峰值直接结束运行。当前待处理字节只包含 FIFO 和最近底层待处理量，历史峰值只作统计；控制线程不查询串口驱动。线程并不能消除 USB 延迟、系统抢占或缺少新观测，仍可能因此退出。
+```sh
+python -m unittest discover -s deploy/v2/device -p 'test_*.py'
+python -m unittest discover -s deploy/v2/device/integration_tests -p 'test_*.py'
+make -C deploy/v2/device/edge test
+```
 
-观测、配置回包和事件的新鲜度使用接收线程的原始主机时间，不把排队期间的数据重新标为新鲜；会话超时与停车仍以处理时刻计时。旧的排队 DISABLED 回包不能确认新一次禁用，旧 RUN 回包不能回答新查询。读线程完全退出后才关闭端口，等待退出被中断且线程尚未退出时，不并发关闭端口。
-
-报告新增 `threaded_receiver`；它是接收线程统计，原 `gap_timeline` 仍仅记录控制线程，二者不混合线程CPU时间。此版本尚未以真实硬件验证，软件测试通过不代表时限问题已解决。
-
-
-### 发送前写入预留
-
-本隔离运行器在原始候选截止期前预留 0.5 ms，接收排空最晚到 `deadline - 0.5 ms`；紧邻 `session.command` 再检查。预算不足即丢弃旧动作，保留已消费观测标记，等待真正新接收观测重新推理，不用新观测给旧动作续期。4 ms 观测、9 ms 指令间隔及写后截止检查不变。报告 `write_budget` 包含丢弃计数、阶段和最后一次原因/剩余预算。
-
-0.5 ms 为经验预留：072320 报告有限尾窗 82 次 command 调用最大约 0.2344 ms，本次失败调用约 0.1668 ms。它不保证 Windows 调度或未来串口写入耗时；即使预留充足，写后仍可能超时并退出。
-
-
-可选 `--thread-priority above-normal`：仅本进程的控制线程及接收线程请求 Windows ABOVE_NORMAL，非实时优先级；默认 `unchanged` 不改。每个线程自己设置并在退出时恢复原值，报告 `control_thread_priority` 和 `threaded_receiver.thread_priority` 记录请求、实际读回、失败及恢复结果。不改变进程优先级或永久系统配置，也不保证时限。其他平台不支持时如实记录。
-
-本次实验可显式指定 `--command-gap-hard-ms 15`；默认与其他 timing profile 不变，正常观测上限仍为 4 ms。`run_totals` 分别保留成功指令间隔大于 4 ms、达到 6/9 ms、达到本次 hard limit 的计数，排除有意暂停间隔。成功指令间隔最大值不包括最后一条尚未写出的超限空档，该空档应看 `failure_snapshot.actual_command_gap_s`。
-
-
-### 慢推理候选重试实验
-
-显式 `--retry-slow-inference` 将原 `CLOCK()-now > 2 ms` 慢候选处置改为记录并丢弃，不发送其动作；默认仍按原策略退出。这个判据是决策阶段墙钟（包含推理前检查），不是 CPU 耗时；`slow_inference` 同时记录 `forward_s`、`decision_elapsed_s`、计数、最大值和最后丢弃原因。等于 2 ms 不触发慢判据。丢弃后保留已消费观测标记，下一轮先处理全部故障/无效帧，再等待真正新接收观测重新推理。没有新观测或反复慢推理仍受原指令总预算约束；本实验指定 15 ms，观测 4 ms、写入预留 0.5 ms、倒杆暂停及写后检查均不变。这不是让旧动作带着新时间戳继续发送。
-
-
-### 倒杆暂停等待
-
-已暂停时单次观测年龄达到 4 ms 只等待，不据陈旧低角度恢复；活动控制及首次进入暂停仍按原 4 ms 规则。暂停仍每轮处理 Session.tick，连续无 STATE 约 100 ms、元数据 1 s、回读响应 100 ms、FAULT、小车无效和格式错误仍退出；摆杆短暂无效遵循下述恢复规则。接收 worker 每次 poll 开始固定策略快照：活动 read/poll/partial 为 10/20/20 ms，暂停为 100/100/100 ms；在途不改变。暂停免除普通 128 字节低延迟门控，但活动期积压仍须完成下述恢复，已锁存错误不清除；1024 字节上限、64 帧队列及格式校验保留。
-
-恢复分两步：新鲜有效且角度 ≤58°、暂停策略已确认且主机接收层排空，先请求严格接收策略但保持暂停；严格策略已确认、无在途 poll/半帧/积压，且再次收到策略切换后的新鲜有效低角观测才恢复。角度不满足或状态陈旧则取消恢复请求。报告含策略确认与恢复等待原因计数。主机排空和接收时间不能证明设备采样时刻，协议没有该时间戳。
-恢复验证阶段已切回严格接收时限，即使尚未重新发送 VEL，该阶段出现接收错误也会保留并终止；不会通过返回暂停来清错。
-
-暂停恢复严格策略的首个 poll，其历史起点间隔仍按暂停 100 ms 判断，但当前读取/半帧已按严格 10/20 ms 判断；随后全部严格。不重置时间或清除已发生故障。
-
-### 短暂接收积压恢复
-
-| 状态 | 行为 |
-| --- | --- |
-| 活动期源串口或完整帧队列超过 128 字节 | 记录积压警告，废弃当前推理动作，不清空或覆盖协议事件。 |
-| 仍有队列、半帧、在途读取或交接锁忙 | 继续按顺序处理帧并短暂让出执行时间，不发送候选动作。 |
-| 主机接收层排空 | 保存排空时刻，仍不使用刚处理的积压样本。 |
-| 收到排空边界之后的新有效观测 | 重新推理；发送前再次检查是否发生积压，旧候选不能借新观测时间戳发送。 |
-| 原活动命令预算耗尽或真实故障 | 按原有路径停止，恢复等待不重置预算。 |
-
-本次实验的命令预算仍由 `--command-gap-hard-ms 15` 设置。1024 字节底层容量、64 帧 FIFO 容量、坏帧、小车测量无效、FAULT、持续失联和读写时限不豁免；超容量意味着证据可能丢失，不能按普通积压恢复。
-
-警告和恢复次数、最近 64 个事件的发现/排空/恢复主机时刻记录在 `threaded_receiver.backlog_recovery`；结束输出汇总警告次数，热路径不额外打印。主机排空只是已观察到的本地队列边界，不代表 USB 或设备内部也无缓冲。协议没有设备采样时间，不能证明排空后收到的帧是刚采样的。
-
-
-### 摆杆测量与持续控制
-
-短暂读取失败的估计保鲜由固件负责：固件只有在最后成功样本仍满足设备侧时间界限、角速度窗口及健康条件时才保持摆杆有效。主机收到双路有效的 STATE 就正常重新推理并持续发送 VEL，即使摆杆数值与前一帧相同也不会因此暂停。
-STATE 没有设备采样时间；主机接收时间只用于接收新鲜度，不能证明最后成功样本的设备年龄，也不会把无效摆杆字段替换为缓存后宣称有效。
-
-以下等待仅适用于固件已经明确报告摆杆无效的情况，不是对单次读帧失败的默认处理。
-
-正式闭环收到小车有效、摆杆无效的 `STATE 1` 时保留会话，暂停模型推理及 VEL 发送。
-不会用无效字段中的占位零推理，也不会给旧观测换上新时间或重复发送旧动作。
-有完整 STATE 持续到达时等待有效性恢复，不把这段故意停发计入普通命令间隔。
-等待期间仍刷新设备元数据；固件 FAULT、小车无效、格式错误和连续约 100 ms 无 STATE 都会结束运行。
-若等待超过固件 WDT_MS，固件按自身看门狗规则减速；主机不自动 ENABLE。
-
-| 输入或阶段 | 处理 |
-| --- | --- |
-| 双路有效且新鲜 | 正常推理；仍须满足摆角范围、写入和活动时序要求。 |
-| 小车有效、摆杆无效 | 清除可推理观测，等待恢复；保留首次失效诊断及累计次数。 |
-| 等待后双路恢复有效 | 接收队列排空并确认严格接收策略，使用策略切换后的新鲜观测重新推理。 |
-| 恢复握手期间再次无效或观测变旧 | 取消恢复请求，继续等待，不发送已计算候选。 |
-| 固件 FAULT、坏帧、小车无效、通信失联 | 结束本次控制并执行既有停机流程。 |
-
-暂停前已经超时的活动命令不会因随后收到无效帧而获得延期。
-恢复后重建栅格和命令预算，不补发错过的指令；原摆角暂停状态保持，角度仍超范围则继续不发送 VEL。
-报告 `pole_recovery` 记录等待、恢复、无效帧和最长已恢复等待；样本
-`intentional_pole_recovery_gap` 标记恢复后的首条命令间隔。接收时间不代表设备采样时间。
-只读时序诊断和通用 Session 客户端不采用该容错策略。
-`first_invalid_state` 仅记录首次无效帧，不再等同于退出原因；退出依据应查看 `error`、`session_failure` 和故障快照。
-
-
-### Transient host-delay recovery experiment (runner revision 21)
-
-Use `--command-gap-hard-ms 25 --retry-slow-inference --thread-priority above-normal`
-with the existing continuous-run command. The 25 ms limit is opt-in, not a real-time
-or stability guarantee. It does not change firmware WDT or encoder fault handling.
-
-The threaded reader treats read windows above 10 ms and poll gaps above 20 ms as
-warnings below 100 ms. It preserves frame order and uses the same drain-then-new-
-receipt recovery as backlog and slow inference; it never renews the active command
-budget. Sustained 100 ms delays, invalid bytes/read contracts, partial-frame timeout,
-queue limits, firmware FAULT and invalid cart measurements remain errors.
-
-The empirical pre-write reserve is now 1 ms. Candidates that no longer fit are
- discarded. A completed write whose observation age exceeds the unchanged 4 ms
-limit cannot be undone: `write_budget.completion_age_warnings` records it and the
-runner drains and recomputes from a later receipt. Exceeding the active command-gap
-limit still stops, including the first write after angle/pole recovery. Host receipt
-and queue boundaries are not proof of device sample age. `slow_windows` and
-`backlog_recovery` retain evidence; no console printing is added to the hot loop.
-
-
-### Deployment angle gate defaults
-
-The real-device runner now pauses VEL at `abs(theta) >= 20 degrees` and resumes
-only at `abs(theta) <= 18 degrees` with a fresh valid observation. The existing
-2-degree hysteresis, long-pause behavior and firmware fault handling are unchanged.
-This is a deployment gate, not a change to the model training termination boundary.
-Explicit CLI options remain available: `--angle-pause-deg 20 --angle-resume-deg 18`.
+Python 单元/组合测试使用注入时钟与模拟传输验证逻辑；C 测试验证其接口。它们不替代目标 Windows、实际 ONNX、USB 串口和配套固件的现场验证。目标设备时序及控制稳定性须另行验证，不能由测试通过或只读诊断退出码推导。
