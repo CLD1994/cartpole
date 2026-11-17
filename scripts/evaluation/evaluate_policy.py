@@ -12,6 +12,7 @@ import subprocess
 import sys
 import uuid
 
+from environment_overrides import add_environment_overrides
 from episode_metrics import EpisodeMetrics, run_cohort, summarize
 
 
@@ -32,6 +33,7 @@ def parse_args(argv=None, *, add_launcher_args):
     parser.add_argument('--velocity-observation-window-ms', type=int, choices=[0,16], default=0,
                         help='仅策略速度输入：0瞬时基线；16ms首末位置差，前16ms保留瞬时速度')
     parser.add_argument('--output-dir', type=Path, default=Path('logs/evaluation'))
+    add_environment_overrides(parser)
     add_launcher_args(parser)
     args = parser.parse_args(argv)
     args.physics = 'isaacsim_physx'
@@ -201,6 +203,7 @@ def main(argv=None):
     output.mkdir(parents=True,exist_ok=False)
     report = dict(schema_version=3,status='starting',checkpoint=str(checkpoint),checkpoint_sha256=digest,
                   task=args.task,seeds=args.seeds,num_envs=args.num_envs,cohorts=[],
+                  env_overrides=args.env_override,
                   scope='当前配置下的独立仿真评估；不是旧训练环境重建、性能基准或真机验收',
                   sample_scope='每槽位从显式reset起的第一个回合；状态在自动reset前、每控制步末采样',
                   recorder_note='Isaac Lab 3.0 recorder会额外计算观测；相同seed不保证与普通play随机数序列相同，不能用于RTF比较',
@@ -217,9 +220,14 @@ def main(argv=None):
     print(f'[OUTPUT] {output}',flush=True)
     active = [None]
     try:
-        env_cfg,agent_cfg = resolve_task_config(args.task,'rsl_rl_cfg_entry_point',play_mode=False,overrides=[])
+        env_cfg,agent_cfg = resolve_task_config(args.task,'rsl_rl_cfg_entry_point',play_mode=False,overrides=args.env_override)
         env_cfg = configure_initial_velocities(env_cfg,cart_range=args.initial_cart_velocity_range,
                                                pole_range=args.initial_pole_velocity_range)
+        tracking = env_cfg.actions.joint_effort
+        report['tracking_configuration'] = {
+            'vel_max': tracking.vel_max, 'acc_max': tracking.acc_max, 'tau': tracking.tau,
+            'randomization': {name: env_cfg.events.randomize_tracking.params[name]
+                              for name in ('vel_max_range', 'acc_max_range', 'tau_range')}}
         report['reset_conditions'] = {
             'cart_position_range_m':env_cfg.events.reset_cart_position.params['position_range'],
             'cart_velocity_range_m_s':env_cfg.events.reset_cart_position.params['velocity_range'],
