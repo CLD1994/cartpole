@@ -240,6 +240,40 @@ def guard_snapshot(obs, session, starting=False):
             'reason': state_guard(obs, session, starting) if obs else 'measurement_unavailable'}
 
 
+def await_startup(session, receiver, transport, report, *, clock=CLOCK, sleep=time.sleep):
+    """两秒内刷新只读证据，保存首次和最后阻碍；不使能或发送运动。"""
+    started = clock()
+    next_refresh = started + .5
+    detail = report['startup_preflight'] = {'first_blocker': None, 'last_blocker': None, 'refresh_count': 0}
+    reason = 'startup_no_data'
+    while clock() - started < 2.:
+        if not receiver.poll() or session.failure:
+            raise RuntimeError(receiver.error or session.failure)
+        reason = session.preflight_reason()
+        if reason is None and 'STEP_LOSS_UM' not in session.values:
+            reason = 'readback_STEP_LOSS_UM'
+        if reason is None and (transport.partial or transport.in_waiting):
+            reason = 'startup_receive_pending'
+        if reason is None:
+            detail['complete'] = True
+            return
+        now = clock()
+        snapshot = {'reason': reason, 'elapsed_s': now-started,
+                    'mode': session.mode, 'mode_age_s': now-session._mode_at if math.isfinite(session._mode_at) else None,
+                    'readback': {k:v[0] for k,v in session.values.items()},
+                    'expected_readback': dict(session.expected_readback)}
+        if detail['first_blocker'] is None:
+            detail['first_blocker'] = snapshot
+        detail['last_blocker'] = snapshot
+        if now >= next_refresh:
+            session.refresh()
+            detail['refresh_count'] += 1
+            next_refresh = now + .5
+        sleep(.0002)
+    detail['complete'] = False
+    raise RuntimeError('preflight:' + reason)
+
+
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--port', required=True)
@@ -398,19 +432,7 @@ def main(a=None):
                     else:
                         raise RuntimeError('initial_alignment_timeout')
                     session.observe()
-                    end = CLOCK() + 2.
-                    # 收集启动读回；不在循环内等待操作者使能，不发送运动。
-                    while CLOCK() < end:
-                        if not receiver.poll() or session.failure:
-                            raise RuntimeError(receiver.error or session.failure)
-                        if (session.preflight_reason() is None
-                                and 'STEP_LOSS_UM' in session.values
-                                and not transport.partial and transport.in_waiting == 0):
-                            break
-                        time.sleep(.0002)
-                    reason = session.preflight_reason()
-                    if reason:
-                        raise RuntimeError('preflight:' + reason)
+                    await_startup(session, receiver, transport, report)
                     report['device_snapshot'] = session.bind_calibration()
                     report['coordinate_mapping'] = {'x_sign': 1, 'action_sign': 1, 'angle_sign': ANGLE_SIGN}
                     report['position_boundary'] = {
