@@ -1,6 +1,7 @@
 """实际 runner while 循环与 Receiver/BoundSession/ReadbackCycle 组合；无硬件。"""
 import ast
 import math
+import re
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -42,14 +43,20 @@ class Port:
         return len(data)
 
 class RunnerCombinationTests(unittest.TestCase):
-    def run_loop(self, angle, duration, policy_hook=None, diagnostic=False, fault_at=None, retry_slow=False, hard_limit=.009, no_new_state=False, backlog_ready=None):
+    def run_loop(self, angle, duration, policy_hook=None, diagnostic=False, fault_at=None, retry_slow=False, hard_limit=.009, no_new_state=False, backlog_ready=None, invalid_pole=None, resume_hook=None, read_hook=None):
         clock=Clock();port=Port(clock,lambda:angle(clock.now-10))
         port.no_new_state=no_new_state
         original_read=port.read
+        fault_sent=[False]
         def read(n):
+            if read_hook:read_hook(clock)
+            if fault_at is not None and clock.now-10 >= fault_at and not fault_sent[0]:
+                port.pending=b'MODE FAULT MT6835\n'+port.pending
+                fault_sent[0]=True
             data=original_read(n)
-            if fault_at is not None and clock.now-10 >= fault_at:
-                data=b'MODE FAULT STEP_LOSS\n'
+            if invalid_pole and invalid_pole(clock.now-10):
+                data=re.sub(rb'(?m)^STATE [^\n]*\n', b'STATE 1 0 0 0 0\n', data)
+            assert len(data)<=n, (n, data)
             return data
         port.read=read
         session=r.BoundSession(port,clock,Limits(500,1250,10000,10000),{'POLE_INV':1,'X_INV':0})
@@ -57,8 +64,9 @@ class RunnerCombinationTests(unittest.TestCase):
         for k,v in port.values.items():session.receive(f'OK {k} {v}')
         session.receive('STATE 3 0 0 0 0');session.bind_calibration();session.start()
         receiver=Receiver(port,session,clock)
-        receiver.request_pause=lambda:None
-        receiver.resume_ready=lambda obs:True
+        receiver.pause_calls=[]
+        receiver.request_pause=lambda:receiver.pause_calls.append(clock.now)
+        receiver.resume_ready=lambda obs:resume_hook(clock) if resume_hook else True
         receiver.active_backlog_seen=0
         receiver.backlog_ready=backlog_ready or (lambda obs:True)
         report={'angle_pause':{'events':[],'pause_count':0,'resume_count':0,'intentional_completion_gaps':0},
@@ -93,7 +101,7 @@ class RunnerCombinationTests(unittest.TestCase):
             session=session,receiver=receiver,transport=port,policy=SimpleNamespace(forward=forward),
             write_budget=r.WriteBudget(),timeline=r.GapTimeline(False),cycle=0,report=report,a=SimpleNamespace(diagnostic_timing=diagnostic,retry_slow_inference=retry_slow),pause=r.AnglePause(),gate=gate,
             hard_limit_s=hard_limit,observation_limit_s=.004,inference_limit_s=.002,
-            budget_at=10.,last_command_at=10.,start=10.,end=10.+duration,
+            pole_resumed_since_command=False,budget_at=10.,last_command_at=10.,start=10.,end=10.+duration,
             grid_start_ns=10_000_000_000,next_tick_ns=10_000_000_000,next_tick=10.,next_slot=0,
             period_ns=2_000_000,last_sample=None,last_tick=None,intervals=[],probe=None,
             refresh=r.ReadbackCycle(port,report['readback_refresh'],10.))
@@ -103,6 +111,67 @@ class RunnerCombinationTests(unittest.TestCase):
             try:exec(code,env)
             except r.TrialEnd:pass
         return port,report,calls
+    def test_pole_recovery_waits_past_command_budget_and_reinfers(self):
+        port,report,calls=self.run_loop(lambda t:0,.08,invalid_pole=lambda t:.004<t<.05)
+        self.assertFalse(any(.004<at-10<.05 for at,_ in calls))
+        self.assertFalse(any(.004<at-10<.05 and data.startswith(b'VEL') for at,data in port.sent))
+        self.assertTrue(any(at-10>=.05 for at,_ in calls))
+        self.assertTrue(any(row.get('intentional_pole_recovery_gap') for row in report['samples']))
+
+    def test_pole_invalid_stream_past_watchdog_waits_without_velocity_writes(self):
+        port,report,calls=self.run_loop(lambda t:0,.3,invalid_pole=lambda t:.004<t<.25)
+        self.assertFalse(any(.004<at-10<.25 and data.startswith(b'VEL') for at,data in port.sent))
+        self.assertTrue(any(at-10>=.25 for at,_ in calls))
+
+    def test_fault_during_pole_wait_ends_control(self):
+        with self.assertRaisesRegex(RuntimeError,'firmware_mode|session_inactive'):
+            self.run_loop(lambda t:0,.03,invalid_pole=lambda t:t>.004,fault_at=.02)
+
+    def test_recovery_candidate_expiring_during_handshake_waits_for_another(self):
+        count=[0]
+        def resume(clock):
+            count[0]+=1
+            if count[0]==1:clock.now+=.005
+            return True
+        port,report,calls=self.run_loop(lambda t:0,.05,invalid_pole=lambda t:.004<t<.01,resume_hook=resume)
+        self.assertGreater(count[0],1)
+        self.assertTrue(any(at-10>.015 for at,_ in calls))
+
+    def test_invalid_again_during_recovery_requests_pause_again(self):
+        until=[0.];tries=[0]
+        def resume(clock):
+            tries[0]+=1
+            if tries[0]==1:
+                until[0]=clock.now-10+.004
+                return False
+            return True
+        def invalid(t):return .004<t<.01 or .01<t<until[0]
+        port,report,calls=self.run_loop(lambda t:0,.05,invalid_pole=invalid,resume_hook=resume)
+        receiver=self.last_run[3]['receiver']
+        self.assertTrue(any(.01<at-10<until[0] for at in receiver.pause_calls))
+        self.assertGreater(tries[0],1)
+        self.assertTrue(any(at-10>=until[0] for at,_ in calls))
+
+    def test_overdue_active_gap_before_first_invalid_is_not_forgiven(self):
+        delayed=[False]
+        def read_delay(clock):
+            if clock.now-10>.004 and not delayed[0]:
+                delayed[0]=True;clock.now+=.008
+        with self.assertRaisesRegex(RuntimeError,'command_gap_deadline'):
+            self.run_loop(lambda t:0,.05,invalid_pole=lambda t:t>.004,read_hook=read_delay,hard_limit=.006)
+
+    def test_pole_invalid_during_inference_discards_candidate(self):
+        invalid={'yes':False}
+        def infer(clock):invalid['yes']=True;clock.now+=.00005
+        port,report,calls=self.run_loop(lambda t:0,.02,infer,invalid_pole=lambda t:invalid['yes'])
+        self.assertEqual(len(calls),1)
+        self.assertFalse(any(data.startswith(b'VEL') for _,data in port.sent))
+
+    def test_pole_invalid_during_angle_pause_preserves_angle_pause(self):
+        port,report,calls=self.run_loop(lambda t:80,.08,invalid_pole=lambda t:.004<t<.05)
+        self.assertEqual(calls,[])
+        self.assertFalse(any(data.startswith(b'VEL') for _,data in port.sent))
+
     def test_pause_over_one_second_refreshes_metadata_and_resumes(self):
         port,report,calls=self.run_loop(lambda t:80 if t<1.1 else 0,1.12)
         self.assertTrue(any(data==b'QUERY\n' for _,data in port.sent))

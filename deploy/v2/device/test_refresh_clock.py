@@ -16,7 +16,7 @@ class RefreshClockTests(unittest.TestCase):
         def refresh(*a): now[0]+=refresh_delay
         env=dict(CLOCK=lambda:now[0],time=NS(perf_counter_ns=lambda:round(now[0]*1e9),sleep=sleep),
                  cycle=0,timeline=NS(mark=lambda *a:None),transport=NS(in_waiting=0),
-                 receiver=NS(backlog_ready=lambda obs:True,poll=lambda:True,error=None),session=NS(phase='active',failure=None,observation=None),
+                 receiver=NS(backlog_ready=lambda obs:True,poll=lambda:True,error=None),session=NS(pole_waiting=False,phase='active',failure=None,observation=None),
                  Phase=NS(ACTIVE='active'),refresh=NS(update=refresh),update_pause=update_pause,
                  pause=NS(paused=False),a=NS(diagnostic_timing=False),budget_at=0.,hard_limit_s=.009,
                  gate=gate,next_tick_ns=2500000,next_tick=.0025,end=1.)

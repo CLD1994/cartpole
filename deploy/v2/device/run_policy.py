@@ -19,6 +19,7 @@ from thread_priority import current_thread_priority
 from session import Session, Phase
 from step_loss_events import StepLossEventMixin
 from angle_pause import AnglePause
+from pole_recovery import PoleRecoverySessionMixin
 from gap_timeline import GapTimeline
 from state_frame import parse_state
 
@@ -99,7 +100,7 @@ class ControlTransport:
         return self.port.write(data)
 
 
-class BoundSession(Session):
+class BoundSession(PoleRecoverySessionMixin, Session):
     """把本次台位坐标参数纳入既有新鲜读回及运行中变化检查。"""
     enforce_position_limits = False  # User-selected firmware-owned position limits.
     def __init__(self, transport, clock, limits, coordinates):
@@ -171,6 +172,7 @@ class DiagnosticTransport(ControlTransport):
 
 
 class DiagnosticSession(BoundSession):
+    allow_pole_recovery = False
     required_active_mode = ('DISABLED', 'NONE')
 
     def receive(self, line):
@@ -363,7 +365,7 @@ def main(a=None):
         policy.forward((0., 0., 0., 0.))
     # 外部权重初始化前后均核验；在运行期间不可改动导出文件。
     verified_files = verify_model_files(model, manifest)
-    report = {'loop_interval_scope': 'new-observation decision ticks, not serial command completion', 'runner_revision': 19, 'timing_profile': a.timing_profile, 'control_hz': limits.control_hz, 'grid_period_ns': period_ns, 'action_dim': 1, 'host_angle_gate': not a.diagnostic_timing, 'host_angle_gate_mode': 'disabled_diagnostic' if a.diagnostic_timing else 'pause_resume', 'diagnostic_timing': a.diagnostic_timing, 'discarded_stale_candidates': 0, 'candidate_refresh_stages': {}, 'stale_observation_waits': 0, 'max_stale_observation_age_s': 0., 'grid_slots_skipped': 0, 'over_period_late_candidates': 0, 'readback_refresh': [], 'scheduler': 'absolute-grid-wait-fresh', 'duplicate_tick_count': 0, 'verified_model_files': verified_files, 'status': 'starting', 'scope': '限时真机联调；不是硬实时或真机验收',
+    report = {'loop_interval_scope': 'new-observation decision ticks, not serial command completion', 'runner_revision': 20, 'timing_profile': a.timing_profile, 'control_hz': limits.control_hz, 'grid_period_ns': period_ns, 'action_dim': 1, 'host_angle_gate': not a.diagnostic_timing, 'host_angle_gate_mode': 'disabled_diagnostic' if a.diagnostic_timing else 'pause_resume', 'diagnostic_timing': a.diagnostic_timing, 'discarded_stale_candidates': 0, 'candidate_refresh_stages': {}, 'stale_observation_waits': 0, 'max_stale_observation_age_s': 0., 'grid_slots_skipped': 0, 'over_period_late_candidates': 0, 'readback_refresh': [], 'scheduler': 'absolute-grid-wait-fresh', 'duplicate_tick_count': 0, 'verified_model_files': verified_files, 'status': 'starting', 'scope': '限时真机联调；不是硬实时或真机验收',
               'timing_limits_s': {'command_gap_soft': COMMAND_GAP_SOFT_S, 'command_gap_hard': hard_limit_s, 'observation_max_age': observation_limit_s},
               'rig_requirements': {'protocol_baud': PROTOCOL_BAUD, 'config': limits.config,
                                    'coordinates': dict(RIG_COORDINATES), 'angle_sign': ANGLE_SIGN,
@@ -571,6 +573,7 @@ def main(a=None):
                     next_tick_ns = grid_start_ns
                     end = math.inf if a.continuous else start + a.seconds
                     last_tick = last_sample = None
+                    pole_resumed_since_command = False
                     last_command_at = budget_at = start
                     if a.continuous or a.seconds > .5:
                         refresh = ReadbackCycle(transport, report['readback_refresh'], start)
@@ -587,6 +590,37 @@ def main(a=None):
                         if refresh:
                             refresh.update(session, now)
                             timeline.mark('readback_update_done', cycle)
+                        if session.pole_waiting and not a.diagnostic_timing:
+                            stage = 'pole_recovery_wait'
+                            timeline.mark(stage, cycle)
+                            if not session.pole_pause_requested:
+                                if not pause.paused and session.pole_wait_at-budget_at >= hard_limit_s:
+                                    gate('command_gap_deadline')
+                                receiver.request_pause()
+                                session.pole_pause_requested = True
+                            observation = session.observation
+                            eligible = (observation is not None
+                                        and now-observation.received_at < observation_limit_s
+                                        and observation.received_at > session.pole_wait_at)
+                            if not eligible:
+                                receiver.request_pause()
+                            if not eligible or not receiver.resume_ready(observation):
+                                if refresh:
+                                    refresh.send_if_due(now, end)
+                                check_trial_end(CLOCK(), end)
+                                time.sleep(.0001)
+                                continue
+                            # 只接受恢复后的新有效观测，不发送暂停前候选。
+                            if not session.finish_pole_recovery(observation_limit_s):
+                                receiver.request_pause()
+                                continue
+                            receiver.active = True
+                            budget_at = CLOCK()
+                            pole_resumed_since_command = True
+                            next_slot = next_grid_slot(next_slot, grid_start_ns, time.perf_counter_ns(), period_ns)
+                            next_tick_ns = grid_start_ns + next_slot*period_ns
+                            next_tick = next_tick_ns/1e9
+                            last_sample = last_tick = None
                         stage = 'angle_pause_check'
                         timeline.mark(stage, cycle)
                         # 非暂停仍先检查原命令预算；暂停只豁免故意停发的间隔。
@@ -767,6 +801,9 @@ def main(a=None):
                             timeline.mark('precommand_poll_done', cycle)
                             if refresh:
                                 refresh.update(session, CLOCK())
+                            if session.pole_waiting and not a.diagnostic_timing:
+                                retry_candidate = True
+                                break
                             latest = session.observation
                             if latest is None or state_guard(latest, session):
                                 report['failed_state_check'] = guard_snapshot(latest, session)
@@ -827,9 +864,14 @@ def main(a=None):
                         command_gap = completed_at-last_command_at
                         totals=report['run_totals']
                         totals['command_completions']+=1
-                        intentional_gap = pause.resumed_since_command and not a.diagnostic_timing
+                        angle_gap = pause.resumed_since_command and not a.diagnostic_timing
+                        pole_gap = pole_resumed_since_command and not a.diagnostic_timing
+                        intentional_gap = angle_gap or pole_gap
+                        pole_resumed_since_command = False
                         pause.resumed_since_command = False
-                        if intentional_gap:
+                        if pole_gap:
+                            session.pole_recovery_stats['intentional_completion_gaps'] += 1
+                        if angle_gap:
                             report['angle_pause']['intentional_completion_gaps'] += 1
                         totals['command_gaps_over_4ms']+=int(not intentional_gap and command_gap>COMMAND_GAP_SOFT_S)
                         totals['command_gaps_at_or_over_6ms']+=int(not intentional_gap and command_gap>=.006)
@@ -845,7 +887,8 @@ def main(a=None):
                                                   'control_source': command_phase, 'raw_action': raw, 'velocity_mm_s': velocity, 'acceleration_mm_s2': acceleration,
                                                   'inference_s': inference_s,
                                                   'command_gap_s': command_gap,
-                                                  'intentional_angle_pause_gap': intentional_gap,
+                                                  'intentional_angle_pause_gap': angle_gap,
+                                                  'intentional_pole_recovery_gap': pole_gap,
                                                   'command_gap_soft_warning': not intentional_gap and command_gap > COMMAND_GAP_SOFT_S,
                                                   'observation_received_clock_s': obs.received_at,
                                                   'host_observation_age_s': completed_at-obs.received_at,
@@ -942,12 +985,12 @@ def main(a=None):
             report['received_state_gap_scope'] = 'valid ACTIVE STATE parses in measurement window; not device sample/wire arrival timing' if a.diagnostic_timing else 'not_recorded'
             report['summary_scope']='retained recent tail; run_totals are full-run' if a.continuous else 'complete recorded run'
             report['loop_interval_s'] = summary(intervals)
-            report['completion_gap_s'] = summary([r['command_gap_s'] for r in report['samples'] if not r.get('intentional_angle_pause_gap')])
-            report['completion_gap_scope'] = 'virtual_no_action_write' if a.diagnostic_timing else 'actual_host_write_completion_excluding_marked_angle_pause_gaps'
-            report['completion_gaps_over_6ms'] = sum(r['command_gap_s'] >= .006 for r in report['samples'] if not r.get('intentional_angle_pause_gap'))
-            report['completion_gaps_at_or_over_9ms'] = sum(r['command_gap_s'] >= .009 for r in report['samples'] if not r.get('intentional_angle_pause_gap'))
-            report['completion_gaps_at_or_over_hard_limit'] = sum(r['command_gap_s'] >= hard_limit_s for r in report['samples'] if not r.get('intentional_angle_pause_gap'))
-            report['completion_gaps_over_4ms'] = sum(r['command_gap_s'] > COMMAND_GAP_SOFT_S for r in report['samples'] if not r.get('intentional_angle_pause_gap'))
+            report['completion_gap_s'] = summary([r['command_gap_s'] for r in report['samples'] if not (r.get('intentional_angle_pause_gap') or r.get('intentional_pole_recovery_gap'))])
+            report['completion_gap_scope'] = 'virtual_no_action_write' if a.diagnostic_timing else 'actual_host_write_completion_excluding_marked_pause_gaps'
+            report['completion_gaps_over_6ms'] = sum(r['command_gap_s'] >= .006 for r in report['samples'] if not (r.get('intentional_angle_pause_gap') or r.get('intentional_pole_recovery_gap')))
+            report['completion_gaps_at_or_over_9ms'] = sum(r['command_gap_s'] >= .009 for r in report['samples'] if not (r.get('intentional_angle_pause_gap') or r.get('intentional_pole_recovery_gap')))
+            report['completion_gaps_at_or_over_hard_limit'] = sum(r['command_gap_s'] >= hard_limit_s for r in report['samples'] if not (r.get('intentional_angle_pause_gap') or r.get('intentional_pole_recovery_gap')))
+            report['completion_gaps_over_4ms'] = sum(r['command_gap_s'] > COMMAND_GAP_SOFT_S for r in report['samples'] if not (r.get('intentional_angle_pause_gap') or r.get('intentional_pole_recovery_gap')))
             report['inference_s'] = summary(report['inference_attempts_s'])
             report['inference_scope'] = ('retained recent policy.forward attempts including discarded candidates; excludes warmup' if a.continuous else 'all measured policy.forward attempts including discarded candidates; excludes warmup')
             report['completed_candidate_inference_s'] = summary([r['inference_s'] for r in report['samples'] if r['inference_s'] is not None])
@@ -959,6 +1002,7 @@ def main(a=None):
                 or report.get('safe_stop_requested')) and not report['disabled_confirmed'])
             report['gap_timeline'] = timeline.snapshot()
             report['first_invalid_state'] = session.first_invalid_state if session else None
+            report['pole_recovery'] = {**session.pole_recovery_stats, 'waiting': session.pole_waiting} if session else None
             report['session_failure'] = session.failure if session else None
             report['receive_error'] = receiver.error if receiver else None
             report['threaded_receiver'] = receiver.report() if receiver else None

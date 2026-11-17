@@ -9,7 +9,7 @@ class PrecommandYieldTests(unittest.TestCase):
         loop=min((n for n in ast.walk(tree) if isinstance(n,ast.While) and any(isinstance(x,ast.Constant) and x.value=='precommand_poll_begin' for x in ast.walk(n))), key=lambda n:sum(1 for _ in ast.walk(n)))
         clock=[0.]; sleeps=[]; polls=[0]
         transport=NS(in_waiting=pending,partial=partial)
-        session=NS(phase='active',failure=None,observation=object())
+        session=NS(pole_waiting=False,phase='active',failure=None,observation=object())
         def poll():
             polls[0]+=1
             if polls[0]>10: raise AssertionError('busy spin without yielding')

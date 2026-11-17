@@ -177,6 +177,9 @@ class Session:
                 and self.observation is not None
                 and self._fresh(self.observation.received_at, now, self.limits.state_timeout_s))
 
+    def _active_measurement_ready(self, now):
+        return self._measurement_ready(now)
+
     def preflight_reason(self):
         now = self._now()
         if self.failure:
@@ -347,7 +350,7 @@ class Session:
             self.observation = None
         if self.phase == Phase.ACTIVE and self._metadata_reason(now):
             self._fail('metadata_unavailable', now)
-        if self.phase == Phase.ACTIVE and not self._measurement_ready(now):
+        if self.phase == Phase.ACTIVE and not self._active_measurement_ready(now):
             self._fail('measurement_timeout', now)
         if self.phase == Phase.STOPPING:
             if now - self._stop_at >= self.limits.stop_timeout_s:
