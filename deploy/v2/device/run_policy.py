@@ -717,13 +717,13 @@ def main(a=None):
                             drain['readback_in_flight'] = bool(refresh and refresh.pending)
                             if not transport.partial and pending == 0:
                                 break
-                            if pending == 0:
-                                begin = CLOCK()
-                                sleep_requested = min(.0001, max(0., receive_deadline-begin)) if begin < receive_deadline else .0001
-                                timeline.mark('sleep_begin', cycle, sleep_requested)
-                                time.sleep(sleep_requested)
-                                timeline.mark('sleep_return', cycle)
-                                drain['wait_s'] += CLOCK()-begin
+                            # Cached pending bytes may await the reader: yield even when nonzero.
+                            begin = CLOCK()
+                            sleep_requested = min(.0001, max(0., receive_deadline-begin))
+                            timeline.mark('sleep_begin', cycle, sleep_requested)
+                            time.sleep(sleep_requested)
+                            timeline.mark('sleep_return', cycle)
+                            drain['wait_s'] += CLOCK()-begin
                         if retry_candidate:
                             continue  # 不使用旧raw；外层拿到更新帧后从头推理。
                         action = max(-1., min(1., raw))
