@@ -23,13 +23,13 @@ class AnglePause:
         if now-observation.received_at >= observation_limit:
             if self.paused:
                 return None  # Session.tick still bounds sustained communication loss.
-            if angle >= self.enter:
+            if angle > self.enter:
                 raise RuntimeError('angle_pause_observation_deadline')
         if self.paused and angle <= self.resume:
             self.paused = False
             self.resumed_since_command = True
             return 'resumed'
-        if not self.paused and angle >= self.enter:
+        if not self.paused and angle > self.enter:
             self.paused = True
             return 'paused'
         return None

@@ -53,6 +53,20 @@ class AnglePauseTests(unittest.TestCase):
             p=AnglePause()
             def frame(deg):return SimpleNamespace(si=lambda:(0,sign*math.radians(deg),0,0),received_at=1.)
             self.assertIsNone(p.check(frame(19.999),1.,1.,.025,.004))
-            self.assertEqual(p.check(frame(20),1.,1.,.025,.004),'paused')
+            self.assertIsNone(p.check(frame(20),1.,1.,.025,.004))
+            self.assertFalse(p.paused)
+            self.assertEqual(p.check(frame(20.001),1.,1.,.025,.004),'paused')
             self.assertIsNone(p.check(frame(18.001),1.,1.,.025,.004))
             self.assertEqual(p.check(frame(18),1.,1.,.025,.004),'resumed')
+
+    def test_stale_pause_boundary_is_strict_for_both_signs(self):
+        from types import SimpleNamespace
+        for sign in (-1, 1):
+            with self.subTest(sign=sign):
+                p = AnglePause()
+                def frame(deg):
+                    return SimpleNamespace(si=lambda: (0, sign*math.radians(deg), 0, 0), received_at=1.)
+                self.assertIsNone(p.check(frame(20), 1.005, 1.004, .025, .004))
+                self.assertFalse(p.paused)
+                with self.assertRaisesRegex(RuntimeError, 'angle_pause_observation_deadline'):
+                    p.check(frame(20.001), 1.005, 1.004, .025, .004)
