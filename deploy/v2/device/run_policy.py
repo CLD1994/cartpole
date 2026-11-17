@@ -14,6 +14,8 @@ from experiment_setup import (limits_from_manifest, PROTOCOL_BAUD, RIG_COORDINAT
 from model_integrity import verify_model_files
 from receiver import Receiver
 from threaded_receiver import ThreadedReceiver, ReceiverPort
+from write_budget import WriteBudget
+from thread_priority import current_thread_priority
 from session import Session, Phase
 from step_loss_events import StepLossEventMixin
 from angle_pause import AnglePause
@@ -308,6 +310,7 @@ def parse_args(argv=None):
     p.add_argument('--angle-pause-deg', type=float, default=60., help='绝对摆角达到此角度时暂停速度命令')
     p.add_argument('--angle-resume-deg', type=float, default=58., help='绝对摆角回落至此角度时自动重新推理')
     p.add_argument('--command-gap-hard-ms', type=float, choices=(6., 9.), help='显式覆盖命令硬期限；不改变观测或推理期限')
+    p.add_argument('--thread-priority', choices=('unchanged','above-normal'), default='unchanged', help='仅本次控制/接收线程优先级，不保证实时')
     p.add_argument('--gap-timeline', action='store_true', help='记录有界主机分段计时到最终报告，不改变控制时限')
     p.add_argument('--json', action='store_true', help='终端输出机器可读摘要 JSON')
     duration_args = p.add_mutually_exclusive_group()
@@ -350,6 +353,7 @@ def main(a=None):
     pause = AnglePause(a.angle_pause_deg, a.angle_resume_deg)
     timeline = GapTimeline(a.gap_timeline)
     cycle = 0
+    write_budget = WriteBudget()
     period_ns = 1_000_000_000 // manifest['training_control_hz']
     limits = limits_from_manifest(manifest, velocity_limit_mm_s=getattr(a, "velocity_limit_mm_s", None),
                                   acceleration_limit_mm_s2=getattr(a, "acceleration_limit_mm_s2", None))
@@ -390,6 +394,24 @@ def main(a=None):
             '模式门要求DISABLED，物理门及时间超限记录后继续，不代表运动可以继续',
             'FAULT/速度失效/坏帧/元数据过期/接收器错误仍退出',
             '超限后的样本是反事实延续；真实runner会在首次超限停止']
+    report['write_budget'] = {'reserve_s': write_budget.reserve_s,
+        'scope': 'fixed empirical host write reserve; not a scheduling guarantee',
+        'discard_count': 0, 'discard_stages': {}, 'last_discard': None}
+    def discard_write_budget(observation, deadline):
+        now = CLOCK()
+        if not write_budget.insufficient(now, deadline):
+            return False
+        check_trial_end(now, end)
+        if now >= budget_at + hard_limit_s:
+            gate('command_gap_deadline')
+        info = report['write_budget']
+        info['discard_count'] += 1
+        info['discard_stages'][stage] = info['discard_stages'].get(stage, 0) + 1
+        info['last_discard'] = {'reason': 'insufficient_write_budget', 'stage': stage,
+            'clock_s': now, 'deadline_clock_s': deadline, 'remaining_s': deadline-now,
+            'observation_received_clock_s': observation.received_at}
+        # last_sample remains consumed: outer loop must await a genuinely new receipt.
+        return True
     def gate(reason):
         if not a.diagnostic_timing:
             raise RuntimeError(reason)
@@ -437,7 +459,8 @@ def main(a=None):
         connection = ReceiverPort(port)
         try:
             a.serial_open_attempted = True
-            with connection:
+            with current_thread_priority(getattr(a, 'thread_priority', 'unchanged')) as priority_report, connection:
+                report['control_thread_priority'] = priority_report
                 try:
                     port.reset_input_buffer()
                     transport = (DiagnosticTransport if a.diagnostic_timing else ControlTransport)(port)
@@ -448,7 +471,7 @@ def main(a=None):
                         probe.enable_monitor()
                     if a.diagnostic_timing:
                         session.diagnostic_state_events = report['received_states']
-                    receiver = ThreadedReceiver(port, session, CLOCK)
+                    receiver = ThreadedReceiver(port, session, CLOCK, priority=getattr(a, 'thread_priority', 'unchanged'))
                     connection.reader = receiver
                     # 与固件tools一致：先对齐持续遥测行，再发请求，避免丢查询回执。
                     align_end = CLOCK()+.5
@@ -677,10 +700,15 @@ def main(a=None):
                         timeline.mark(stage, cycle)
                         receive_deadline = min(budget_at+hard_limit_s, obs.received_at+observation_limit_s, end)
                         drain = {'deadline_clock_s': receive_deadline, 'polls': 0,
-                                 'wait_s': 0., 'started_clock_s': CLOCK()}
+                                 'wait_s': 0., 'started_clock_s': CLOCK(),
+                                 'write_reserve_s': write_budget.reserve_s,
+                                 'drain_cutoff_clock_s': write_budget.cutoff(receive_deadline)}
                         retry_candidate = False
                         while True:
                             check_trial_end(CLOCK(), end)
+                            if discard_write_budget(obs, receive_deadline):
+                                retry_candidate = True
+                                break
                             if CLOCK() >= receive_deadline:
                                 if discard_expired_candidate(obs):
                                     retry_candidate = True
@@ -715,11 +743,14 @@ def main(a=None):
                             if pending > 128:
                                 raise RuntimeError('precommand_backlog')
                             drain['readback_in_flight'] = bool(refresh and refresh.pending)
+                            if discard_write_budget(obs, receive_deadline):
+                                retry_candidate = True
+                                break
                             if not transport.partial and pending == 0:
                                 break
                             # Cached pending bytes may await the reader: yield even when nonzero.
                             begin = CLOCK()
-                            sleep_requested = min(.0001, max(0., receive_deadline-begin))
+                            sleep_requested = min(.0001, max(0., write_budget.cutoff(receive_deadline)-begin))
                             timeline.mark('sleep_begin', cycle, sleep_requested)
                             time.sleep(sleep_requested)
                             timeline.mark('sleep_return', cycle)
@@ -735,9 +766,12 @@ def main(a=None):
                             gate('prewrite_fixed_deadline')
                             if a.diagnostic_timing and CLOCK() >= obs.received_at+observation_limit_s:
                                 continue
-                        report['virtual_command_attempted' if a.diagnostic_timing else 'motion_command_attempted'] = True
                         acceleration = None
                         command_phase = 'model'
+                        timeline.mark('prewrite_budget_check', cycle)
+                        if discard_write_budget(obs, receive_deadline):
+                            continue
+                        report['virtual_command_attempted' if a.diagnostic_timing else 'motion_command_attempted'] = True
                         timeline.mark('command_call', cycle)
                         velocity = session.command(action)
                         completed_ns = time.perf_counter_ns()

@@ -3,9 +3,11 @@ from collections import deque
 import threading
 import time
 from receiver import Receiver
+from thread_priority import current_thread_priority
 
 class ThreadedReceiver:
-    def __init__(self,source,session,clock,capacity=64):
+    def __init__(self,source,session,clock,capacity=64,priority='unchanged'):
+        self.priority=priority;self.priority_report=None
         self.source,self.session,self.clock=source,session,clock
         self.capacity=capacity;self.queue=deque();self.lock=threading.Lock()
         self.pending_bytes=0;self._partial=False;self._busy=False;self._polling=False
@@ -45,16 +47,18 @@ class ThreadedReceiver:
         self.worker.start()
     def _run(self):
         try:
-            while not self.stop_event.is_set():
-                begin=self.clock()
-                self._polling=True
-                try:
-                    if not self.raw.poll():self.error=self.error or self.raw.error or 'reader_failed'
-                finally:
-                    self._partial=bool(self.raw._pending)
-                    self._polling=False
-                self.poll_count+=1;self.maximum_poll_s=max(self.maximum_poll_s,self.clock()-begin)
-                time.sleep(.0001)
+            with current_thread_priority(self.priority) as priority_report:
+                self.priority_report=priority_report
+                while not self.stop_event.is_set():
+                    begin=self.clock()
+                    self._polling=True
+                    try:
+                        if not self.raw.poll():self.error=self.error or self.raw.error or 'reader_failed'
+                    finally:
+                        self._partial=bool(self.raw._pending)
+                        self._polling=False
+                    self.poll_count+=1;self.maximum_poll_s=max(self.maximum_poll_s,self.clock()-begin)
+                    time.sleep(.0001)
         except BaseException as exc:
             self.error=self.error or 'reader_exception:'+type(exc).__name__
         finally:self.done.set()
@@ -84,7 +88,7 @@ class ThreadedReceiver:
                 'queue_capacity_frames':self.capacity,'queued_frames':self.queued_count,'drained_frames':self.drained_count,
                 'pending_bytes':self.pending_bytes,'last_source_pending_bytes':self.source_pending,
                 'active_source_backlog_peak_bytes':self.active_backlog_seen,'error':self.error,'poll_count':self.poll_count,
-                'maximum_reader_poll_s':self.maximum_poll_s,
+                'maximum_reader_poll_s':self.maximum_poll_s,'thread_priority':self.priority_report,
                 'scope':'receipt timestamps are host reader parse times, not device sampling; no latest-frame overwrite'}
 
 class ReceiverPort:

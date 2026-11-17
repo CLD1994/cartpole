@@ -63,6 +63,7 @@ class RunnerCombinationTests(unittest.TestCase):
             'samples':[],'inference_attempts_s':[],'discarded_stale_candidates':0,'candidate_refresh_stages':{},
             'duplicate_tick_count':0,'stale_observation_waits':0,'max_stale_observation_age_s':0.,
             'over_period_late_candidates':0,'grid_slots_skipped':0}
+        report['write_budget']={'discard_count':0,'discard_stages':{},'last_discard':None}
         calls=[]
         def forward(state):
             calls.append((clock.now,state))
@@ -72,7 +73,7 @@ class RunnerCombinationTests(unittest.TestCase):
         main=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='main')
         funcs=[]
         for node in main.body:
-            if isinstance(node,ast.FunctionDef) and node.name in ('update_pause','discard_expired_candidate'):
+            if isinstance(node,ast.FunctionDef) and node.name in ('update_pause','discard_expired_candidate','discard_write_budget'):
                 for i,n in enumerate(node.body):
                     if isinstance(n,ast.Nonlocal):node.body[i]=ast.Global(names=n.names)
                 funcs.append(node)
@@ -83,7 +84,7 @@ class RunnerCombinationTests(unittest.TestCase):
             if not diagnostic:raise RuntimeError(reason)
         env=dict(vars(r));env.update(CLOCK=clock,time=SimpleNamespace(perf_counter_ns=lambda:round(clock.now*1e9),sleep=clock.sleep),
             session=session,receiver=receiver,transport=port,policy=SimpleNamespace(forward=forward),
-            timeline=r.GapTimeline(False),cycle=0,report=report,a=SimpleNamespace(diagnostic_timing=diagnostic),pause=r.AnglePause(),gate=gate,
+            write_budget=r.WriteBudget(),timeline=r.GapTimeline(False),cycle=0,report=report,a=SimpleNamespace(diagnostic_timing=diagnostic),pause=r.AnglePause(),gate=gate,
             hard_limit_s=.009,observation_limit_s=.004,inference_limit_s=.002,
             budget_at=10.,last_command_at=10.,start=10.,end=10.+duration,
             grid_start_ns=10_000_000_000,next_tick_ns=10_000_000_000,next_tick=10.,next_slot=0,
