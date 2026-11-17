@@ -441,7 +441,7 @@ def main(a=None):
                         probe.enable_monitor()
                     if a.diagnostic_timing:
                         session.diagnostic_state_events = report['received_states']
-                    receiver = Receiver(transport, session, CLOCK)
+                    receiver = Receiver(transport, session, CLOCK, timeline=timeline if a.gap_timeline else None)
                     # 与固件tools一致：先对齐持续遥测行，再发请求，避免丢查询回执。
                     align_end = CLOCK()+.5
                     while CLOCK() < align_end:

@@ -194,3 +194,7 @@ python deploy/v2/device/run_policy.py --port COM11 --model <导出目录> --velo
 每条事件包含循环编号、主机单调纳秒时间、当前线程 CPU 纳秒时间及相对上一边界的差值；`sleep_begin` 另记请求休眠秒数。相邻边界用于区分等待、接收、推理、命令调用、报告记账与读回检查。`command_call` 到 `command_return` 包含会话检查和串口写调用，不等于线上发送时间；`loop_poll_begin` 到 `poll_done` 包含积压查询、读取、解析及会话处理。`readback_check_return` 不意味着该轮实际发送查询，需结合原读回记录。
 
 墙钟时间减线程 CPU 时间不能进一步区分系统抢占、内核等待、其他线程或运行时影响，线程 CPU 时钟粒度也可能较粗。记录自身有开销，时间差包括记录开销；这些数据不证明固件收讫、设备采样或机械动作时间。报告保留的是尾部，不是完整运行轨迹。
+
+接收器时间线还区分 `receiver_count_call/return`、`receiver_read_call/return` 和 `receiver_remaining_call/return`：分别围住两次 `in_waiting` 与中间实际 `read(count)`，记录已读取的 count、remaining 及返回字节数，不额外查询串口。count 为零时记录 `receiver_read_skipped`，不声称执行 read。第二次查询的返回标记在原有 `end` 时钟采集之后；其 `read_window_s` 是原控制判定使用的 `end - now`，诊断不扣除自身开销、不改变 10 ms 门槛。异常调用可能只有 call 没有 return，需结合 `receive_error` 判断。
+
+这些是 Python 调用区间，不是 Windows API 的内部测量。`read` 内部也可能查询队列和等待系统调用，因此只能定位到调用边界，不能据此断言具体系统调用阻塞、硬件延迟或线程抢占。

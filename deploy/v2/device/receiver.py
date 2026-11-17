@@ -30,8 +30,9 @@ class Receiver:
     """source必须独占且read非阻塞；clock须与session共享单调时间轴。
 
     失败后可继续poll推进有界停机；Session的致命异常（如时钟无效）传播。"""
-    def __init__(self, source: ByteSource, session, clock, limits=ReceiveLimits()):
+    def __init__(self, source: ByteSource, session, clock, limits=ReceiveLimits(), *, timeline=None):
         self.source, self.session, self.clock, self.limits = source, session, clock, limits
+        self.timeline = timeline
         self.error = None
         self._desync = False
         self._pending = b''
@@ -58,14 +59,31 @@ class Receiver:
         if self._partial_since is not None and now-self._partial_since > self.limits.partial_timeout_s:
             return self._fail('partial_timeout')
         try:
+            if self.timeline:
+                self.timeline.mark('receiver_count_call')
             count = self.source.in_waiting
+            if self.timeline:
+                self.timeline.mark('receiver_count_return', io={'count':count})
             if type(count) is not int or not 0 <= count <= self.limits.max_pending:
                 return self._fail('backlog')
-            data = self.source.read(count) if count else b''
+            if count:
+                if self.timeline:
+                    self.timeline.mark('receiver_read_call', io={'count':count})
+                data = self.source.read(count)
+                if self.timeline:
+                    self.timeline.mark('receiver_read_return', io={'read_bytes':len(data) if isinstance(data,bytes) else None})
+            else:
+                data = b''
+                if self.timeline:
+                    self.timeline.mark('receiver_read_skipped', io={'count':count})
+            if self.timeline:
+                self.timeline.mark('receiver_remaining_call')
             remaining = self.source.in_waiting
         except (OSError, ValueError):
             return self._fail('read_error')
         end = self.clock()
+        if self.timeline:
+            self.timeline.mark('receiver_remaining_return', io={'remaining':remaining, 'read_window_s':end-now})
         self.session.tick()
         if not math.isfinite(end) or not 0 <= end-now <= self.limits.max_read_s:
             return self._fail('read_deadline')
