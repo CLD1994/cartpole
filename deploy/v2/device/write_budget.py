@@ -1,6 +1,9 @@
 class WriteBudget:
-    """经验写入预留，不是调度保证；原始写后截止检查仍必须执行。"""
-    reserve_s = .0005
+    """Empirical reserve, not a scheduling guarantee; check active gap after write.
+
+    A late observation is reported and recovered, never silently retimestamped.
+    """
+    reserve_s = .001
 
     def cutoff(self, deadline):
         return deadline - self.reserve_s

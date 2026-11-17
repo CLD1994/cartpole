@@ -101,8 +101,10 @@ class ThreadedTests(unittest.TestCase):
             finally:
                 release.set();self.assertTrue(r.stop_and_join())
             if delay>.01:
-                self.assertEqual(r.error,'read_deadline');self.assertFalse(r.poll())
-                self.assertEqual(s.failure,'application_abort')
+                self.assertIsNone(r.error);self.assertTrue(r.poll())
+                self.assertTrue(r.backlog_pending)
+                self.assertFalse(r.backlog_ready(s.observation))
+                self.assertIsNone(s.failure)
             else:
                 self.assertTrue(r.poll());self.assertEqual(s.observation.received_at,10.+delay)
     def test_partial_snapshot_is_published_before_busy_clears(self):

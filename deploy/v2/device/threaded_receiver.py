@@ -36,7 +36,19 @@ class ThreadedReceiver:
                     with owner.lock:owner._note_backlog(count, 'serial')
                 return count
             def read(self,count):return source.read(count)
-        self.raw=Receiver(ObservedSource(),Sink(),clock)
+        self.slow_windows=deque(maxlen=64);self.slow_window_count=0
+        self.raw=Receiver(ObservedSource(),Sink(),clock,slow_window=self._slow_window)
+    def request_recovery(self, source="control"):
+        with self.lock:self._note_backlog(0, source)
+
+    def _slow_window(self, reason, elapsed):
+        # Called by reader before parsing: preserve bytes and FAULT order, but
+        # fence all candidates until drain + a later receipt on control thread.
+        with self.lock:
+            self.slow_window_count+=1
+            self.slow_windows.append({'reason':reason,'elapsed_s':elapsed,'at':self.clock()})
+            self._note_backlog(0, reason)
+
     @property
     def partial(self):return self._partial or self._busy or self._polling
     @property
@@ -160,6 +172,7 @@ class ThreadedReceiver:
                 'pending_bytes':self.pending_bytes,'last_source_pending_bytes':self.source_pending,
                 'active_source_backlog_peak_bytes':self.active_backlog_seen,'error':self.error,'poll_count':self.poll_count,
                 'maximum_reader_poll_s':self.maximum_poll_s,
+                'slow_windows':{'count':self.slow_window_count,'events':list(self.slow_windows),'hard_window_s':self.raw.hard_window_s},
                 'backlog_recovery':{'warnings':self.backlog_warnings,'recoveries':self.backlog_recoveries,
                     'pending':self.backlog_pending,'wait_checks':self.backlog_waits,
                     'events':list(self.backlog_events),'retained_events':64,

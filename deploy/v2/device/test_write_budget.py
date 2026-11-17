@@ -2,13 +2,13 @@ import unittest
 from write_budget import WriteBudget
 class WriteBudgetTests(unittest.TestCase):
     def test_reserve_floor(self):
-        self.assertEqual(WriteBudget().reserve_s,.0005)
+        self.assertEqual(WriteBudget().reserve_s,.001)
     def test_old_candidate_budget_not_renewed(self):
         b=WriteBudget(); self.assertTrue(b.insufficient(1.003978,1.004))
-        self.assertFalse(b.insufficient(1.003,1.004))
+        self.assertFalse(b.insufficient(1.0029,1.004))
         self.assertTrue(b.insufficient(1.004,1.004))
     def test_cutoff_never_extends_deadline(self):
-        b=WriteBudget(); self.assertEqual(b.cutoff(1.004),1.0035)
+        b=WriteBudget(); self.assertAlmostEqual(b.cutoff(1.004),1.003)
 
 class BudgetCallsiteTests(unittest.TestCase):
     def test_actual_discard_preserves_observation_and_gap_deadlines(self):

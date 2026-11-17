@@ -16,5 +16,5 @@ class Gap15Tests(unittest.TestCase):
         self.assertEqual(len(nodes),2)
         for gap,pause,expected in [(.010,False,(1,0)),(.015,False,(1,1)),(.020,True,(0,0))]:
             totals={'command_gaps_at_or_over_9ms':0,'command_gaps_at_or_over_hard_limit':0}
-            exec(compile(ast.Module(body=nodes,type_ignores=[]),'<actual counters>','exec'),dict(totals=totals,command_gap=gap,intentional_gap=pause,hard_limit_s=.015))
+            exec(compile(ast.Module(body=nodes,type_ignores=[]),'<actual counters>','exec'),dict(totals=totals,command_gap=gap,active_command_gap=0. if pause else gap,intentional_gap=pause,hard_limit_s=.015))
             self.assertEqual(tuple(totals.values()),expected)

@@ -279,3 +279,24 @@ STATE 没有设备采样时间；主机接收时间只用于接收新鲜度，�
 `intentional_pole_recovery_gap` 标记恢复后的首条命令间隔。接收时间不代表设备采样时间。
 只读时序诊断和通用 Session 客户端不采用该容错策略。
 `first_invalid_state` 仅记录首次无效帧，不再等同于退出原因；退出依据应查看 `error`、`session_failure` 和故障快照。
+
+
+### Transient host-delay recovery experiment (runner revision 21)
+
+Use `--command-gap-hard-ms 25 --retry-slow-inference --thread-priority above-normal`
+with the existing continuous-run command. The 25 ms limit is opt-in, not a real-time
+or stability guarantee. It does not change firmware WDT or encoder fault handling.
+
+The threaded reader treats read windows above 10 ms and poll gaps above 20 ms as
+warnings below 100 ms. It preserves frame order and uses the same drain-then-new-
+receipt recovery as backlog and slow inference; it never renews the active command
+budget. Sustained 100 ms delays, invalid bytes/read contracts, partial-frame timeout,
+queue limits, firmware FAULT and invalid cart measurements remain errors.
+
+The empirical pre-write reserve is now 1 ms. Candidates that no longer fit are
+ discarded. A completed write whose observation age exceeds the unchanged 4 ms
+limit cannot be undone: `write_budget.completion_age_warnings` records it and the
+runner drains and recomputes from a later receipt. Exceeding the active command-gap
+limit still stops, including the first write after angle/pole recovery. Host receipt
+and queue boundaries are not proof of device sample age. `slow_windows` and
+`backlog_recovery` retain evidence; no console printing is added to the hot loop.

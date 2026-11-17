@@ -152,3 +152,45 @@ class ReceiverTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'clock_invalid'):
             self.receiver.poll()
         self.source.read.assert_not_called()
+
+
+class SlowWindowTests(ReceiverTests):
+    def tolerant(self):
+        self.warnings=[]
+        self.receiver.slow_window=lambda reason,elapsed:self.warnings.append((reason,elapsed))
+
+    def test_slow_read_preserves_fault_and_invalid_order(self):
+        self.tolerant()
+        self.source.data=b'STATE 2 0 1 0 2\nMODE FAULT AS5600\n'
+        original=self.source.read
+        def slow(n):
+            self.now+=.013
+            return original(n)
+        self.source.read=slow
+        self.assertTrue(self.receiver.poll())
+        self.assertIsNone(self.receiver.error)
+        self.assertEqual([c.args[0] for c in self.session.receive.call_args_list],
+                         ['STATE 2 0 1 0 2','MODE FAULT AS5600'])
+        self.assertEqual(self.warnings[0][0],'read_deadline')
+
+    def test_slow_poll_recovers_without_desync(self):
+        self.tolerant();self.receiver.poll();self.now+=.03
+        self.source.data=b'MODE READY NONE\n'
+        self.assertTrue(self.receiver.poll())
+        self.session.receive.assert_called_once_with('MODE READY NONE')
+        self.assertEqual(self.warnings[0][0],'poll_deadline')
+
+    def test_hard_read_still_fails(self):
+        self.tolerant();self.source.data=b'x\n';original=self.source.read
+        def slow(n):
+            self.now+=.101
+            return original(n)
+        self.source.read=slow
+        self.assertFalse(self.receiver.poll())
+        self.assertEqual(self.receiver.error,'read_deadline')
+        self.session.receive.assert_not_called()
+
+    def test_tolerant_malformed_still_fails(self):
+        self.tolerant();self.source.data=b'\xff\n'
+        self.assertFalse(self.receiver.poll())
+        self.assertEqual(self.receiver.error,'invalid_ascii')

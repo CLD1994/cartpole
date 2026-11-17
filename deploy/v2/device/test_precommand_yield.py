@@ -64,9 +64,9 @@ class PrecommandYieldTests(unittest.TestCase):
         self.assertEqual(self.last[2][0],1)
         self.assertEqual(self.last[1],[])
     def test_real_drain_stops_at_reserved_cutoff_without_extending_deadline(self):
-        self.run_loop(deadline=.0007,reserve=True,clear=False)
+        self.run_loop(deadline=.0012,reserve=True,clear=False)
         clock,sleeps,polls,ctx=self.last
         self.assertTrue(ctx['retry_candidate'])
         self.assertAlmostEqual(clock[0],.0002)
-        self.assertEqual(ctx['receive_deadline'],.0007)
+        self.assertEqual(ctx['receive_deadline'],.0012)
         self.assertTrue(all(0<=s<=.0001 for s in sleeps))

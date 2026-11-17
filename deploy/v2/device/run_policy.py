@@ -32,6 +32,15 @@ COMMAND_GAP_HARD_S = .006
 OBSERVATION_MAX_AGE_S = .004
 
 
+def completion_violation(age, age_limit, gap, gap_limit):
+    """A completed write cannot be undone; distinguish age warning from hard outage."""
+    if gap >= gap_limit:
+        return 'command_gap'
+    if age >= age_limit:
+        return 'observation_age'
+    return None
+
+
 def timing_limits(profile):
     if profile == 'normal':
         return COMMAND_GAP_HARD_S, OBSERVATION_MAX_AGE_S, .002
@@ -311,7 +320,7 @@ def parse_args(argv=None):
     p.add_argument('--velocity-limit-mm-s', type=int, help='显式降低部署速度上限；保留模型动作倍率并饱和限幅，不修改固件配置')
     p.add_argument('--angle-pause-deg', type=float, default=60., help='绝对摆角达到此角度时暂停速度命令')
     p.add_argument('--angle-resume-deg', type=float, default=58., help='绝对摆角回落至此角度时自动重新推理')
-    p.add_argument('--command-gap-hard-ms', type=float, choices=(6., 9., 15.), help='显式覆盖命令硬期限；不改变观测或推理期限')
+    p.add_argument('--command-gap-hard-ms', type=float, choices=(6., 9., 15., 25.), help='显式覆盖命令硬期限；不改变观测或推理期限')
     p.add_argument('--thread-priority', choices=('unchanged','above-normal'), default='unchanged', help='仅本次控制/接收线程优先级，不保证实时')
     p.add_argument('--retry-slow-inference', action='store_true', help='实验：丢弃慢推理动作并等待新观测重算，总时限不变')
     p.add_argument('--gap-timeline', action='store_true', help='记录有界主机分段计时到最终报告，不改变控制时限')
@@ -365,7 +374,7 @@ def main(a=None):
         policy.forward((0., 0., 0., 0.))
     # 外部权重初始化前后均核验；在运行期间不可改动导出文件。
     verified_files = verify_model_files(model, manifest)
-    report = {'loop_interval_scope': 'new-observation decision ticks, not serial command completion', 'runner_revision': 20, 'timing_profile': a.timing_profile, 'control_hz': limits.control_hz, 'grid_period_ns': period_ns, 'action_dim': 1, 'host_angle_gate': not a.diagnostic_timing, 'host_angle_gate_mode': 'disabled_diagnostic' if a.diagnostic_timing else 'pause_resume', 'diagnostic_timing': a.diagnostic_timing, 'discarded_stale_candidates': 0, 'candidate_refresh_stages': {}, 'stale_observation_waits': 0, 'max_stale_observation_age_s': 0., 'grid_slots_skipped': 0, 'over_period_late_candidates': 0, 'readback_refresh': [], 'scheduler': 'absolute-grid-wait-fresh', 'duplicate_tick_count': 0, 'verified_model_files': verified_files, 'status': 'starting', 'scope': '限时真机联调；不是硬实时或真机验收',
+    report = {'loop_interval_scope': 'new-observation decision ticks, not serial command completion', 'runner_revision': 21, 'timing_profile': a.timing_profile, 'control_hz': limits.control_hz, 'grid_period_ns': period_ns, 'action_dim': 1, 'host_angle_gate': not a.diagnostic_timing, 'host_angle_gate_mode': 'disabled_diagnostic' if a.diagnostic_timing else 'pause_resume', 'diagnostic_timing': a.diagnostic_timing, 'discarded_stale_candidates': 0, 'candidate_refresh_stages': {}, 'stale_observation_waits': 0, 'max_stale_observation_age_s': 0., 'grid_slots_skipped': 0, 'over_period_late_candidates': 0, 'readback_refresh': [], 'scheduler': 'absolute-grid-wait-fresh', 'duplicate_tick_count': 0, 'verified_model_files': verified_files, 'status': 'starting', 'scope': '限时真机联调；不是硬实时或真机验收',
               'timing_limits_s': {'command_gap_soft': COMMAND_GAP_SOFT_S, 'command_gap_hard': hard_limit_s, 'observation_max_age': observation_limit_s},
               'rig_requirements': {'protocol_baud': PROTOCOL_BAUD, 'config': limits.config,
                                    'coordinates': dict(RIG_COORDINATES), 'angle_sign': ANGLE_SIGN,
@@ -402,7 +411,7 @@ def main(a=None):
         'last_discard': None, 'scope': 'decision wall time CLOCK()-now; forward wall time separately recorded'}
     report['write_budget'] = {'reserve_s': write_budget.reserve_s,
         'scope': 'fixed empirical host write reserve; not a scheduling guarantee',
-        'discard_count': 0, 'discard_stages': {}, 'last_discard': None}
+        'discard_count': 0, 'discard_stages': {}, 'last_discard': None, 'completion_age_warnings': 0, 'last_completion_warning': None}
     def discard_write_budget(observation, deadline):
         now = CLOCK()
         if not write_budget.insufficient(now, deadline):
@@ -763,6 +772,7 @@ def main(a=None):
                                 check_trial_end(slow_now, end)
                                 if slow_now-budget_at >= hard_limit_s:
                                     gate('command_gap_deadline')
+                                receiver.request_recovery('slow_inference')
                                 # Keep last_sample consumed. Poll faults first, then await new receipt.
                                 continue
                             gate('inference_deadline')
@@ -862,6 +872,7 @@ def main(a=None):
                         completed_at = completed_ns / 1e9
                         timeline.mark('command_return', cycle)
                         command_gap = completed_at-last_command_at
+                        active_command_gap = completed_at-budget_at
                         totals=report['run_totals']
                         totals['command_completions']+=1
                         angle_gap = pause.resumed_since_command and not a.diagnostic_timing
@@ -876,10 +887,9 @@ def main(a=None):
                         totals['command_gaps_over_4ms']+=int(not intentional_gap and command_gap>COMMAND_GAP_SOFT_S)
                         totals['command_gaps_at_or_over_6ms']+=int(not intentional_gap and command_gap>=.006)
                         totals['command_gaps_at_or_over_9ms']+=int(not intentional_gap and command_gap>=.009)
-                        totals['command_gaps_at_or_over_hard_limit']+=int(not intentional_gap and command_gap>=hard_limit_s)
+                        totals['command_gaps_at_or_over_hard_limit']+=int(active_command_gap>=hard_limit_s)
                         totals['maximum_command_gap_s']=max(totals['maximum_command_gap_s'],command_gap)
-                        if not intentional_gap:
-                            totals['maximum_active_command_gap_s']=max(totals['maximum_active_command_gap_s'],command_gap)
+                        totals['maximum_active_command_gap_s']=max(totals['maximum_active_command_gap_s'],active_command_gap)
                         last_command_at = budget_at = completed_at
                         if not a.diagnostic_timing:
                             report['motion_command_sent'] = True
@@ -887,6 +897,7 @@ def main(a=None):
                                                   'control_source': command_phase, 'raw_action': raw, 'velocity_mm_s': velocity, 'acceleration_mm_s2': acceleration,
                                                   'inference_s': inference_s,
                                                   'command_gap_s': command_gap,
+                                                  'active_command_gap_s': active_command_gap,
                                                   'intentional_angle_pause_gap': angle_gap,
                                                   'intentional_pole_recovery_gap': pole_gap,
                                                   'command_gap_soft_warning': not intentional_gap and command_gap > COMMAND_GAP_SOFT_S,
@@ -901,8 +912,18 @@ def main(a=None):
                             probe.record_sample(report['samples'][-1])
                         stage = 'write_completion'
                         timeline.mark(stage, cycle)
-                        if completed_at >= receive_deadline:
+                        violation = completion_violation(completed_at-obs.received_at,
+                            observation_limit_s, active_command_gap, hard_limit_s)
+                        if violation == 'command_gap':
                             gate('write_completion_deadline')
+                        elif violation == 'observation_age':
+                            report['write_budget']['completion_age_warnings'] += 1
+                            report['write_budget']['last_completion_warning'] = {
+                                'completed_at': completed_at, 'observation_received_at': obs.received_at,
+                                'age_s': completed_at-obs.received_at, 'limit_s': observation_limit_s,
+                                'command_gap_s': command_gap, 'active_command_gap_s': active_command_gap, 'already_written': True}
+                            receiver.request_recovery('write_completion_age')
+                        check_trial_end(completed_at, end)
                         # 成功写入且通过硬截止后才推进；短间隔相位恢复并非固定周期保证。
                         next_slot = next_grid_slot(candidate_slot, grid_start_ns, completed_ns, period_ns)
                         skipped = next_slot-candidate_slot-1

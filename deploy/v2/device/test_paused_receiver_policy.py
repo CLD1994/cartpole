@@ -16,7 +16,7 @@ class PausedReceiverPolicyTests(unittest.TestCase):
         r,now=self.make();r.request_pause();r._select_policy()
         self.assertTrue(r.raw.poll());self.assertEqual(r.raw.limits.max_read_s,.1)
         strict,_=self.make();strict._select_policy()
-        self.assertFalse(strict.raw.poll());self.assertEqual(strict.raw.error,'read_deadline')
+        self.assertTrue(strict.raw.poll());self.assertIsNone(strict.raw.error);self.assertTrue(strict.backlog_pending)
     def test_pause_read_over100ms_still_fails(self):
         r,_=self.make(.101);r.request_pause();r._select_policy()
         self.assertFalse(r.raw.poll());self.assertEqual(r.raw.error,'read_deadline')
@@ -48,7 +48,7 @@ class PausedReceiverPolicyTests(unittest.TestCase):
         r,now=self.make(0.);r.request_pause();r._select_policy();self.assertTrue(r.raw.poll())
         now[0]+=.025;self.assertTrue(r.raw.poll())
         r,now=self.make(0.);r._select_policy();self.assertTrue(r.raw.poll())
-        now[0]+=.025;self.assertFalse(r.raw.poll());self.assertEqual(r.raw.error,'poll_deadline')
+        now[0]+=.025;self.assertTrue(r.raw.poll());self.assertIsNone(r.raw.error);self.assertTrue(r.backlog_pending)
     def test_paused_backlog_not_latched_active_backlog_is(self):
         source=NS(in_waiting=200);r=ThreadedReceiver(source,Mock(),lambda:1.)
         r.request_pause();r._polling=True;r._select_policy()
@@ -64,7 +64,7 @@ class PausedReceiverPolicyTests(unittest.TestCase):
         self.assertTrue(r.raw.poll(previous_poll_limit_s=r._previous_poll_limit_s))
         r._select_policy();self.assertIsNone(r._previous_poll_limit_s)
         now[0]+=.025
-        self.assertFalse(r.raw.poll());self.assertEqual(r.raw.error,'poll_deadline')
+        self.assertTrue(r.raw.poll());self.assertIsNone(r.raw.error);self.assertTrue(r.backlog_pending)
     def test_transition_does_not_erase_over100ms_gap(self):
         r,now=self.make(0.);r.request_pause();r._select_policy();self.assertTrue(r.raw.poll())
         now[0]+=.101;r.pause_requested=False;r.resume_pending=True;r._select_policy()
@@ -79,6 +79,6 @@ class PausedReceiverPolicyTests(unittest.TestCase):
         r=ThreadedReceiver(Source(),Mock(),lambda:now[0]);r.request_pause();r._select_policy()
         self.assertTrue(r.raw.poll())
         r.pause_requested=False;r.resume_pending=True;r._select_policy()
-        self.assertFalse(r.raw.poll(previous_poll_limit_s=r._previous_poll_limit_s))
-        self.assertEqual(r.raw.error,'read_deadline')
+        self.assertTrue(r.raw.poll(previous_poll_limit_s=r._previous_poll_limit_s))
+        self.assertIsNone(r.raw.error);self.assertTrue(r.backlog_pending)
 

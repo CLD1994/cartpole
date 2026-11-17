@@ -9,7 +9,7 @@ class SlowInferenceTests(unittest.TestCase):
         node=next(n for n in ast.walk(tree) if isinstance(n,ast.If) and 'inference_limit_s is not None' in ast.unparse(n.test))
         stats={'slow_count':0,'maximum_decision_elapsed_s':0.,'maximum_forward_s':0.,'last_discard':None}
         def gate(reason): raise RuntimeError(reason)
-        ctx=dict(CLOCK=lambda:elapsed,now=0.,inference_s=elapsed,inference_limit_s=.002,
+        ctx=dict(receiver=NS(request_recovery=lambda reason:None),CLOCK=lambda:elapsed,now=0.,inference_s=elapsed,inference_limit_s=.002,
                  a=NS(retry_slow_inference=enabled),report={'slow_inference':stats},
                  budget_at=0.,hard_limit_s=hard,end=1.,check_trial_end=r.check_trial_end,
                  gate=gate,obs=NS(received_at=0.),last_sample=0.)

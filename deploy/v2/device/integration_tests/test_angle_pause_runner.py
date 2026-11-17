@@ -43,9 +43,15 @@ class Port:
         return len(data)
 
 class RunnerCombinationTests(unittest.TestCase):
-    def run_loop(self, angle, duration, policy_hook=None, diagnostic=False, fault_at=None, retry_slow=False, hard_limit=.009, no_new_state=False, backlog_ready=None, invalid_pole=None, resume_hook=None, read_hook=None):
+    def run_loop(self, angle, duration, policy_hook=None, diagnostic=False, fault_at=None, retry_slow=False, hard_limit=.009, no_new_state=False, backlog_ready=None, invalid_pole=None, resume_hook=None, read_hook=None, write_hook=None):
         clock=Clock();port=Port(clock,lambda:angle(clock.now-10))
         port.no_new_state=no_new_state
+        original_write=port.write
+        def write(data):
+            result=original_write(data)
+            if write_hook and data.startswith(b'VEL ') and data != b'VEL 0\n':write_hook(clock)
+            return result
+        port.write=write
         original_read=port.read
         fault_sent=[False]
         def read(n):
@@ -68,6 +74,7 @@ class RunnerCombinationTests(unittest.TestCase):
         receiver.request_pause=lambda:receiver.pause_calls.append(clock.now)
         receiver.resume_ready=lambda obs:resume_hook(clock) if resume_hook else True
         receiver.active_backlog_seen=0
+        receiver.request_recovery=lambda reason:None
         receiver.backlog_ready=backlog_ready or (lambda obs:True)
         report={'angle_pause':{'events':[],'pause_count':0,'resume_count':0,'intentional_completion_gaps':0},
             'readback_refresh':[],'run_totals':dict.fromkeys(('command_completions','command_gaps_over_4ms',
@@ -76,7 +83,7 @@ class RunnerCombinationTests(unittest.TestCase):
             'samples':[],'inference_attempts_s':[],'discarded_stale_candidates':0,'candidate_refresh_stages':{},
             'duplicate_tick_count':0,'stale_observation_waits':0,'max_stale_observation_age_s':0.,
             'over_period_late_candidates':0,'grid_slots_skipped':0}
-        report['write_budget']={'discard_count':0,'discard_stages':{},'last_discard':None}
+        report['write_budget']={'completion_age_warnings':0,'last_completion_warning':None,'discard_count':0,'discard_stages':{},'last_discard':None}
         report['run_totals']['command_gaps_at_or_over_9ms']=0
         report['slow_inference']={'slow_count':0,'maximum_decision_elapsed_s':0.,'maximum_forward_s':0.,'last_discard':None}
         calls=[]
@@ -208,3 +215,22 @@ class RunnerCombinationTests(unittest.TestCase):
         self.assertEqual(report['angle_pause']['pause_count'],0)
 
 if __name__=='__main__':unittest.main()
+
+class RecoveryWriteTests(unittest.TestCase):
+    run_loop = RunnerCombinationTests.run_loop
+    def test_late_write_warns_then_recovers(self):
+        first=[True]
+        def delay(clock):
+            if first[0]:clock.now+=.0045;first[0]=False
+        port,report,calls=self.run_loop(lambda t:0,.03,hard_limit=.025,write_hook=delay)
+        self.assertEqual(report['write_budget']['completion_age_warnings'],1)
+        self.assertTrue(report['write_budget']['last_completion_warning']['already_written'])
+        self.assertGreater(len(report['samples']),1)
+    def test_angle_resume_write_still_obeys_hard_limit(self):
+        def angle(t):return 70 if t<.01 else 0
+        with self.assertRaisesRegex(RuntimeError,'write_completion_deadline'):
+            self.run_loop(angle,.06,hard_limit=.025,write_hook=lambda c:setattr(c,'now',c.now+.03))
+    def test_pole_resume_write_still_obeys_hard_limit(self):
+        with self.assertRaisesRegex(RuntimeError,'write_completion_deadline'):
+            self.run_loop(lambda t:0,.06,invalid_pole=lambda t:t<.01,
+                hard_limit=.025,write_hook=lambda c:setattr(c,'now',c.now+.03))
