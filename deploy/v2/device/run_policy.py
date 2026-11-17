@@ -311,6 +311,7 @@ def parse_args(argv=None):
     p.add_argument('--angle-resume-deg', type=float, default=58., help='绝对摆角回落至此角度时自动重新推理')
     p.add_argument('--command-gap-hard-ms', type=float, choices=(6., 9., 15.), help='显式覆盖命令硬期限；不改变观测或推理期限')
     p.add_argument('--thread-priority', choices=('unchanged','above-normal'), default='unchanged', help='仅本次控制/接收线程优先级，不保证实时')
+    p.add_argument('--retry-slow-inference', action='store_true', help='实验：丢弃慢推理动作并等待新观测重算，总时限不变')
     p.add_argument('--gap-timeline', action='store_true', help='记录有界主机分段计时到最终报告，不改变控制时限')
     p.add_argument('--json', action='store_true', help='终端输出机器可读摘要 JSON')
     duration_args = p.add_mutually_exclusive_group()
@@ -394,6 +395,9 @@ def main(a=None):
             '模式门要求DISABLED，物理门及时间超限记录后继续，不代表运动可以继续',
             'FAULT/速度失效/坏帧/元数据过期/接收器错误仍退出',
             '超限后的样本是反事实延续；真实runner会在首次超限停止']
+    report['slow_inference'] = {'enabled': bool(getattr(a, 'retry_slow_inference', False)),
+        'slow_count': 0, 'maximum_decision_elapsed_s': 0., 'maximum_forward_s': 0.,
+        'last_discard': None, 'scope': 'decision wall time CLOCK()-now; forward wall time separately recorded'}
     report['write_budget'] = {'reserve_s': write_budget.reserve_s,
         'scope': 'fixed empirical host write reserve; not a scheduling guarantee',
         'discard_count': 0, 'discard_stages': {}, 'last_discard': None}
@@ -698,6 +702,20 @@ def main(a=None):
                         totals['inference_total_s']+=inference_s
                         totals['maximum_inference_s']=max(totals['maximum_inference_s'],inference_s)
                         if inference_limit_s is not None and CLOCK()-now > inference_limit_s:
+                            if getattr(a, 'retry_slow_inference', False):
+                                slow_now = CLOCK()
+                                info = report['slow_inference']
+                                info['slow_count'] += 1
+                                info['maximum_decision_elapsed_s'] = max(info['maximum_decision_elapsed_s'], slow_now-now)
+                                info['maximum_forward_s'] = max(info['maximum_forward_s'], inference_s)
+                                info['last_discard'] = {'reason': 'slow_inference', 'clock_s': slow_now,
+                                    'decision_elapsed_s': slow_now-now, 'forward_s': inference_s,
+                                    'observation_received_clock_s': obs.received_at}
+                                check_trial_end(slow_now, end)
+                                if slow_now-budget_at >= hard_limit_s:
+                                    gate('command_gap_deadline')
+                                # Keep last_sample consumed. Poll faults first, then await new receipt.
+                                continue
                             gate('inference_deadline')
                         if CLOCK()-obs.received_at >= observation_limit_s:
                             if discard_expired_candidate(obs):

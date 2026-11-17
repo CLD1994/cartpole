@@ -221,3 +221,8 @@ python deploy/v2/device/run_policy.py --port COM11 --model <导出目录> --velo
 可选 `--thread-priority above-normal`：仅本进程的控制线程及接收线程请求 Windows ABOVE_NORMAL，非实时优先级；默认 `unchanged` 不改。每个线程自己设置并在退出时恢复原值，报告 `control_thread_priority` 和 `threaded_receiver.thread_priority` 记录请求、实际读回、失败及恢复结果。不改变进程优先级或永久系统配置，也不保证时限。其他平台不支持时如实记录。
 
 本次实验可显式指定 `--command-gap-hard-ms 15`；默认与其他 timing profile 不变，正常观测上限仍为 4 ms。`run_totals` 分别保留成功指令间隔大于 4 ms、达到 6/9 ms、达到本次 hard limit 的计数，排除有意暂停间隔。成功指令间隔最大值不包括最后一条尚未写出的超限空档，该空档应看 `failure_snapshot.actual_command_gap_s`。
+
+
+### 慢推理候选重试实验
+
+显式 `--retry-slow-inference` 将原 `CLOCK()-now > 2 ms` 慢候选处置改为记录并丢弃，不发送其动作；默认仍按原策略退出。这个判据是决策阶段墙钟（包含推理前检查），不是 CPU 耗时；`slow_inference` 同时记录 `forward_s`、`decision_elapsed_s`、计数、最大值和最后丢弃原因。等于 2 ms 不触发慢判据。丢弃后保留已消费观测标记，下一轮先处理全部故障/无效帧，再等待真正新接收观测重新推理。没有新观测或反复慢推理仍受原指令总预算约束；本实验指定 15 ms，观测 4 ms、写入预留 0.5 ms、倒杆暂停及写后检查均不变。这不是让旧动作带着新时间戳继续发送。

@@ -26,7 +26,7 @@ class Port:
             'POLE_ZERO_URAD':0,'POLE_INV':1,'X_INV':0,'STEP_LOSS_UM':3000}
     @property
     def in_waiting(self):
-        if self.last != self.clock.now:
+        if self.last != self.clock.now and not (getattr(self,'no_new_state',False) and self.clock.now>10.):
             self.pending += f'STATE 3 0 {round(math.radians(self.angle())*1e6)} 0 0\n'.encode()
             self.last=self.clock.now
         return len(self.pending)
@@ -42,8 +42,9 @@ class Port:
         return len(data)
 
 class RunnerCombinationTests(unittest.TestCase):
-    def run_loop(self, angle, duration, policy_hook=None, diagnostic=False, fault_at=None):
+    def run_loop(self, angle, duration, policy_hook=None, diagnostic=False, fault_at=None, retry_slow=False, hard_limit=.009, no_new_state=False):
         clock=Clock();port=Port(clock,lambda:angle(clock.now-10))
+        port.no_new_state=no_new_state
         original_read=port.read
         def read(n):
             data=original_read(n)
@@ -65,6 +66,7 @@ class RunnerCombinationTests(unittest.TestCase):
             'over_period_late_candidates':0,'grid_slots_skipped':0}
         report['write_budget']={'discard_count':0,'discard_stages':{},'last_discard':None}
         report['run_totals']['command_gaps_at_or_over_9ms']=0
+        report['slow_inference']={'slow_count':0,'maximum_decision_elapsed_s':0.,'maximum_forward_s':0.,'last_discard':None}
         calls=[]
         def forward(state):
             calls.append((clock.now,state))
@@ -85,12 +87,13 @@ class RunnerCombinationTests(unittest.TestCase):
             if not diagnostic:raise RuntimeError(reason)
         env=dict(vars(r));env.update(CLOCK=clock,time=SimpleNamespace(perf_counter_ns=lambda:round(clock.now*1e9),sleep=clock.sleep),
             session=session,receiver=receiver,transport=port,policy=SimpleNamespace(forward=forward),
-            write_budget=r.WriteBudget(),timeline=r.GapTimeline(False),cycle=0,report=report,a=SimpleNamespace(diagnostic_timing=diagnostic),pause=r.AnglePause(),gate=gate,
-            hard_limit_s=.009,observation_limit_s=.004,inference_limit_s=.002,
+            write_budget=r.WriteBudget(),timeline=r.GapTimeline(False),cycle=0,report=report,a=SimpleNamespace(diagnostic_timing=diagnostic,retry_slow_inference=retry_slow),pause=r.AnglePause(),gate=gate,
+            hard_limit_s=hard_limit,observation_limit_s=.004,inference_limit_s=.002,
             budget_at=10.,last_command_at=10.,start=10.,end=10.+duration,
             grid_start_ns=10_000_000_000,next_tick_ns=10_000_000_000,next_tick=10.,next_slot=0,
             period_ns=2_000_000,last_sample=None,last_tick=None,intervals=[],probe=None,
             refresh=r.ReadbackCycle(port,report['readback_refresh'],10.))
+        self.last_run=(port,report,calls,env)
         with patch.object(r,'CLOCK',clock):
             code=compile(ast.fix_missing_locations(ast.Module(body=funcs+[loop],type_ignores=[])),'<actual-runner-loop>','exec')
             try:exec(code,env)
