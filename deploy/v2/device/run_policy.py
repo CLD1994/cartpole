@@ -13,8 +13,15 @@ from experiment_setup import (limits_from_manifest, PROTOCOL_BAUD, RIG_COORDINAT
                               ANGLE_SIGN, report_path, result_summary)
 from model_integrity import verify_model_files
 from receiver import Receiver
+from threaded_receiver import ThreadedReceiver, ReceiverPort
+from write_budget import WriteBudget
+from thread_priority import current_thread_priority
 from session import Session, Phase
 from step_loss_events import StepLossEventMixin
+from angle_pause import AnglePause
+from pole_recovery import PoleRecoverySessionMixin
+from gap_timeline import GapTimeline
+from state_frame import parse_state
 
 
 CONFIG_KEYS = ('VEL_MAX', 'ACC_MAX', 'WDT_MS', 'X_MARGIN_UM',
@@ -23,6 +30,15 @@ GRID_PERIOD_NS = 2_000_000
 COMMAND_GAP_SOFT_S = .004
 COMMAND_GAP_HARD_S = .006
 OBSERVATION_MAX_AGE_S = .004
+
+
+def completion_violation(age, age_limit, gap, gap_limit):
+    """A completed write cannot be undone; distinguish age warning from hard outage."""
+    if gap >= gap_limit:
+        return 'command_gap'
+    if age >= age_limit:
+        return 'observation_age'
+    return None
 
 
 def timing_limits(profile):
@@ -64,16 +80,21 @@ class ControlTransport:
     """只允许查询、会话速度命令和禁用，拒绝ENABLE/配置/定位。"""
     def __init__(self, port):
         self.port = port
-        self.partial = False
+        self._partial = False
+        self.reader = None
 
     @property
     def in_waiting(self):
-        return self.port.in_waiting
+        return self.reader.in_waiting if self.reader is not None else self.port.in_waiting
+
+    @property
+    def partial(self):
+        return self.reader.partial if self.reader is not None else self._partial
 
     def read(self, count):
         data = self.port.read(count)
         if data:
-            self.partial = not data.endswith(b"\n")
+            self._partial = not data.endswith(b"\n")
         return data
 
     def write(self, data):
@@ -88,12 +109,28 @@ class ControlTransport:
         return self.port.write(data)
 
 
-class BoundSession(Session):
+class BoundSession(PoleRecoverySessionMixin, Session):
     """把本次台位坐标参数纳入既有新鲜读回及运行中变化检查。"""
     enforce_position_limits = False  # User-selected firmware-owned position limits.
     def __init__(self, transport, clock, limits, coordinates):
         self.coordinates = dict(coordinates)
+        self.first_invalid_state = None
         super().__init__(transport, clock, limits)
+
+    def receive(self, line):
+        # 正常双路有效帧不额外解析；只保存活动会话首次无效帧。
+        if (self.first_invalid_state is None and self.phase == Phase.ACTIVE
+                and line.startswith(('STATE 0 ', 'STATE 1 ', 'STATE 2 '))):
+            try:
+                frame = parse_state(line)
+            except ValueError:
+                pass  # 格式错误仍交既有会话处理，不伪造有效位证据。
+            else:
+                self.first_invalid_state = {
+                    'raw_line': line, 'flags': int(line.split()[1]),
+                    'cart_valid': frame.cart is not None, 'pole_valid': frame.pole is not None,
+                    'host_received_clock_s': self._receipt_time(self.clock()), 'phase': self.phase.value}
+        super().receive(line)
 
     @property
     def expected_readback(self):
@@ -144,6 +181,7 @@ class DiagnosticTransport(ControlTransport):
 
 
 class DiagnosticSession(BoundSession):
+    allow_pole_recovery = False
     required_active_mode = ('DISABLED', 'NONE')
 
     def receive(self, line):
@@ -233,9 +271,44 @@ def guard_snapshot(obs, session, starting=False):
             'limits': {'max_abs_x_m': None,
                        'position_owner': 'firmware',
                        'max_abs_theta_rad': None,
+                       'angle_limit_scope': 'terminal_gate_disabled; pause_resume_thresholds_in_report_angle_pause',
                        'max_abs_vx_m_s': .05 if starting else None,
                        'max_abs_omega_rad_s': .5 if starting else None},
             'reason': state_guard(obs, session, starting) if obs else 'measurement_unavailable'}
+
+
+def await_startup(session, receiver, transport, report, *, clock=CLOCK, sleep=time.sleep):
+    """两秒内刷新只读证据，保存首次和最后阻碍；不使能或发送运动。"""
+    started = clock()
+    next_refresh = started + .5
+    detail = report['startup_preflight'] = {'first_blocker': None, 'last_blocker': None, 'refresh_count': 0}
+    reason = 'startup_no_data'
+    while clock() - started < 2.:
+        if not receiver.poll() or session.failure:
+            raise RuntimeError(receiver.error or session.failure)
+        reason = session.preflight_reason()
+        if reason is None and 'STEP_LOSS_UM' not in session.values:
+            reason = 'readback_STEP_LOSS_UM'
+        if reason is None and (transport.partial or transport.in_waiting):
+            reason = 'startup_receive_pending'
+        if reason is None:
+            detail['complete'] = True
+            return
+        now = clock()
+        snapshot = {'reason': reason, 'elapsed_s': now-started,
+                    'mode': session.mode, 'mode_age_s': now-session._mode_at if math.isfinite(session._mode_at) else None,
+                    'readback': {k:v[0] for k,v in session.values.items()},
+                    'expected_readback': dict(session.expected_readback)}
+        if detail['first_blocker'] is None:
+            detail['first_blocker'] = snapshot
+        detail['last_blocker'] = snapshot
+        if now >= next_refresh:
+            session.refresh()
+            detail['refresh_count'] += 1
+            next_refresh = now + .5
+        sleep(.0002)
+    detail['complete'] = False
+    raise RuntimeError('preflight:' + reason)
 
 
 def parse_args(argv=None):
@@ -243,6 +316,14 @@ def parse_args(argv=None):
     p.add_argument('--port', required=True)
     p.add_argument('--model', required=True, type=Path, help='含 policy.onnx 与 model.json 的导出目录')
     p.add_argument('--output', type=Path, help='完整报告；默认在模型 runs 目录生成唯一文件')
+    p.add_argument('--acceleration-limit-mm-s2', type=int, help='显式部署加速度上限，精确核验固件读回；不修改模型训练参数')
+    p.add_argument('--velocity-limit-mm-s', type=int, help='显式降低部署速度上限；保留模型动作倍率并饱和限幅，不修改固件配置')
+    p.add_argument('--angle-pause-deg', type=float, default=20., help='绝对摆角达到此角度时暂停速度命令')
+    p.add_argument('--angle-resume-deg', type=float, default=18., help='绝对摆角回落至此角度时自动重新推理')
+    p.add_argument('--command-gap-hard-ms', type=float, choices=(6., 9., 15., 25.), help='显式覆盖命令硬期限；不改变观测或推理期限')
+    p.add_argument('--thread-priority', choices=('unchanged','above-normal'), default='unchanged', help='仅本次控制/接收线程优先级，不保证实时')
+    p.add_argument('--retry-slow-inference', action='store_true', help='实验：丢弃慢推理动作并等待新观测重算，总时限不变')
+    p.add_argument('--gap-timeline', action='store_true', help='记录有界主机分段计时到最终报告，不改变控制时限')
     p.add_argument('--json', action='store_true', help='终端输出机器可读摘要 JSON')
     duration_args = p.add_mutually_exclusive_group()
     duration_args.add_argument('--seconds', type=float, default=5.)
@@ -254,6 +335,10 @@ def parse_args(argv=None):
     p.add_argument('--timing-profile', choices=('normal', 'debug'), default='normal',
                    help='debug显式采用15ms命令/12ms观测期限；不是硬实时保证')
     a = p.parse_args(argv)
+    try:
+        AnglePause(a.angle_pause_deg, a.angle_resume_deg)
+    except ValueError:
+        p.error('摆角必须满足 0 <= resume < pause <= 180')
     event_diag = a.step_loss_monitor
     if a.continuous and a.diagnostic_timing:
         p.error('--continuous不能与只读诊断组合')
@@ -275,19 +360,26 @@ def main(a=None):
     model = a.model / 'policy.onnx'
     manifest = load_manifest(a.model / 'model.json', model)
     hard_limit_s, observation_limit_s, inference_limit_s = timing_limits(a.timing_profile)
+    if a.command_gap_hard_ms is not None:
+        hard_limit_s = a.command_gap_hard_ms / 1000.
+    pause = AnglePause(a.angle_pause_deg, a.angle_resume_deg)
+    timeline = GapTimeline(a.gap_timeline)
+    cycle = 0
+    write_budget = WriteBudget()
     period_ns = 1_000_000_000 // manifest['training_control_hz']
-    limits = limits_from_manifest(manifest)
+    limits = limits_from_manifest(manifest, velocity_limit_mm_s=getattr(a, "velocity_limit_mm_s", None),
+                                  acceleration_limit_mm_s2=getattr(a, "acceleration_limit_mm_s2", None))
     policy = Policy(model)
     for _ in range(20):
         policy.forward((0., 0., 0., 0.))
     # 外部权重初始化前后均核验；在运行期间不可改动导出文件。
     verified_files = verify_model_files(model, manifest)
-    report = {'loop_interval_scope': 'new-observation decision ticks, not serial command completion', 'runner_revision': 17, 'timing_profile': a.timing_profile, 'control_hz': limits.control_hz, 'grid_period_ns': period_ns, 'action_dim': 1, 'host_angle_gate': False, 'diagnostic_timing': a.diagnostic_timing, 'discarded_stale_candidates': 0, 'candidate_refresh_stages': {}, 'stale_observation_waits': 0, 'max_stale_observation_age_s': 0., 'grid_slots_skipped': 0, 'over_period_late_candidates': 0, 'readback_refresh': [], 'scheduler': 'absolute-grid-wait-fresh', 'duplicate_tick_count': 0, 'verified_model_files': verified_files, 'status': 'starting', 'scope': '限时真机联调；不是硬实时或真机验收',
+    report = {'loop_interval_scope': 'new-observation decision ticks, not serial command completion', 'runner_revision': 21, 'timing_profile': a.timing_profile, 'control_hz': limits.control_hz, 'grid_period_ns': period_ns, 'action_dim': 1, 'host_angle_gate': not a.diagnostic_timing, 'host_angle_gate_mode': 'disabled_diagnostic' if a.diagnostic_timing else 'pause_resume', 'diagnostic_timing': a.diagnostic_timing, 'discarded_stale_candidates': 0, 'candidate_refresh_stages': {}, 'stale_observation_waits': 0, 'max_stale_observation_age_s': 0., 'grid_slots_skipped': 0, 'over_period_late_candidates': 0, 'readback_refresh': [], 'scheduler': 'absolute-grid-wait-fresh', 'duplicate_tick_count': 0, 'verified_model_files': verified_files, 'status': 'starting', 'scope': '限时真机联调；不是硬实时或真机验收',
               'timing_limits_s': {'command_gap_soft': COMMAND_GAP_SOFT_S, 'command_gap_hard': hard_limit_s, 'observation_max_age': observation_limit_s},
               'rig_requirements': {'protocol_baud': PROTOCOL_BAUD, 'config': limits.config,
                                    'coordinates': dict(RIG_COORDINATES), 'angle_sign': ANGLE_SIGN,
                                    'x_sign': 1, 'action_sign': 1},
-              'model_manifest': manifest, 'clock': vars(time.get_clock_info('perf_counter')),
+              'deployment_acceleration': {'training_mm_s2': limits.acceleration_mm_s2, 'firmware_limit_mm_s2': limits.firmware_acceleration_mm_s2, 'distribution_shift': limits.firmware_acceleration_mm_s2 != limits.acceleration_mm_s2}, 'deployment_velocity': {'model_scale_mm_s': limits.speed_mm_s, 'firmware_limit_mm_s': limits.firmware_speed_mm_s, 'mapping': 'training_scale_then_saturation', 'distribution_shift': limits.firmware_speed_mm_s != limits.speed_mm_s}, 'model_manifest': manifest, 'clock': vars(time.get_clock_info('perf_counter')),
               'continuous': a.continuous, 'requested_seconds': None if a.continuous else a.seconds, 'samples': [], 'received_states': [], 'inference_attempts_s': [], 'would_stop_count_scope': 'gate invocation counts, not independent faults or failed cycles', 'would_stop': {}, 'virtual_command_attempted': False, 'motion_command_sent': False, 'motion_command_attempted': False}
     if a.step_loss_monitor:
         report['step_loss_monitor_config'] = {'model_continues': True, 'event_run_matches_current_firmware_run_verified': False, 'event_wait_timeout_s': None, 'pre_event_sample_limit': 400, 'post_event_sample_limit': 2000, 'scope': '首个同run事件的控制决策样本窗口；非全部串口STATE、非固定物理时长；完成后不被尾缓冲覆盖'}
@@ -300,8 +392,13 @@ def main(a=None):
         report['readback_refresh'] = deque(maxlen=512)
         report['retention'] = {'samples':10000,'inference_attempts':10000,'intervals':10000,
                                'readback_groups':512,'scope':'recent bounded tail, not complete run'}
+    report['angle_pause'] = {'enabled': not a.diagnostic_timing,
+        'enter_deg': a.angle_pause_deg, 'resume_deg': a.angle_resume_deg,
+        'events': [],
+        'pause_count': 0, 'resume_count': 0, 'intentional_completion_gaps': 0}
     report['run_totals'] = {'command_completions':0,'command_gaps_over_4ms':0,
-        'command_gaps_at_or_over_6ms':0,'command_gaps_at_or_over_hard_limit':0,'maximum_command_gap_s':0.,
+        'command_gaps_at_or_over_6ms':0,'command_gaps_at_or_over_9ms':0,'command_gaps_at_or_over_hard_limit':0,'maximum_command_gap_s':0.,'maximum_active_command_gap_s':0.,
+        'command_gap_scope':'maximum_command_gap_s includes intentional pauses; active maximum and over-limit counts exclude marked pause gaps',
         'inference_attempts':0,'inference_total_s':0.,'maximum_inference_s':0.}
     if a.diagnostic_timing:
         report['scope'] = 'DISABLED同路径只读诊断；虚拟命令完成不包含真实串口动作写入/设备运动负载'
@@ -309,15 +406,60 @@ def main(a=None):
             '模式门要求DISABLED，物理门及时间超限记录后继续，不代表运动可以继续',
             'FAULT/速度失效/坏帧/元数据过期/接收器错误仍退出',
             '超限后的样本是反事实延续；真实runner会在首次超限停止']
+    report['slow_inference'] = {'enabled': bool(getattr(a, 'retry_slow_inference', False)),
+        'slow_count': 0, 'maximum_decision_elapsed_s': 0., 'maximum_forward_s': 0.,
+        'last_discard': None, 'scope': 'decision wall time CLOCK()-now; forward wall time separately recorded'}
+    report['write_budget'] = {'reserve_s': write_budget.reserve_s,
+        'scope': 'fixed empirical host write reserve; not a scheduling guarantee',
+        'discard_count': 0, 'discard_stages': {}, 'last_discard': None, 'completion_age_warnings': 0, 'last_completion_warning': None}
+    def discard_write_budget(observation, deadline):
+        now = CLOCK()
+        if not write_budget.insufficient(now, deadline):
+            return False
+        check_trial_end(now, end)
+        if now >= budget_at + hard_limit_s:
+            gate('command_gap_deadline')
+        info = report['write_budget']
+        info['discard_count'] += 1
+        info['discard_stages'][stage] = info['discard_stages'].get(stage, 0) + 1
+        info['last_discard'] = {'reason': 'insufficient_write_budget', 'stage': stage,
+            'clock_s': now, 'deadline_clock_s': deadline, 'remaining_s': deadline-now,
+            'observation_received_clock_s': observation.received_at}
+        # last_sample remains consumed: outer loop must await a genuinely new receipt.
+        return True
     def gate(reason):
         if not a.diagnostic_timing:
             raise RuntimeError(reason)
         row = report['would_stop'].setdefault(reason, {'count': 0, 'first_clock_s': CLOCK(), 'last_clock_s': None})
         row['count'] += 1
         row['last_clock_s'] = CLOCK()
+    def update_pause(observation, now):
+        nonlocal budget_at
+        if a.diagnostic_timing:
+            return None
+        if pause.paused:
+            eligible = (observation is not None and now-observation.received_at < observation_limit_s
+                        and abs(observation.si()[1]) <= pause.resume)
+            if not eligible:
+                receiver.request_pause()
+            elif not receiver.resume_ready(observation):
+                return None
+        transition = pause.check(observation, now, budget_at, hard_limit_s, observation_limit_s)
+        if transition:
+            info = report['angle_pause']
+            info['pause_count' if transition == 'paused' else 'resume_count'] += 1
+            info['events'].append({'event': transition, 'elapsed_s': now-start,
+                                   'abs_angle_deg': abs(math.degrees(observation.si()[1]))})
+            del info['events'][:-512]
+            if transition == 'paused':
+                receiver.request_pause()
+            if transition == 'resumed':
+                receiver.active = True
+                budget_at = now
+        return transition
     def discard_expired_candidate(observation):
         check_trial_end(CLOCK(), end)
-        if not candidate_refresh_allowed(CLOCK(), observation.received_at, last_command_at, end,
+        if not candidate_refresh_allowed(CLOCK(), observation.received_at, budget_at, end,
                                          observation_limit_s, hard_limit_s):
             return False
         report['discarded_stale_candidates'] += 1
@@ -330,7 +472,7 @@ def main(a=None):
         session = receiver = probe = None
         intervals = deque(maxlen=10000) if a.continuous else []
         stage = 'startup'
-        start = end = last_command_at = next_tick = next_slot = None
+        start = end = last_command_at = budget_at = next_tick = next_slot = None
         drain = refresh = None
         # Startup evidence only; no synchronous disk writes in the active control loop.
         initial_manifest = {k:v for k,v in report.items() if not isinstance(v,deque)}
@@ -339,9 +481,11 @@ def main(a=None):
         port = serial.Serial(port=None, baudrate=PROTOCOL_BAUD, timeout=0, write_timeout=.002)
         port.dtr = port.rts = False
         port.port = a.port
+        connection = ReceiverPort(port)
         try:
             a.serial_open_attempted = True
-            with port:
+            with current_thread_priority(getattr(a, 'thread_priority', 'unchanged')) as priority_report, connection:
+                report['control_thread_priority'] = priority_report
                 try:
                     port.reset_input_buffer()
                     transport = (DiagnosticTransport if a.diagnostic_timing else ControlTransport)(port)
@@ -352,7 +496,8 @@ def main(a=None):
                         probe.enable_monitor()
                     if a.diagnostic_timing:
                         session.diagnostic_state_events = report['received_states']
-                    receiver = Receiver(transport, session, CLOCK)
+                    receiver = ThreadedReceiver(port, session, CLOCK, priority=getattr(a, 'thread_priority', 'unchanged'))
+                    connection.reader = receiver
                     # 与固件tools一致：先对齐持续遥测行，再发请求，避免丢查询回执。
                     align_end = CLOCK()+.5
                     while CLOCK() < align_end:
@@ -363,20 +508,10 @@ def main(a=None):
                             time.sleep(.0002)
                     else:
                         raise RuntimeError('initial_alignment_timeout')
+                    transport.reader = receiver
+                    receiver.start()
                     session.observe()
-                    end = CLOCK() + 2.
-                    # 收集启动读回；不在循环内等待操作者使能，不发送运动。
-                    while CLOCK() < end:
-                        if not receiver.poll() or session.failure:
-                            raise RuntimeError(receiver.error or session.failure)
-                        if (session.preflight_reason() is None
-                                and 'STEP_LOSS_UM' in session.values
-                                and not transport.partial and transport.in_waiting == 0):
-                            break
-                        time.sleep(.0002)
-                    reason = session.preflight_reason()
-                    if reason:
-                        raise RuntimeError('preflight:' + reason)
+                    await_startup(session, receiver, transport, report)
                     report['device_snapshot'] = session.bind_calibration()
                     report['coordinate_mapping'] = {'x_sign': 1, 'action_sign': 1, 'angle_sign': ANGLE_SIGN}
                     report['position_boundary'] = {
@@ -402,7 +537,7 @@ def main(a=None):
                             if CLOCK()-probe_at >= .2:
                                 raise RuntimeError('single_config_readback_unsupported_or_timeout')
                             entry = session.values.get('VEL_MAX')
-                            if (entry and entry[1] > probe_at and entry[0] == limits.speed_mm_s
+                            if (entry and entry[1] > probe_at and entry[0] == limits.firmware_speed_mm_s
                                     and not transport.partial and transport.in_waiting == 0):
                                 report['single_config_capability'] = {
                                     'verified': True, 'response_s': CLOCK()-probe_at}
@@ -421,6 +556,7 @@ def main(a=None):
                         raise RuntimeError('preflight_receive_incomplete')
                     if event_diag:
                         session.run_query_pending = True
+                        session.run_query_sent_at = CLOCK()
                         if transport.write(b'RUN?\n') != 5:
                             raise RuntimeError('run_query_write')
                         run_deadline = CLOCK() + .2
@@ -436,43 +572,126 @@ def main(a=None):
                             print('事件记录：同 run STEP_LOSS 仅记录；FAULT 仍停车，Ctrl+C 停止。', flush=True)
                     if not a.json:
                         duration = '持续运行，Ctrl+C 停止' if a.continuous else f'{a.seconds:g} 秒'
-                        print(f'预检通过：{limits.control_hz:g} Hz，{limits.speed_mm_s} mm/s，{limits.acceleration_mm_s2} mm/s²；{duration}。', flush=True)
+                        print(f'预检通过：{limits.control_hz:g} Hz，{limits.speed_mm_s} mm/s 模型倍率，{limits.firmware_speed_mm_s} mm/s 部署限幅，{limits.firmware_acceleration_mm_s2} mm/s² 部署加速度（训练 {limits.acceleration_mm_s2}）；{duration}。', flush=True)
                         print(f'报告：{a.output}', flush=True)
                     session.start()
+                    receiver.active = True
                     grid_start_ns = time.perf_counter_ns()
                     start = next_tick = grid_start_ns / 1e9
                     next_slot = 0
                     next_tick_ns = grid_start_ns
                     end = math.inf if a.continuous else start + a.seconds
                     last_tick = last_sample = None
-                    last_command_at = start
+                    pole_resumed_since_command = False
+                    last_command_at = budget_at = start
                     if a.continuous or a.seconds > .5:
                         refresh = ReadbackCycle(transport, report['readback_refresh'], start)
                     while CLOCK() < end:
                         # 长窗口轮转刷新；命令6ms硬限、观测4ms及1秒元数据TTL独立。
                         stage = 'poll'
-                        if transport.in_waiting > 128:
-                            raise RuntimeError('active_backlog')
+                        cycle += 1
+                        timeline.mark('loop_poll_begin', cycle)
                         if not receiver.poll() or session.phase != Phase.ACTIVE:
                             raise RuntimeError(receiver.error or session.failure or 'session_inactive')
                         now_ns = time.perf_counter_ns()
+                        timeline.mark('poll_done', cycle)
                         now = now_ns / 1e9
                         if refresh:
                             refresh.update(session, now)
+                            timeline.mark('readback_update_done', cycle)
+                        if session.pole_waiting and not a.diagnostic_timing:
+                            stage = 'pole_recovery_wait'
+                            timeline.mark(stage, cycle)
+                            if not session.pole_pause_requested:
+                                if not pause.paused and session.pole_wait_at-budget_at >= hard_limit_s:
+                                    gate('command_gap_deadline')
+                                receiver.request_pause()
+                                session.pole_pause_requested = True
+                            observation = session.observation
+                            eligible = (observation is not None
+                                        and now-observation.received_at < observation_limit_s
+                                        and observation.received_at > session.pole_wait_at)
+                            if not eligible:
+                                receiver.request_pause()
+                            if not eligible or not receiver.resume_ready(observation):
+                                if refresh:
+                                    refresh.send_if_due(now, end)
+                                check_trial_end(CLOCK(), end)
+                                time.sleep(.0001)
+                                continue
+                            # 只接受恢复后的新有效观测，不发送暂停前候选。
+                            if not session.finish_pole_recovery(observation_limit_s):
+                                receiver.request_pause()
+                                continue
+                            receiver.active = True
+                            budget_at = CLOCK()
+                            pole_resumed_since_command = True
+                            next_slot = next_grid_slot(next_slot, grid_start_ns, time.perf_counter_ns(), period_ns)
+                            next_tick_ns = grid_start_ns + next_slot*period_ns
+                            next_tick = next_tick_ns/1e9
+                            last_sample = last_tick = None
+                        stage = 'angle_pause_check'
+                        timeline.mark(stage, cycle)
+                        # 非暂停仍先检查原命令预算；暂停只豁免故意停发的间隔。
+                        # Refresh after readback work; the poll timestamp may already be stale.
+                        now_ns = time.perf_counter_ns()
+                        now = now_ns / 1e9
+                        transition = update_pause(session.observation, now)
+                        if transition == 'resumed':
+                            next_slot = next_grid_slot(next_slot, grid_start_ns, now_ns, period_ns)
+                            next_tick_ns = grid_start_ns + next_slot*period_ns
+                            next_tick = next_tick_ns/1e9
+                            last_sample = last_tick = None
+                        if pause.paused and not a.diagnostic_timing:
+                            stage = 'angle_paused'
+                            timeline.mark(stage, cycle)
+                            if session.observation is None:
+                                verify_bound_calibration(session)
+                            elif state_guard(session.observation, session):
+                                raise RuntimeError('paused_state_guard')
+                            if refresh:
+                                refresh.send_if_due(now, end)
+                            # 读回写入也不允许遮蔽新的观测超时。
+                            update_pause(session.observation, CLOCK())
+                            check_trial_end(CLOCK(), end)
+                            sleep_requested = .0001
+                            timeline.mark('sleep_begin', cycle, sleep_requested)
+                            time.sleep(sleep_requested)
+                            timeline.mark('sleep_return', cycle)
+                            continue
                         stage = 'gap_check'
-                        if now-last_command_at >= hard_limit_s:
+                        timeline.mark(stage, cycle)
+                        now_ns = time.perf_counter_ns()
+                        now = now_ns / 1e9
+                        if now-budget_at >= hard_limit_s:
                             gate('command_gap_deadline')
+                        if not receiver.backlog_ready(session.observation):
+                            stage = 'backlog_recovery'
+                            timeline.mark(stage, cycle)
+                            time.sleep(min(.0001, max(0., min(budget_at+hard_limit_s, end)-CLOCK())))
+                            continue
                         if now_ns < next_tick_ns:
                             stage = 'wait_tick'
-                            time.sleep(min(.0002, next_tick-now))
+                            timeline.mark(stage, cycle)
+                            wait_now = CLOCK()
+                            if wait_now-budget_at >= hard_limit_s:
+                                gate('command_gap_deadline')
+                            sleep_requested = min(.0002, max(0., min(next_tick, budget_at+hard_limit_s, end)-wait_now))
+                            if sleep_requested <= 0:
+                                continue
+                            timeline.mark('sleep_begin', cycle, sleep_requested)
+                            time.sleep(sleep_requested)
+                            timeline.mark('sleep_return', cycle)
                             continue
                         stage = 'tick'
+                        timeline.mark(stage, cycle)
                         # 栅格迟到仅记录；实际命令6ms/原观测4ms为独立硬停止条件。
                         obs = session.observation
                         if obs is None:
                             raise RuntimeError('observation_missing')
                         # 已观察到的危险状态必须先停止，不能因缓存旧而等待恢复。
                         stage = 'cached_state_guard'
+                        timeline.mark(stage, cycle)
                         reason = state_guard(obs, session)
                         if reason:
                             report['failed_state_check'] = guard_snapshot(obs, session)
@@ -481,20 +700,28 @@ def main(a=None):
                             # 尚无推理候选：不用旧缓存，只消耗既有命令预算等新有效帧。
                             # ACTIVE的FAULT/STATE双路有效性/metadata失效仍由每次poll立即锁存。
                             stage = 'wait_fresh_observation'
+                            timeline.mark(stage, cycle)
                             report['stale_observation_waits'] += 1
                             report['max_stale_observation_age_s'] = max(
                                 report['max_stale_observation_age_s'], now-obs.received_at)
-                            remaining = min(last_command_at+hard_limit_s, end)-CLOCK()
+                            remaining = min(budget_at+hard_limit_s, end)-CLOCK()
                             if remaining <= 0:
-                                if CLOCK() >= last_command_at+hard_limit_s:
+                                if CLOCK() >= budget_at+hard_limit_s:
                                     gate('wait_fresh_command_deadline')
                                 check_trial_end(CLOCK(), end)
-                            time.sleep(min(.0001, remaining) if remaining > 0 else .0001)
+                            sleep_requested = min(.0001, remaining) if remaining > 0 else .0001
+                            timeline.mark('sleep_begin', cycle, sleep_requested)
+                            time.sleep(sleep_requested)
+                            timeline.mark('sleep_return', cycle)
                             continue
                         if obs.received_at == last_sample:
                             report['duplicate_tick_count'] += 1
                             stage = 'wait_fresh'
-                            time.sleep(min(.0002, max(0., min(last_command_at+hard_limit_s, obs.received_at+observation_limit_s, end)-CLOCK())))
+                            timeline.mark(stage, cycle)
+                            sleep_requested = min(.0002, max(0., min(budget_at+hard_limit_s, obs.received_at+observation_limit_s, end)-CLOCK()))
+                            timeline.mark('sleep_begin', cycle, sleep_requested)
+                            time.sleep(sleep_requested)
+                            timeline.mark('sleep_return', cycle)
                             continue
                         if last_tick is not None:
                             intervals.append(now-last_tick)
@@ -505,6 +732,7 @@ def main(a=None):
                         if now_ns-candidate_due_ns > period_ns:
                             report['over_period_late_candidates'] += 1
                         stage = 'state_guard'
+                        timeline.mark(stage, cycle)
                         reason = state_guard(obs, session)
                         if reason:
                             report['failed_state_check'] = guard_snapshot(obs, session)
@@ -512,9 +740,10 @@ def main(a=None):
                         last_sample = obs.received_at
                         x, th, vx, w = obs.si()
                         stage = 'inference'
+                        timeline.mark(stage, cycle)
                         begin = CLOCK()
                         check_trial_end(begin, end)
-                        if begin >= min(last_command_at+hard_limit_s, obs.received_at+observation_limit_s, end):
+                        if begin >= min(budget_at+hard_limit_s, obs.received_at+observation_limit_s, end):
                             if discard_expired_candidate(obs):
                                 continue
                             gate('candidate_deadline')
@@ -524,12 +753,28 @@ def main(a=None):
                         inference_s = None
                         raw = policy.forward((x, ANGLE_SIGN*th, vx, ANGLE_SIGN*w))
                         inference_s = CLOCK()-begin
+                        timeline.mark('inference_return', cycle)
                         report['inference_attempts_s'].append(inference_s)
                         totals=report['run_totals']
                         totals['inference_attempts']+=1
                         totals['inference_total_s']+=inference_s
                         totals['maximum_inference_s']=max(totals['maximum_inference_s'],inference_s)
                         if inference_limit_s is not None and CLOCK()-now > inference_limit_s:
+                            if getattr(a, 'retry_slow_inference', False):
+                                slow_now = CLOCK()
+                                info = report['slow_inference']
+                                info['slow_count'] += 1
+                                info['maximum_decision_elapsed_s'] = max(info['maximum_decision_elapsed_s'], slow_now-now)
+                                info['maximum_forward_s'] = max(info['maximum_forward_s'], inference_s)
+                                info['last_discard'] = {'reason': 'slow_inference', 'clock_s': slow_now,
+                                    'decision_elapsed_s': slow_now-now, 'forward_s': inference_s,
+                                    'observation_received_clock_s': obs.received_at}
+                                check_trial_end(slow_now, end)
+                                if slow_now-budget_at >= hard_limit_s:
+                                    gate('command_gap_deadline')
+                                receiver.request_recovery('slow_inference')
+                                # Keep last_sample consumed. Poll faults first, then await new receipt.
+                                continue
                             gate('inference_deadline')
                         if CLOCK()-obs.received_at >= observation_limit_s:
                             if discard_expired_candidate(obs):
@@ -539,30 +784,45 @@ def main(a=None):
                                 continue
                         # 分片/新字节可在poll末尾到达；仅在固定原始截止内补收。
                         stage = 'precommand_receive'
-                        receive_deadline = min(last_command_at+hard_limit_s, obs.received_at+observation_limit_s, end)
+                        timeline.mark(stage, cycle)
+                        receive_deadline = min(budget_at+hard_limit_s, obs.received_at+observation_limit_s, end)
                         drain = {'deadline_clock_s': receive_deadline, 'polls': 0,
-                                 'wait_s': 0., 'started_clock_s': CLOCK()}
+                                 'wait_s': 0., 'started_clock_s': CLOCK(),
+                                 'write_reserve_s': write_budget.reserve_s,
+                                 'drain_cutoff_clock_s': write_budget.cutoff(receive_deadline)}
                         retry_candidate = False
                         while True:
                             check_trial_end(CLOCK(), end)
+                            if discard_write_budget(obs, receive_deadline):
+                                retry_candidate = True
+                                break
                             if CLOCK() >= receive_deadline:
                                 if discard_expired_candidate(obs):
                                     retry_candidate = True
                                     break
                                 gate('precommand_receive_deadline')
-                            if transport.in_waiting > 128:
-                                raise RuntimeError('precommand_backlog')
+                            if not receiver.backlog_ready(obs):
+                                retry_candidate = True
+                                break
+                            timeline.mark('precommand_poll_begin', cycle)
                             if not receiver.poll() or session.phase != Phase.ACTIVE:
                                 raise RuntimeError(receiver.error or session.failure or 'session_inactive')
                             drain['polls'] += 1
+                            timeline.mark('precommand_poll_done', cycle)
                             if refresh:
                                 refresh.update(session, CLOCK())
+                            if session.pole_waiting and not a.diagnostic_timing:
+                                retry_candidate = True
+                                break
                             latest = session.observation
                             if latest is None or state_guard(latest, session):
                                 report['failed_state_check'] = guard_snapshot(latest, session)
                                 if latest is None:
                                     raise RuntimeError('latest_state_missing')
                                 gate('latest_state_limit')
+                            if update_pause(latest, CLOCK()) == 'paused':
+                                retry_candidate = True
+                                break  # 已发生暂停：不发送旧候选，恢复后重新推理。
                             pending = transport.in_waiting
                             drain.update(pending_bytes=pending, partial=transport.partial,
                                          elapsed_s=CLOCK()-drain['started_clock_s'])
@@ -571,46 +831,76 @@ def main(a=None):
                                     retry_candidate = True
                                     break
                                 gate('precommand_receive_deadline')
-                            if pending > 128:
-                                raise RuntimeError('precommand_backlog')
+                            if not receiver.backlog_ready(obs):
+                                retry_candidate = True
+                                break
                             drain['readback_in_flight'] = bool(refresh and refresh.pending)
+                            if discard_write_budget(obs, receive_deadline):
+                                retry_candidate = True
+                                break
                             if not transport.partial and pending == 0:
                                 break
-                            if pending == 0:
-                                begin = CLOCK()
-                                time.sleep(min(.0001, max(0., receive_deadline-begin)) if begin < receive_deadline else .0001)
-                                drain['wait_s'] += CLOCK()-begin
+                            # Cached pending bytes may await the reader: yield even when nonzero.
+                            begin = CLOCK()
+                            sleep_requested = min(.0001, max(0., write_budget.cutoff(receive_deadline)-begin))
+                            timeline.mark('sleep_begin', cycle, sleep_requested)
+                            time.sleep(sleep_requested)
+                            timeline.mark('sleep_return', cycle)
+                            drain['wait_s'] += CLOCK()-begin
                         if retry_candidate:
                             continue  # 不使用旧raw；外层拿到更新帧后从头推理。
                         action = max(-1., min(1., raw))
                         stage = 'prewrite'
+                        timeline.mark(stage, cycle)
                         if CLOCK() >= receive_deadline:
                             if discard_expired_candidate(obs):
                                 continue
                             gate('prewrite_fixed_deadline')
                             if a.diagnostic_timing and CLOCK() >= obs.received_at+observation_limit_s:
                                 continue
-                        report['virtual_command_attempted' if a.diagnostic_timing else 'motion_command_attempted'] = True
+                        if not receiver.backlog_ready(obs):
+                            continue  # Discard action; drain and reinfer within the unchanged budget.
                         acceleration = None
                         command_phase = 'model'
+                        timeline.mark('prewrite_budget_check', cycle)
+                        if discard_write_budget(obs, receive_deadline):
+                            continue
+                        report['virtual_command_attempted' if a.diagnostic_timing else 'motion_command_attempted'] = True
+                        timeline.mark('command_call', cycle)
                         velocity = session.command(action)
                         completed_ns = time.perf_counter_ns()
                         completed_at = completed_ns / 1e9
+                        timeline.mark('command_return', cycle)
                         command_gap = completed_at-last_command_at
+                        active_command_gap = completed_at-budget_at
                         totals=report['run_totals']
                         totals['command_completions']+=1
-                        totals['command_gaps_over_4ms']+=int(command_gap>COMMAND_GAP_SOFT_S)
-                        totals['command_gaps_at_or_over_6ms']+=int(command_gap>=.006)
-                        totals['command_gaps_at_or_over_hard_limit']+=int(command_gap>=hard_limit_s)
+                        angle_gap = pause.resumed_since_command and not a.diagnostic_timing
+                        pole_gap = pole_resumed_since_command and not a.diagnostic_timing
+                        intentional_gap = angle_gap or pole_gap
+                        pole_resumed_since_command = False
+                        pause.resumed_since_command = False
+                        if pole_gap:
+                            session.pole_recovery_stats['intentional_completion_gaps'] += 1
+                        if angle_gap:
+                            report['angle_pause']['intentional_completion_gaps'] += 1
+                        totals['command_gaps_over_4ms']+=int(not intentional_gap and command_gap>COMMAND_GAP_SOFT_S)
+                        totals['command_gaps_at_or_over_6ms']+=int(not intentional_gap and command_gap>=.006)
+                        totals['command_gaps_at_or_over_9ms']+=int(not intentional_gap and command_gap>=.009)
+                        totals['command_gaps_at_or_over_hard_limit']+=int(active_command_gap>=hard_limit_s)
                         totals['maximum_command_gap_s']=max(totals['maximum_command_gap_s'],command_gap)
-                        last_command_at = completed_at
+                        totals['maximum_active_command_gap_s']=max(totals['maximum_active_command_gap_s'],active_command_gap)
+                        last_command_at = budget_at = completed_at
                         if not a.diagnostic_timing:
                             report['motion_command_sent'] = True
                         report['samples'].append({'elapsed_s': CLOCK()-start, 'state_si': obs.si(),
                                                   'control_source': command_phase, 'raw_action': raw, 'velocity_mm_s': velocity, 'acceleration_mm_s2': acceleration,
                                                   'inference_s': inference_s,
                                                   'command_gap_s': command_gap,
-                                                  'command_gap_soft_warning': command_gap > COMMAND_GAP_SOFT_S,
+                                                  'active_command_gap_s': active_command_gap,
+                                                  'intentional_angle_pause_gap': angle_gap,
+                                                  'intentional_pole_recovery_gap': pole_gap,
+                                                  'command_gap_soft_warning': not intentional_gap and command_gap > COMMAND_GAP_SOFT_S,
                                                   'observation_received_clock_s': obs.received_at,
                                                   'host_observation_age_s': completed_at-obs.received_at,
                                                   'grid_slot': candidate_slot,
@@ -621,8 +911,19 @@ def main(a=None):
                         if probe:
                             probe.record_sample(report['samples'][-1])
                         stage = 'write_completion'
-                        if completed_at >= receive_deadline:
+                        timeline.mark(stage, cycle)
+                        violation = completion_violation(completed_at-obs.received_at,
+                            observation_limit_s, active_command_gap, hard_limit_s)
+                        if violation == 'command_gap':
                             gate('write_completion_deadline')
+                        elif violation == 'observation_age':
+                            report['write_budget']['completion_age_warnings'] += 1
+                            report['write_budget']['last_completion_warning'] = {
+                                'completed_at': completed_at, 'observation_received_at': obs.received_at,
+                                'age_s': completed_at-obs.received_at, 'limit_s': observation_limit_s,
+                                'command_gap_s': command_gap, 'active_command_gap_s': active_command_gap, 'already_written': True}
+                            receiver.request_recovery('write_completion_age')
+                        check_trial_end(completed_at, end)
                         # 成功写入且通过硬截止后才推进；短间隔相位恢复并非固定周期保证。
                         next_slot = next_grid_slot(candidate_slot, grid_start_ns, completed_ns, period_ns)
                         skipped = next_slot-candidate_slot-1
@@ -633,13 +934,15 @@ def main(a=None):
                         if refresh:
                             # 已成功写入新速度后才安排单条只读查询，不与其他查询叠加。
                             stage = 'readback_query'
+                            timeline.mark(stage, cycle)
                             query_at = CLOCK()
-                            if query_at >= last_command_at+hard_limit_s:
+                            if query_at >= budget_at+hard_limit_s:
                                 gate('readback_send_deadline')
                             check_trial_end(query_at, end)
                             refresh.send_if_due(query_at, end)
                             query_done = CLOCK()
-                            if query_done >= last_command_at+hard_limit_s:
+                            timeline.mark('readback_check_return', cycle)
+                            if query_done >= budget_at+hard_limit_s:
                                 gate('readback_write_deadline')
                             check_trial_end(query_done, end)
                     report['status'] = 'trial_ended'
@@ -664,6 +967,10 @@ def main(a=None):
                         'precommand_receive': drain,
                         'readback_in_flight': dict(refresh.pending) if refresh and refresh.pending else None}
                 finally:
+                    if receiver is not None:
+                        receiver.active = False
+                    timeline.mark('control_loop_exit', cycle)
+                    timeline.freeze()
                     report['active_elapsed_s']=CLOCK()-start if start is not None else None
                     if not a.diagnostic_timing and session is not None and (session.phase in (Phase.ACTIVE, Phase.STOPPING)
                                                 or session.mode == ('READY', 'NONE')):
@@ -699,11 +1006,12 @@ def main(a=None):
             report['received_state_gap_scope'] = 'valid ACTIVE STATE parses in measurement window; not device sample/wire arrival timing' if a.diagnostic_timing else 'not_recorded'
             report['summary_scope']='retained recent tail; run_totals are full-run' if a.continuous else 'complete recorded run'
             report['loop_interval_s'] = summary(intervals)
-            report['completion_gap_s'] = summary([r['command_gap_s'] for r in report['samples']])
-            report['completion_gap_scope'] = 'virtual_no_action_write' if a.diagnostic_timing else 'actual_host_write_completion'
-            report['completion_gaps_over_6ms'] = sum(r['command_gap_s'] >= .006 for r in report['samples'])
-            report['completion_gaps_at_or_over_hard_limit'] = sum(r['command_gap_s'] >= hard_limit_s for r in report['samples'])
-            report['completion_gaps_over_4ms'] = sum(r['command_gap_s'] > COMMAND_GAP_SOFT_S for r in report['samples'])
+            report['completion_gap_s'] = summary([r['command_gap_s'] for r in report['samples'] if not (r.get('intentional_angle_pause_gap') or r.get('intentional_pole_recovery_gap'))])
+            report['completion_gap_scope'] = 'virtual_no_action_write' if a.diagnostic_timing else 'actual_host_write_completion_excluding_marked_pause_gaps'
+            report['completion_gaps_over_6ms'] = sum(r['command_gap_s'] >= .006 for r in report['samples'] if not (r.get('intentional_angle_pause_gap') or r.get('intentional_pole_recovery_gap')))
+            report['completion_gaps_at_or_over_9ms'] = sum(r['command_gap_s'] >= .009 for r in report['samples'] if not (r.get('intentional_angle_pause_gap') or r.get('intentional_pole_recovery_gap')))
+            report['completion_gaps_at_or_over_hard_limit'] = sum(r['active_command_gap_s'] >= hard_limit_s for r in report['samples'])
+            report['completion_gaps_over_4ms'] = sum(r['command_gap_s'] > COMMAND_GAP_SOFT_S for r in report['samples'] if not (r.get('intentional_angle_pause_gap') or r.get('intentional_pole_recovery_gap')))
             report['inference_s'] = summary(report['inference_attempts_s'])
             report['inference_scope'] = ('retained recent policy.forward attempts including discarded candidates; excludes warmup' if a.continuous else 'all measured policy.forward attempts including discarded candidates; excludes warmup')
             report['completed_candidate_inference_s'] = summary([r['inference_s'] for r in report['samples'] if r['inference_s'] is not None])
@@ -713,8 +1021,13 @@ def main(a=None):
             report['last_observed_firmware_mode'] = session.mode if session else None
             report['stop_unconfirmed'] = bool((report['motion_command_attempted']
                 or report.get('safe_stop_requested')) and not report['disabled_confirmed'])
+            report['gap_timeline'] = timeline.snapshot()
+            report['first_invalid_state'] = session.first_invalid_state if session else None
+            report['pole_recovery'] = {**session.pole_recovery_stats, 'waiting': session.pole_waiting} if session else None
             report['session_failure'] = session.failure if session else None
             report['receive_error'] = receiver.error if receiver else None
+            report['threaded_receiver'] = receiver.report() if receiver else None
+            report['reader_stopped_before_port_close'] = connection.reader_stopped
             report['status'] = ('complete' if report['status'] == 'trial_ended' and report['samples'] and (report['disabled_confirmed'] or a.diagnostic_timing)
                                 and not report['session_failure'] and not report['receive_error'] else report['status'])
             if (a.continuous and report['status']=='interrupted' and report['disabled_confirmed']
@@ -729,6 +1042,9 @@ def main(a=None):
         print(json.dumps({k:v for k,v in report.items() if k not in ('samples', 'received_states', 'inference_attempts_s')}, ensure_ascii=False, indent=2))
     else:
         print(result_summary(report, a.output))
+        backlog = (report.get('threaded_receiver') or {}).get('backlog_recovery', {})
+        if backlog.get('warnings'):
+            print(f"接收积压警告 {backlog['warnings']} 次，已恢复 {backlog['recoveries']} 次；恢复前未发送旧动作。详情见报告。")
     return 0 if report['status'] in ('complete','stopped_by_user') else 1
 
 

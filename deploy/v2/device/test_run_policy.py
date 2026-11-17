@@ -15,6 +15,7 @@ class RunnerTests(unittest.TestCase):
             result = guard_snapshot(Observation(0,0,0,0,9.99), Mock())
         self.assertEqual(result['host_received_at_s'],9.99)
         self.assertNotIn('freshness_reference_at_s',result)
+        self.assertEqual(result['limits']['angle_limit_scope'], 'terminal_gate_disabled; pause_resume_thresholds_in_report_angle_pause')
     def test_normal_expiry_is_separate_from_failure(self):
         from run_policy import check_trial_end, TrialEnd
         check_trial_end(4.99,5)
@@ -62,11 +63,12 @@ class ExpiryCallsiteTests(unittest.TestCase):
     def run_nodes(self, nodes, now):
         import ast
         from run_policy import check_trial_end
+        from gap_timeline import GapTimeline
         def gate(reason):raise RuntimeError(reason)
         refresh=Mock()
-        context=dict(CLOCK=lambda:now, end=5., last_command_at=4.999,
+        context=dict(CLOCK=lambda:now, end=5., budget_at=4.999,
                      hard_limit_s=.006, gate=gate, check_trial_end=check_trial_end,
-                     refresh=refresh, remaining=-.001)
+                     refresh=refresh, remaining=-.001, timeline=GapTimeline(False), cycle=0)
         exec(compile(ast.fix_missing_locations(ast.Module(body=nodes,type_ignores=[])), '<runner-branch>', 'exec'),context)
         return refresh
     def test_wait_fresh_expiry_and_real_gap(self):

@@ -32,12 +32,24 @@ class Limits:
     validity_timeout_s: float = .3
     preflight_timeout_s: float = 1.
     stop_timeout_s: float = 1.
+    deployment_speed_mm_s: int | None = None
+    deployment_acceleration_mm_s2: int | None = None
 
     def __post_init__(self):
         # These integer limits match the firmware CONFIG protocol, not measured capacity.
         integer_ranges = {'speed_mm_s': (1, 2000), 'acceleration_mm_s2': (100, 30000),
                           'margin_um': (1000, 50000), 'watchdog_ms': (10, 1000)}
         for name, value in vars(self).items():
+            if name == "deployment_acceleration_mm_s2":
+                if value is not None and (isinstance(value, bool) or not isinstance(value, Integral)
+                                          or not 100 <= value <= 30000):
+                    raise ValueError("deployment_acceleration_mm_s2 必须是 [100, 30000] 范围内的整数")
+                continue
+            if name == "deployment_speed_mm_s":
+                if value is not None and (isinstance(value, bool) or not isinstance(value, Integral)
+                                          or not 1 <= value <= self.speed_mm_s):
+                    raise ValueError("deployment_speed_mm_s 必须是正整数且不超过模型速度倍率")
+                continue
             if name in integer_ranges:
                 low, high = integer_ranges[name]
                 if isinstance(value, bool) or not isinstance(value, Integral) or not low <= value <= high:
@@ -47,8 +59,16 @@ class Limits:
                 raise ValueError(f'{name} 必须是有限正数')
 
     @property
+    def firmware_speed_mm_s(self):
+        return self.speed_mm_s if self.deployment_speed_mm_s is None else self.deployment_speed_mm_s
+
+    @property
+    def firmware_acceleration_mm_s2(self):
+        return self.acceleration_mm_s2 if self.deployment_acceleration_mm_s2 is None else self.deployment_acceleration_mm_s2
+
+    @property
     def config(self):
-        return {'VEL_MAX': self.speed_mm_s, 'ACC_MAX': self.acceleration_mm_s2,
+        return {'VEL_MAX': self.firmware_speed_mm_s, 'ACC_MAX': self.firmware_acceleration_mm_s2,
                 'WDT_MS': self.watchdog_ms,
                 'X_MARGIN_UM': self.margin_um}
 
@@ -89,6 +109,8 @@ class Session:
         self._last_time = -math.inf
         self._stop_at = self._last_stop_tx = -math.inf
         self._disable_sent = False
+        self._disable_at = -math.inf
+        self._incoming_received_at = None
 
     def _receive_state(self, line, now):
         frame = parse_state(line)
@@ -96,9 +118,10 @@ class Session:
             self._fail('measurement_invalid', now)
             return
         # 这是主机收到完整帧的时刻，不证明设备采样或端到端新鲜度。
-        self._valid, self._valid_at = True, now
+        received_at = self._receipt_time(now)
+        self._valid, self._valid_at = True, received_at
         self.observation = Observation(frame.cart.position, frame.pole.position,
-                                       frame.cart.velocity, frame.pole.velocity, now)
+                                       frame.cart.velocity, frame.pole.velocity, received_at)
 
     def _now(self):
         now = self.clock()
@@ -153,6 +176,9 @@ class Session:
         return (self._valid and self._fresh(self._valid_at, now, self.limits.validity_timeout_s)
                 and self.observation is not None
                 and self._fresh(self.observation.received_at, now, self.limits.state_timeout_s))
+
+    def _active_measurement_ready(self, now):
+        return self._measurement_ready(now)
 
     def preflight_reason(self):
         now = self._now()
@@ -240,6 +266,20 @@ class Session:
         elif self.phase in (Phase.ACTIVE, Phase.STOPPING):
             self._fail('application_abort', now)
 
+    def _receipt_time(self, now):
+        return now if self._incoming_received_at is None else self._incoming_received_at
+
+    def receive_at(self, line, received_at):
+        now = self._now()
+        if not math.isfinite(received_at) or received_at > now:
+            self._fail('invalid_receipt_time', now)
+            raise ValueError('invalid_receipt_time')
+        self._incoming_received_at = received_at
+        try:
+            self.receive(line)
+        finally:
+            self._incoming_received_at = None
+
     def receive(self, line: str):
         # Check old deadlines before newly received bytes can renew their timestamps.
         self.tick()
@@ -261,8 +301,9 @@ class Session:
             elif tag == 'MODE':
                 if len(words) != 3 or words[1] not in ('DISABLED', 'READY', 'FAULT'):
                     raise ValueError()
-                self.mode, self._mode_at = (words[1], words[2]), now
-                if self.phase == Phase.STOPPING and self._disable_sent and self.mode == ('DISABLED', 'NONE'):
+                self.mode, self._mode_at = (words[1], words[2]), self._receipt_time(now)
+                if (self.phase == Phase.STOPPING and self._disable_sent and self.mode == ('DISABLED', 'NONE')
+                        and self._receipt_time(now) >= self._disable_at):
                     self.disabled_confirmed = True
                     self.phase = Phase.FINISHED
                 elif self.phase == Phase.ACTIVE and self.mode != self.required_active_mode:
@@ -282,7 +323,7 @@ class Session:
                 if len(words) == 3:
                     value = int(words[2])
                     previous = self.values.get(words[1])
-                    self.values[words[1]] = (value, now)
+                    self.values[words[1]] = (value, self._receipt_time(now))
                     if self.phase == Phase.ACTIVE:
                         expected = self.expected_readback
                         if (words[1] in expected and value != expected[words[1]]) or (words[1] == 'CAL_LENGTH_UM' and previous and value != previous[0]):
@@ -309,7 +350,7 @@ class Session:
             self.observation = None
         if self.phase == Phase.ACTIVE and self._metadata_reason(now):
             self._fail('metadata_unavailable', now)
-        if self.phase == Phase.ACTIVE and not self._measurement_ready(now):
+        if self.phase == Phase.ACTIVE and not self._active_measurement_ready(now):
             self._fail('measurement_timeout', now)
         if self.phase == Phase.STOPPING:
             if now - self._stop_at >= self.limits.stop_timeout_s:
@@ -323,6 +364,7 @@ class Session:
                 if self._measurement_ready(now) and self.observation.received_at > self._stop_at and self.observation.velocity_mm_s == 0:
                     if self._write('DISABLE'):
                         self._disable_sent = True
+                        self._disable_at = self._now()
 
     def command(self, action: float):
         """[-1,1]动作映射为目标速度；每次发送前重新检查有效性。"""
@@ -342,6 +384,7 @@ class Session:
         velocity = int(whole)
         if abs(fraction) >= 0.5:
             velocity += 1 if fraction > 0 else -1
+        velocity = max(-self.limits.firmware_speed_mm_s, min(self.limits.firmware_speed_mm_s, velocity))
         if self.enforce_position_limits and abs(self.observation.x_um) >= self.track_limit_um and self.observation.x_um * velocity > 0:
             velocity = 0
         if not self._write(f'VEL {velocity}'):

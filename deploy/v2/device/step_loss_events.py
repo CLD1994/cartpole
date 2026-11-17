@@ -83,6 +83,7 @@ class StepLossEventMixin:
         super().__init__(*args, **kwargs)
         self.step_loss_probe = StepLossProbe()
         self.run_query_pending = False
+        self.run_query_sent_at = float('-inf')
         self.run_reply = None
 
     def receive(self, line):
@@ -92,7 +93,7 @@ class StepLossEventMixin:
                     or not 0 < int(words[2]) <= 2**32-1):
                 self._fail('malformed_run_reply', self._now())
                 raise RuntimeError('malformed_run_reply')
-            if self.run_query_pending:
+            if self.run_query_pending and self._receipt_time(self._now()) >= self.run_query_sent_at:
                 self.run_reply = int(words[2])
                 self.step_loss_probe.expected_run_id = self.run_reply
                 self.run_query_pending = False
@@ -102,7 +103,7 @@ class StepLossEventMixin:
         self.tick()
         now = self._now()
         try:
-            self.step_loss_probe.receive(line, now, self.phase == Phase.ACTIVE)
+            self.step_loss_probe.receive(line, self._receipt_time(now), self.phase == Phase.ACTIVE)
         except ValueError:
             self._fail('malformed_step_loss_event', now)
             raise RuntimeError('malformed_step_loss_event')

@@ -116,7 +116,7 @@ class RealCartpoleV2EnvCfg(CartpoleEnvCfg):
             func=pole_angle_out_of_bounds,
             params={
                 "asset_cfg": SceneEntityCfg("robot", joint_names=["cart_to_pole"]),
-                "max_angle": math.pi / 3,
+                "max_angle": math.radians(20.0),
             },
         )
         # 初始位置保留在轨道中部，避免从终止边界附近初始化。
@@ -168,7 +168,7 @@ class RealCartpoleV2EnvCfg(CartpoleEnvCfg):
             mode="reset",
             params={
                 "asset_cfg": SceneEntityCfg("robot"),
-                "damping_range": {"slider_to_cart": (0.0, 2.0), "cart_to_pole": (0.0, 0.01)},
+                "damping_range": {"slider_to_cart": (0.1, 0.6), "cart_to_pole": (0.0, 0.01)},
             },
         )
         # 参考跟踪动态范围；当前装置的速度、加速度与响应参数需要实测辨识。
