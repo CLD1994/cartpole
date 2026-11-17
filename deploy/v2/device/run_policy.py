@@ -16,6 +16,7 @@ from receiver import Receiver
 from session import Session, Phase
 from step_loss_events import StepLossEventMixin
 from angle_pause import AnglePause
+from state_frame import parse_state
 
 
 CONFIG_KEYS = ('VEL_MAX', 'ACC_MAX', 'WDT_MS', 'X_MARGIN_UM',
@@ -94,7 +95,23 @@ class BoundSession(Session):
     enforce_position_limits = False  # User-selected firmware-owned position limits.
     def __init__(self, transport, clock, limits, coordinates):
         self.coordinates = dict(coordinates)
+        self.first_invalid_state = None
         super().__init__(transport, clock, limits)
+
+    def receive(self, line):
+        # 正常双路有效帧不额外解析；只保存活动会话首次无效帧。
+        if (self.first_invalid_state is None and self.phase == Phase.ACTIVE
+                and line.startswith(('STATE 0 ', 'STATE 1 ', 'STATE 2 '))):
+            try:
+                frame = parse_state(line)
+            except ValueError:
+                pass  # 格式错误仍交既有会话处理，不伪造有效位证据。
+            else:
+                self.first_invalid_state = {
+                    'raw_line': line, 'flags': int(line.split()[1]),
+                    'cart_valid': frame.cart is not None, 'pole_valid': frame.pole is not None,
+                    'host_received_clock_s': self.clock(), 'phase': self.phase.value}
+        super().receive(line)
 
     @property
     def expected_readback(self):
@@ -798,6 +815,7 @@ def main(a=None):
             report['last_observed_firmware_mode'] = session.mode if session else None
             report['stop_unconfirmed'] = bool((report['motion_command_attempted']
                 or report.get('safe_stop_requested')) and not report['disabled_confirmed'])
+            report['first_invalid_state'] = session.first_invalid_state if session else None
             report['session_failure'] = session.failure if session else None
             report['receive_error'] = receiver.error if receiver else None
             report['status'] = ('complete' if report['status'] == 'trial_ended' and report['samples'] and (report['disabled_confirmed'] or a.diagnostic_timing)
