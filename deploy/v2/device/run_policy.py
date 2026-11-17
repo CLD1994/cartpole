@@ -578,6 +578,9 @@ def main(a=None):
                         stage = 'angle_pause_check'
                         timeline.mark(stage, cycle)
                         # 非暂停仍先检查原命令预算；暂停只豁免故意停发的间隔。
+                        # Refresh after readback work; the poll timestamp may already be stale.
+                        now_ns = time.perf_counter_ns()
+                        now = now_ns / 1e9
                         transition = update_pause(session.observation, now)
                         if transition == 'resumed':
                             next_slot = next_grid_slot(next_slot, grid_start_ns, now_ns, period_ns)
@@ -601,12 +604,19 @@ def main(a=None):
                             continue
                         stage = 'gap_check'
                         timeline.mark(stage, cycle)
+                        now_ns = time.perf_counter_ns()
+                        now = now_ns / 1e9
                         if now-budget_at >= hard_limit_s:
                             gate('command_gap_deadline')
                         if now_ns < next_tick_ns:
                             stage = 'wait_tick'
                             timeline.mark(stage, cycle)
-                            sleep_requested = min(.0002, next_tick-now)
+                            wait_now = CLOCK()
+                            if wait_now-budget_at >= hard_limit_s:
+                                gate('command_gap_deadline')
+                            sleep_requested = min(.0002, max(0., min(next_tick, budget_at+hard_limit_s, end)-wait_now))
+                            if sleep_requested <= 0:
+                                continue
                             timeline.mark('sleep_begin', cycle, sleep_requested)
                             time.sleep(sleep_requested)
                             timeline.mark('sleep_return', cycle)
