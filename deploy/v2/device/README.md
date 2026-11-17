@@ -300,3 +300,12 @@ runner drains and recomputes from a later receipt. Exceeding the active command-
 limit still stops, including the first write after angle/pole recovery. Host receipt
 and queue boundaries are not proof of device sample age. `slow_windows` and
 `backlog_recovery` retain evidence; no console printing is added to the hot loop.
+
+
+### Deployment angle gate defaults
+
+The real-device runner now pauses VEL at `abs(theta) >= 20 degrees` and resumes
+only at `abs(theta) <= 18 degrees` with a fresh valid observation. The existing
+2-degree hysteresis, long-pause behavior and firmware fault handling are unchanged.
+This is a deployment gate, not a change to the model training termination boundary.
+Explicit CLI options remain available: `--angle-pause-deg 20 --angle-resume-deg 18`.

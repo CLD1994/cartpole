@@ -2,7 +2,7 @@
 import math
 
 class AnglePause:
-    def __init__(self, enter_deg=60., resume_deg=58.):
+    def __init__(self, enter_deg=20., resume_deg=18.):
         if not (math.isfinite(enter_deg) and math.isfinite(resume_deg)
                 and 0 <= resume_deg < enter_deg <= 180):
             raise ValueError('invalid_angle_pause_thresholds')

@@ -9,10 +9,10 @@ def obs(deg, at=1.):
 class AnglePauseTests(unittest.TestCase):
     def test_hysteresis_and_resume_budget(self):
         p=AnglePause()
-        self.assertEqual(p.check(obs(61),1.,.999,.006,.004),'paused')
-        self.assertEqual(p.check(obs(59,2.),2.,.999,.006,.004),None)
+        self.assertEqual(p.check(obs(21),1.,.999,.006,.004),'paused')
+        self.assertEqual(p.check(obs(19,2.),2.,.999,.006,.004),None)
         self.assertTrue(p.paused)
-        self.assertEqual(p.check(obs(57,3.),3.,.999,.006,.004),'resumed')
+        self.assertEqual(p.check(obs(17,3.),3.,.999,.006,.004),'resumed')
         self.assertFalse(p.paused)
     def test_expired_active_budget_cannot_enter_pause(self):
         p=AnglePause()
@@ -43,3 +43,16 @@ class AnglePauseTests(unittest.TestCase):
         args=parse_args(['--port','COM11','--model','unused','--start-confirmed','--command-gap-hard-ms','9'])
         self.assertEqual(args.command_gap_hard_ms,9.)
         self.assertEqual(timing_limits(args.timing_profile),(.006,.004,.002))
+
+    def test_default_twenty_eighteen_exact_both_sign_boundaries(self):
+        from types import SimpleNamespace
+        from run_policy import parse_args
+        args=parse_args(['--port','FAKE','--model','unused','--start-confirmed'])
+        self.assertEqual((args.angle_pause_deg,args.angle_resume_deg),(20.,18.))
+        for sign in (-1,1):
+            p=AnglePause()
+            def frame(deg):return SimpleNamespace(si=lambda:(0,sign*math.radians(deg),0,0),received_at=1.)
+            self.assertIsNone(p.check(frame(19.999),1.,1.,.025,.004))
+            self.assertEqual(p.check(frame(20),1.,1.,.025,.004),'paused')
+            self.assertIsNone(p.check(frame(18.001),1.,1.,.025,.004))
+            self.assertEqual(p.check(frame(18),1.,1.,.025,.004),'resumed')
