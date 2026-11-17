@@ -111,6 +111,14 @@ class RunnerCombinationTests(unittest.TestCase):
             try:exec(code,env)
             except r.TrialEnd:pass
         return port,report,calls
+    def test_repeated_valid_pole_estimate_keeps_control_running(self):
+        port,report,calls=self.run_loop(lambda t:0,.03)
+        self.assertGreater(len(calls),8)
+        writes=[at for at,data in port.sent if data.startswith(b'VEL')]
+        self.assertGreaterEqual(len(writes),14)
+        self.assertLess(max(b-a for a,b in zip(writes,writes[1:])),.004)
+        self.assertEqual(self.last_run[3]['session'].pole_recovery_stats['pauses'],0)
+
     def test_pole_recovery_waits_past_command_budget_and_reinfers(self):
         port,report,calls=self.run_loop(lambda t:0,.08,invalid_pole=lambda t:.004<t<.05)
         self.assertFalse(any(.004<at-10<.05 for at,_ in calls))
