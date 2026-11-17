@@ -1010,7 +1010,7 @@ def main(a=None):
             report['completion_gap_scope'] = 'virtual_no_action_write' if a.diagnostic_timing else 'actual_host_write_completion_excluding_marked_pause_gaps'
             report['completion_gaps_over_6ms'] = sum(r['command_gap_s'] >= .006 for r in report['samples'] if not (r.get('intentional_angle_pause_gap') or r.get('intentional_pole_recovery_gap')))
             report['completion_gaps_at_or_over_9ms'] = sum(r['command_gap_s'] >= .009 for r in report['samples'] if not (r.get('intentional_angle_pause_gap') or r.get('intentional_pole_recovery_gap')))
-            report['completion_gaps_at_or_over_hard_limit'] = sum(r['command_gap_s'] >= hard_limit_s for r in report['samples'] if not (r.get('intentional_angle_pause_gap') or r.get('intentional_pole_recovery_gap')))
+            report['completion_gaps_at_or_over_hard_limit'] = sum(r['active_command_gap_s'] >= hard_limit_s for r in report['samples'])
             report['completion_gaps_over_4ms'] = sum(r['command_gap_s'] > COMMAND_GAP_SOFT_S for r in report['samples'] if not (r.get('intentional_angle_pause_gap') or r.get('intentional_pole_recovery_gap')))
             report['inference_s'] = summary(report['inference_attempts_s'])
             report['inference_scope'] = ('retained recent policy.forward attempts including discarded candidates; excludes warmup' if a.continuous else 'all measured policy.forward attempts including discarded candidates; excludes warmup')
