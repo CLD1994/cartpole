@@ -64,6 +64,7 @@ class RunnerCombinationTests(unittest.TestCase):
             'duplicate_tick_count':0,'stale_observation_waits':0,'max_stale_observation_age_s':0.,
             'over_period_late_candidates':0,'grid_slots_skipped':0}
         report['write_budget']={'discard_count':0,'discard_stages':{},'last_discard':None}
+        report['run_totals']['command_gaps_at_or_over_9ms']=0
         calls=[]
         def forward(state):
             calls.append((clock.now,state))

@@ -309,7 +309,7 @@ def parse_args(argv=None):
     p.add_argument('--velocity-limit-mm-s', type=int, help='显式降低部署速度上限；保留模型动作倍率并饱和限幅，不修改固件配置')
     p.add_argument('--angle-pause-deg', type=float, default=60., help='绝对摆角达到此角度时暂停速度命令')
     p.add_argument('--angle-resume-deg', type=float, default=58., help='绝对摆角回落至此角度时自动重新推理')
-    p.add_argument('--command-gap-hard-ms', type=float, choices=(6., 9.), help='显式覆盖命令硬期限；不改变观测或推理期限')
+    p.add_argument('--command-gap-hard-ms', type=float, choices=(6., 9., 15.), help='显式覆盖命令硬期限；不改变观测或推理期限')
     p.add_argument('--thread-priority', choices=('unchanged','above-normal'), default='unchanged', help='仅本次控制/接收线程优先级，不保证实时')
     p.add_argument('--gap-timeline', action='store_true', help='记录有界主机分段计时到最终报告，不改变控制时限')
     p.add_argument('--json', action='store_true', help='终端输出机器可读摘要 JSON')
@@ -385,7 +385,7 @@ def main(a=None):
         'events': [],
         'pause_count': 0, 'resume_count': 0, 'intentional_completion_gaps': 0}
     report['run_totals'] = {'command_completions':0,'command_gaps_over_4ms':0,
-        'command_gaps_at_or_over_6ms':0,'command_gaps_at_or_over_hard_limit':0,'maximum_command_gap_s':0.,'maximum_active_command_gap_s':0.,
+        'command_gaps_at_or_over_6ms':0,'command_gaps_at_or_over_9ms':0,'command_gaps_at_or_over_hard_limit':0,'maximum_command_gap_s':0.,'maximum_active_command_gap_s':0.,
         'command_gap_scope':'maximum_command_gap_s includes intentional pauses; active maximum and over-limit counts exclude marked pause gaps',
         'inference_attempts':0,'inference_total_s':0.,'maximum_inference_s':0.}
     if a.diagnostic_timing:
@@ -796,6 +796,7 @@ def main(a=None):
                             report['angle_pause']['intentional_completion_gaps'] += 1
                         totals['command_gaps_over_4ms']+=int(not intentional_gap and command_gap>COMMAND_GAP_SOFT_S)
                         totals['command_gaps_at_or_over_6ms']+=int(not intentional_gap and command_gap>=.006)
+                        totals['command_gaps_at_or_over_9ms']+=int(not intentional_gap and command_gap>=.009)
                         totals['command_gaps_at_or_over_hard_limit']+=int(not intentional_gap and command_gap>=hard_limit_s)
                         totals['maximum_command_gap_s']=max(totals['maximum_command_gap_s'],command_gap)
                         if not intentional_gap:
@@ -907,6 +908,7 @@ def main(a=None):
             report['completion_gap_s'] = summary([r['command_gap_s'] for r in report['samples'] if not r.get('intentional_angle_pause_gap')])
             report['completion_gap_scope'] = 'virtual_no_action_write' if a.diagnostic_timing else 'actual_host_write_completion_excluding_marked_angle_pause_gaps'
             report['completion_gaps_over_6ms'] = sum(r['command_gap_s'] >= .006 for r in report['samples'] if not r.get('intentional_angle_pause_gap'))
+            report['completion_gaps_at_or_over_9ms'] = sum(r['command_gap_s'] >= .009 for r in report['samples'] if not r.get('intentional_angle_pause_gap'))
             report['completion_gaps_at_or_over_hard_limit'] = sum(r['command_gap_s'] >= hard_limit_s for r in report['samples'] if not r.get('intentional_angle_pause_gap'))
             report['completion_gaps_over_4ms'] = sum(r['command_gap_s'] > COMMAND_GAP_SOFT_S for r in report['samples'] if not r.get('intentional_angle_pause_gap'))
             report['inference_s'] = summary(report['inference_attempts_s'])
