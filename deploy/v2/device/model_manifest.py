@@ -40,7 +40,7 @@ def training_contract(config):
         frequency = 1.0 / (dt * decimation)
         if not any(math.isclose(frequency, hz, rel_tol=0, abs_tol=1e-8) for hz in (400, 500)):
             raise ValueError('training_configuration_unsupported_frequency')
-        if speed != 1.25 or not _positive(acceleration):
+        if speed not in (0.9, 1.25) or not _positive(acceleration):
             raise ValueError('training_configuration_invalid_actuator')
         policy = config['observations']['policy']
         terms = [(k, v) for k, v in policy.items() if isinstance(v, dict) and 'func' in v]
@@ -87,7 +87,7 @@ def validate_manifest(value):
             or value.get('action_type') != 'cart_target_velocity'
             or type(value.get('action_dim')) is not int or value['action_dim'] != 1
             or type(value.get('training_control_hz')) is not int or value['training_control_hz'] not in (400, 500)
-            or value.get('action_scale_m_s') != 1.25
+            or value.get('action_scale_m_s') not in (0.9, 1.25)
             or not _positive(value.get('training_acceleration_m_s2'))):
         raise ValueError('model_manifest_semantics_invalid')
     source = value.get('training_source')
