@@ -14,6 +14,8 @@ import subprocess
 import sys
 import uuid
 
+from environment_overrides import add_environment_overrides
+
 
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -240,6 +242,8 @@ def start_evaluation(candidate, args, output, seeds, stage):
            '--checkpoint',candidate['path'],'--task',args.task,'--num_envs',str(args.num_envs),
            '--seeds',*map(str,seeds),'--device',args.device,'--viz','none','--info',
            '--output-dir',str(target)]
+    for value in args.env_override:
+        cmd += ['--env-override', value]
     if args.horizon_s is not None:
         cmd += ['--horizon-s',str(args.horizon_s)]
     for flag, values in [('--initial-cart-velocity-range',args.initial_cart_velocity_range),
@@ -269,7 +273,8 @@ def finish_evaluation(job, args, seeds):
     path = reports[0]; report = json.loads(path.read_text(encoding='utf-8'))
     if (report['status']!='complete' or report['summary']['status']!='complete'
         or report['checkpoint_sha256']!=candidate['sha256'] or report['seeds']!=seeds
-        or report['num_envs']!=args.num_envs or report.get('task')!=args.task):
+        or report['num_envs']!=args.num_envs or report.get('task')!=args.task
+        or report.get('env_overrides')!=args.env_override):
         raise ValueError(f'报告不完整或身份不匹配: {path}')
     episodes = [e for c in report['cohorts'] for e in c['episodes']]
     if len(episodes)!=len(seeds)*args.num_envs:
@@ -390,6 +395,7 @@ def main():
     p.add_argument('--initial-cart-velocity-range',type=float,nargs=2)
     p.add_argument('--initial-pole-velocity-range',type=float,nargs=2)
     p.add_argument('--output-dir',type=Path,default=Path('logs/checkpoint-selection'))
+    add_environment_overrides(p)
     args = p.parse_args()
     if args.horizon_s is not None and (not math.isfinite(args.horizon_s) or args.horizon_s<=0):
         p.error('horizon-s必须为有限正数')
