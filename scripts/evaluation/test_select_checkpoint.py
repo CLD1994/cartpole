@@ -49,7 +49,7 @@ class SelectionContracts(unittest.TestCase):
         path.write_bytes(b'checkpoint placeholder')
         selected = dict(path=str(path), iteration=1706, sha256=digest(path),
                         task='task', report='selection-report', summary={'successes': 0})
-        args = SimpleNamespace(task='task', num_envs=1, device='cpu', horizon_s=None,
+        args = SimpleNamespace(env_override=[], task='task', num_envs=1, device='cpu', horizon_s=None,
                                initial_cart_velocity_range=None, initial_pole_velocity_range=None)
         process = SimpleNamespace(returncode=0)
         with patch('select_checkpoint.subprocess.Popen', return_value=process):
@@ -60,7 +60,7 @@ class SelectionContracts(unittest.TestCase):
         (target / 'env.yaml').write_text('fixed config')
         (target / 'report.json').write_text(json.dumps(dict(
             status='complete', summary=dict(status='complete', successes=1),
-            checkpoint_sha256=selected['sha256'], seeds=[1001], num_envs=1, task='task',
+            env_overrides=[], checkpoint_sha256=selected['sha256'], seeds=[1001], num_envs=1, task='task',
             cohorts=[dict(episodes=[dict(success=True, cart_mean_abs_velocity_m_s=.1,
                                         cart_net_displacement_m=.2)])], code={'commit': 'fixed'},
         )))

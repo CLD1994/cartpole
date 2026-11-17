@@ -176,3 +176,28 @@ python .\scripts\evaluation\select_checkpoint.py `
 评估报告 schema 3 增加 `cart_mean_abs_velocity_m_s`、`cart_rms_velocity_m_s`、`cart_travel_m` 和 `cart_net_displacement_m`。行程是控制步末绝对速度的矩形积分；首尾位移是终态位置减实际初态位置，两者都不是回中心误差。
 
 进程清理只针对本次运行；已退出父进程遗留的后代进程不保证全部回收。清理异常需按报告的 PID 手动核查。
+
+### 匹配训练时的执行器覆盖
+
+如果训练命令覆盖了动作速度、加速度或时间常数，选模时也应传入相同的覆盖。
+先核对训练目录的 `params/env.yaml`，动作参数和重置随机范围必须一起核对；下面的
+0.9 m/s、10 m/s²、Tau0 仅是对应训练配置的示例，不是其他模型的默认值：
+
+```powershell
+python scripts/evaluation/select_checkpoint.py --run-dir "$run" `
+  --task Hexchip-Cartpole-Real-V2-Window16-Tau0-Acc9-Hz400-v0 `
+  --nomination saved --parallel-workers 3 --num_envs 32 `
+  --seeds 101 202 --holdout-seeds 1001 2002 --device cuda:0 `
+  --env-override 'env.actions.joint_effort.vel_max=0.9' `
+  --env-override 'env.events.randomize_tracking.params.vel_max_range=[0.9,0.9]' `
+  --env-override 'env.actions.joint_effort.acc_max=10' `
+  --env-override 'env.events.randomize_tracking.params.acc_max_range=[10,10]' `
+  --env-override 'env.actions.joint_effort.tau=0' `
+  --env-override 'env.events.randomize_tracking.params.tau_range=[0,0]'
+```
+
+`evaluate_policy.py` 也接受相同的 `--env-override`。覆盖只允许上述六个配置键；
+速度和加速度为正数，时间常数非负，随机范围为有序二元素数组。
+候选和 holdout 使用同一组覆盖，报告记录请求值、生效的执行器配置及实际 reset 抽样。
+解析后的完整配置仍保存在每次评估的 `env.yaml`。不指定覆盖时使用所选任务的当前配置，
+不会自动恢复训练目录的配置，也不承诺仅这六个覆盖就能重建任意训练环境。
