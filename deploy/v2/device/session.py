@@ -109,6 +109,8 @@ class Session:
         self._last_time = -math.inf
         self._stop_at = self._last_stop_tx = -math.inf
         self._disable_sent = False
+        self._disable_at = -math.inf
+        self._incoming_received_at = None
 
     def _receive_state(self, line, now):
         frame = parse_state(line)
@@ -116,9 +118,10 @@ class Session:
             self._fail('measurement_invalid', now)
             return
         # 这是主机收到完整帧的时刻，不证明设备采样或端到端新鲜度。
-        self._valid, self._valid_at = True, now
+        received_at = self._receipt_time(now)
+        self._valid, self._valid_at = True, received_at
         self.observation = Observation(frame.cart.position, frame.pole.position,
-                                       frame.cart.velocity, frame.pole.velocity, now)
+                                       frame.cart.velocity, frame.pole.velocity, received_at)
 
     def _now(self):
         now = self.clock()
@@ -260,6 +263,20 @@ class Session:
         elif self.phase in (Phase.ACTIVE, Phase.STOPPING):
             self._fail('application_abort', now)
 
+    def _receipt_time(self, now):
+        return now if self._incoming_received_at is None else self._incoming_received_at
+
+    def receive_at(self, line, received_at):
+        now = self._now()
+        if not math.isfinite(received_at) or received_at > now:
+            self._fail('invalid_receipt_time', now)
+            raise ValueError('invalid_receipt_time')
+        self._incoming_received_at = received_at
+        try:
+            self.receive(line)
+        finally:
+            self._incoming_received_at = None
+
     def receive(self, line: str):
         # Check old deadlines before newly received bytes can renew their timestamps.
         self.tick()
@@ -281,8 +298,9 @@ class Session:
             elif tag == 'MODE':
                 if len(words) != 3 or words[1] not in ('DISABLED', 'READY', 'FAULT'):
                     raise ValueError()
-                self.mode, self._mode_at = (words[1], words[2]), now
-                if self.phase == Phase.STOPPING and self._disable_sent and self.mode == ('DISABLED', 'NONE'):
+                self.mode, self._mode_at = (words[1], words[2]), self._receipt_time(now)
+                if (self.phase == Phase.STOPPING and self._disable_sent and self.mode == ('DISABLED', 'NONE')
+                        and self._receipt_time(now) >= self._disable_at):
                     self.disabled_confirmed = True
                     self.phase = Phase.FINISHED
                 elif self.phase == Phase.ACTIVE and self.mode != self.required_active_mode:
@@ -302,7 +320,7 @@ class Session:
                 if len(words) == 3:
                     value = int(words[2])
                     previous = self.values.get(words[1])
-                    self.values[words[1]] = (value, now)
+                    self.values[words[1]] = (value, self._receipt_time(now))
                     if self.phase == Phase.ACTIVE:
                         expected = self.expected_readback
                         if (words[1] in expected and value != expected[words[1]]) or (words[1] == 'CAL_LENGTH_UM' and previous and value != previous[0]):
@@ -343,6 +361,7 @@ class Session:
                 if self._measurement_ready(now) and self.observation.received_at > self._stop_at and self.observation.velocity_mm_s == 0:
                     if self._write('DISABLE'):
                         self._disable_sent = True
+                        self._disable_at = self._now()
 
     def command(self, action: float):
         """[-1,1]动作映射为目标速度；每次发送前重新检查有效性。"""

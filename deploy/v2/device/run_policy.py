@@ -13,6 +13,7 @@ from experiment_setup import (limits_from_manifest, PROTOCOL_BAUD, RIG_COORDINAT
                               ANGLE_SIGN, report_path, result_summary)
 from model_integrity import verify_model_files
 from receiver import Receiver
+from threaded_receiver import ThreadedReceiver, ReceiverPort
 from session import Session, Phase
 from step_loss_events import StepLossEventMixin
 from angle_pause import AnglePause
@@ -67,16 +68,21 @@ class ControlTransport:
     """只允许查询、会话速度命令和禁用，拒绝ENABLE/配置/定位。"""
     def __init__(self, port):
         self.port = port
-        self.partial = False
+        self._partial = False
+        self.reader = None
 
     @property
     def in_waiting(self):
-        return self.port.in_waiting
+        return self.reader.in_waiting if self.reader is not None else self.port.in_waiting
+
+    @property
+    def partial(self):
+        return self.reader.partial if self.reader is not None else self._partial
 
     def read(self, count):
         data = self.port.read(count)
         if data:
-            self.partial = not data.endswith(b"\n")
+            self._partial = not data.endswith(b"\n")
         return data
 
     def write(self, data):
@@ -111,7 +117,7 @@ class BoundSession(Session):
                 self.first_invalid_state = {
                     'raw_line': line, 'flags': int(line.split()[1]),
                     'cart_valid': frame.cart is not None, 'pole_valid': frame.pole is not None,
-                    'host_received_clock_s': self.clock(), 'phase': self.phase.value}
+                    'host_received_clock_s': self._receipt_time(self.clock()), 'phase': self.phase.value}
         super().receive(line)
 
     @property
@@ -428,9 +434,10 @@ def main(a=None):
         port = serial.Serial(port=None, baudrate=PROTOCOL_BAUD, timeout=0, write_timeout=.002)
         port.dtr = port.rts = False
         port.port = a.port
+        connection = ReceiverPort(port)
         try:
             a.serial_open_attempted = True
-            with port:
+            with connection:
                 try:
                     port.reset_input_buffer()
                     transport = (DiagnosticTransport if a.diagnostic_timing else ControlTransport)(port)
@@ -441,7 +448,8 @@ def main(a=None):
                         probe.enable_monitor()
                     if a.diagnostic_timing:
                         session.diagnostic_state_events = report['received_states']
-                    receiver = Receiver(transport, session, CLOCK, timeline=timeline if a.gap_timeline else None)
+                    receiver = ThreadedReceiver(port, session, CLOCK)
+                    connection.reader = receiver
                     # 与固件tools一致：先对齐持续遥测行，再发请求，避免丢查询回执。
                     align_end = CLOCK()+.5
                     while CLOCK() < align_end:
@@ -452,6 +460,8 @@ def main(a=None):
                             time.sleep(.0002)
                     else:
                         raise RuntimeError('initial_alignment_timeout')
+                    transport.reader = receiver
+                    receiver.start()
                     session.observe()
                     await_startup(session, receiver, transport, report)
                     report['device_snapshot'] = session.bind_calibration()
@@ -498,6 +508,7 @@ def main(a=None):
                         raise RuntimeError('preflight_receive_incomplete')
                     if event_diag:
                         session.run_query_pending = True
+                        session.run_query_sent_at = CLOCK()
                         if transport.write(b'RUN?\n') != 5:
                             raise RuntimeError('run_query_write')
                         run_deadline = CLOCK() + .2
@@ -516,6 +527,7 @@ def main(a=None):
                         print(f'预检通过：{limits.control_hz:g} Hz，{limits.speed_mm_s} mm/s 模型倍率，{limits.firmware_speed_mm_s} mm/s 部署限幅，{limits.firmware_acceleration_mm_s2} mm/s² 部署加速度（训练 {limits.acceleration_mm_s2}）；{duration}。', flush=True)
                         print(f'报告：{a.output}', flush=True)
                     session.start()
+                    receiver.active = True
                     grid_start_ns = time.perf_counter_ns()
                     start = next_tick = grid_start_ns / 1e9
                     next_slot = 0
@@ -809,6 +821,8 @@ def main(a=None):
                         'precommand_receive': drain,
                         'readback_in_flight': dict(refresh.pending) if refresh and refresh.pending else None}
                 finally:
+                    if receiver is not None:
+                        receiver.active = False
                     timeline.mark('control_loop_exit', cycle)
                     timeline.freeze()
                     report['active_elapsed_s']=CLOCK()-start if start is not None else None
@@ -864,6 +878,8 @@ def main(a=None):
             report['first_invalid_state'] = session.first_invalid_state if session else None
             report['session_failure'] = session.failure if session else None
             report['receive_error'] = receiver.error if receiver else None
+            report['threaded_receiver'] = receiver.report() if receiver else None
+            report['reader_stopped_before_port_close'] = connection.reader_stopped
             report['status'] = ('complete' if report['status'] == 'trial_ended' and report['samples'] and (report['disabled_confirmed'] or a.diagnostic_timing)
                                 and not report['session_failure'] and not report['receive_error'] else report['status'])
             if (a.continuous and report['status']=='interrupted' and report['disabled_confirmed']
