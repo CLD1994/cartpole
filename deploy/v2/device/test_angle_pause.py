@@ -19,10 +19,16 @@ class AnglePauseTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError,'command_gap_deadline'):
             p.check(obs(80),1.,.99,.006,.004)
         self.assertFalse(p.paused)
-    def test_pause_still_requires_fresh_measurement(self):
+    def test_pause_waits_on_stale_and_requires_fresh_resume(self):
         p=AnglePause();p.check(obs(80),1.,1.,.006,.004)
+        self.assertIsNone(p.check(obs(80),1.004114,1.,.006,.004))
+        self.assertIsNone(p.check(obs(0),1.005,1.,.006,.004))
+        self.assertTrue(p.paused)
+        self.assertIsNone(p.check(None,1.006,1.,.006,.004))
+        self.assertEqual(p.check(obs(0,1.007),1.007,1.,.006,.004),'resumed')
+    def test_first_pause_cannot_use_stale_measurement(self):
         with self.assertRaisesRegex(RuntimeError,'angle_pause_observation_deadline'):
-            p.check(obs(80),1.005,1.,.006,.004)
+            AnglePause().check(obs(80),1.005,1.004,.015,.004)
     def test_invalid_thresholds(self):
         for pair in ((60,60),(60,61),(0,0),(181,58),(float('nan'),58)):
             with self.assertRaises(ValueError):AnglePause(*pair)

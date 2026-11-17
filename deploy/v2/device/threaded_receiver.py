@@ -2,7 +2,7 @@
 from collections import deque
 import threading
 import time
-from receiver import Receiver
+from receiver import Receiver, ReceiveLimits
 from thread_priority import current_thread_priority
 
 class ThreadedReceiver:
@@ -12,6 +12,9 @@ class ThreadedReceiver:
         self.capacity=capacity;self.queue=deque();self.lock=threading.Lock()
         self.pending_bytes=0;self._partial=False;self._busy=False;self._polling=False
         self.source_pending=0;self.active=False;self.active_backlog_seen=0
+        self.pause_requested=False;self.pause_ack=False;self.policy_at=-float('inf');self.resume_pending=False
+        self._poll_active=False;self.policy_switches=0;self.resume_wait_counts={}
+        self.strict_limits=ReceiveLimits();self.paused_limits=ReceiveLimits(max_read_s=.1,max_poll_s=.1,partial_timeout_s=.1)
         self.error=None;self._error_delivered=False
         self.stop_event=threading.Event();self.done=threading.Event();self.worker=None
         self.poll_count=0;self.maximum_poll_s=0.;self.queued_count=0;self.drained_count=0
@@ -25,7 +28,7 @@ class ThreadedReceiver:
             def in_waiting(self):
                 count=source.in_waiting
                 owner.source_pending=count
-                if owner.active and isinstance(count,int) and count>128:
+                if (owner._poll_active if owner._polling else owner.active) and isinstance(count,int) and count>128:
                     owner.active_backlog_seen=max(owner.active_backlog_seen,count)
                 return count
             def read(self,count):return source.read(count)
@@ -35,6 +38,31 @@ class ThreadedReceiver:
     @property
     def in_waiting(self):
         return max(self.pending_bytes,self.source_pending,self.active_backlog_seen)
+    def request_pause(self):
+        self.pause_requested=True;self.resume_pending=False;self.active=False
+    def _select_policy(self):
+        requested=self.pause_requested
+        self._previous_poll_limit_s=self.paused_limits.max_poll_s if self.pause_ack and not requested else None
+        if requested != self.pause_ack:
+            self.policy_at=self.clock();self.policy_switches+=1
+        self.raw.limits=self.paused_limits if requested else self.strict_limits
+        self.pause_ack=requested
+        self._poll_active=self.active or self.resume_pending
+    def _resume_wait(self, reason):
+        self.resume_wait_counts[reason]=self.resume_wait_counts.get(reason,0)+1
+        return False
+    def resume_ready(self, observation):
+        # Host queue drain and receipt boundary only, not device sampling proof.
+        if self.error:return self._resume_wait('reader_error')
+        if observation is None:return self._resume_wait('missing_observation')
+        if self.partial or self.in_waiting:return self._resume_wait('receive_not_drained')
+        if observation.received_at <= self.policy_at:
+            return self._resume_wait('need_post_policy_observation')
+        if not self.resume_pending:
+            if not self.pause_ack:return self._resume_wait('pause_not_acknowledged')
+            self.pause_requested=False;self.resume_pending=True
+            return self._resume_wait('strict_requested')
+        return not self.pause_ack or self._resume_wait('strict_not_acknowledged')
     def enqueue(self,line,received_at):
         with self.lock:
             if len(self.queue)>=self.capacity:
@@ -52,8 +80,11 @@ class ThreadedReceiver:
                 while not self.stop_event.is_set():
                     begin=self.clock()
                     self._polling=True
+                    self._select_policy()
                     try:
-                        if not self.raw.poll():self.error=self.error or self.raw.error or 'reader_failed'
+                        ok = (self.raw.poll(previous_poll_limit_s=self._previous_poll_limit_s)
+                              if self._previous_poll_limit_s is not None else self.raw.poll())
+                        if not ok:self.error=self.error or self.raw.error or 'reader_failed'
                     finally:
                         self._partial=bool(self.raw._pending)
                         self._polling=False
@@ -88,7 +119,8 @@ class ThreadedReceiver:
                 'queue_capacity_frames':self.capacity,'queued_frames':self.queued_count,'drained_frames':self.drained_count,
                 'pending_bytes':self.pending_bytes,'last_source_pending_bytes':self.source_pending,
                 'active_source_backlog_peak_bytes':self.active_backlog_seen,'error':self.error,'poll_count':self.poll_count,
-                'maximum_reader_poll_s':self.maximum_poll_s,'thread_priority':self.priority_report,
+                'maximum_reader_poll_s':self.maximum_poll_s,
+                'pause_policy':{'requested':self.pause_requested,'acknowledged':self.pause_ack,'policy_at':self.policy_at if self.policy_at != -float('inf') else None,'resume_pending':self.resume_pending,'switches':self.policy_switches,'resume_wait_counts':dict(self.resume_wait_counts)},'thread_priority':self.priority_report,
                 'scope':'receipt timestamps are host reader parse times, not device sampling; no latest-frame overwrite'}
 
 class ReceiverPort:

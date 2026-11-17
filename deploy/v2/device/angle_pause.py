@@ -16,14 +16,15 @@ class AnglePause:
         if not self.paused and now-budget_at >= hard_limit:
             raise RuntimeError('command_gap_deadline')
         if observation is None:
-            if self.paused:
-                raise RuntimeError('angle_pause_observation_deadline')
             return None  # 非暂停的缺测由原运行器处理。
         angle = abs(observation.si()[1])
         if not math.isfinite(angle):
             raise RuntimeError('invalid_angle')
-        if (self.paused or angle >= self.enter) and now-observation.received_at >= observation_limit:
-            raise RuntimeError('angle_pause_observation_deadline')
+        if now-observation.received_at >= observation_limit:
+            if self.paused:
+                return None  # Session.tick still bounds sustained communication loss.
+            if angle >= self.enter:
+                raise RuntimeError('angle_pause_observation_deadline')
         if self.paused and angle <= self.resume:
             self.paused = False
             self.resumed_since_command = True

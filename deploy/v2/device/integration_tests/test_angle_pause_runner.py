@@ -57,6 +57,9 @@ class RunnerCombinationTests(unittest.TestCase):
         for k,v in port.values.items():session.receive(f'OK {k} {v}')
         session.receive('STATE 3 0 0 0 0');session.bind_calibration();session.start()
         receiver=Receiver(port,session,clock)
+        receiver.request_pause=lambda:None
+        receiver.resume_ready=lambda obs:True
+        receiver.active_backlog_seen=0
         report={'angle_pause':{'events':[],'pause_count':0,'resume_count':0,'intentional_completion_gaps':0},
             'readback_refresh':[],'run_totals':dict.fromkeys(('command_completions','command_gaps_over_4ms',
             'command_gaps_at_or_over_6ms','command_gaps_at_or_over_hard_limit','maximum_command_gap_s','maximum_active_command_gap_s',

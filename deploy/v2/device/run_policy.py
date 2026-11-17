@@ -426,6 +426,13 @@ def main(a=None):
         nonlocal budget_at
         if a.diagnostic_timing:
             return None
+        if pause.paused:
+            eligible = (observation is not None and now-observation.received_at < observation_limit_s
+                        and abs(observation.si()[1]) <= pause.resume)
+            if not eligible:
+                receiver.request_pause()
+            elif not receiver.resume_ready(observation):
+                return None
         transition = pause.check(observation, now, budget_at, hard_limit_s, observation_limit_s)
         if transition:
             info = report['angle_pause']
@@ -433,7 +440,10 @@ def main(a=None):
             info['events'].append({'event': transition, 'elapsed_s': now-start,
                                    'abs_angle_deg': abs(math.degrees(observation.si()[1]))})
             del info['events'][:-512]
+            if transition == 'paused':
+                receiver.request_pause()
             if transition == 'resumed':
+                receiver.active = True
                 budget_at = now
         return transition
     def discard_expired_candidate(observation):
@@ -569,7 +579,7 @@ def main(a=None):
                         stage = 'poll'
                         cycle += 1
                         timeline.mark('loop_poll_begin', cycle)
-                        if transport.in_waiting > 128:
+                        if transport.in_waiting > 128 and (not pause.paused or receiver.active_backlog_seen > 128):
                             raise RuntimeError('active_backlog')
                         if not receiver.poll() or session.phase != Phase.ACTIVE:
                             raise RuntimeError(receiver.error or session.failure or 'session_inactive')
@@ -594,7 +604,9 @@ def main(a=None):
                         if pause.paused and not a.diagnostic_timing:
                             stage = 'angle_paused'
                             timeline.mark(stage, cycle)
-                            if state_guard(session.observation, session):
+                            if session.observation is None:
+                                verify_bound_calibration(session)
+                            elif state_guard(session.observation, session):
                                 raise RuntimeError('paused_state_guard')
                             if refresh:
                                 refresh.send_if_due(now, end)

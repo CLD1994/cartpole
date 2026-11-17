@@ -47,12 +47,12 @@ class Receiver:
         self.session.abort()
         return False
 
-    def poll(self):
+    def poll(self, *, previous_poll_limit_s=None):
         """至多一次读操作，返回本批是否有效；error锁存接收异常，致命会话异常传播。"""
         self.session.tick()
         now = self.clock()
         if (not math.isfinite(now) or (self._last_poll is not None and
-                not 0 <= now - self._last_poll <= self.limits.max_poll_s)):
+                not 0 <= now - self._last_poll <= (self.limits.max_poll_s if previous_poll_limit_s is None else previous_poll_limit_s))):
             self._last_poll = now
             return self._fail('poll_deadline')
         self._last_poll = now
