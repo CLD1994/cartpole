@@ -1,36 +1,38 @@
-"""真实文件/编译器边界的集成测试，独立于纯单元测试运行。"""
+"""JSON package: real compiler/files boundary, no SDK or hardware."""
 from pathlib import Path
+import json
 import subprocess
 import tempfile
 import unittest
 EDGE = Path(__file__).parents[2]
-BASE = ('EDGE_PACKAGE_V2\nmodel_cpu=none\nmodel_npu=policy.om\nsha256_cpu=none\nsha256_npu=' + 'a'*64 + '\ncontrol_hz=400\n'
-        'action_scale_mm_s=900\nvelocity_limit_mm_s=900\nacceleration_mm_s2=10000\n'
-        'angle_sign=-1\npause_deg=20\nresume_deg=18\n')
+BASE = dict(schema_version=2,model_cpu=None,model_npu='policy.om',sha256_cpu=None,sha256_npu='a'*64,
+            control_hz=400,action_scale_mm_s=900,velocity_limit_mm_s=900,acceleration_mm_s2=10000,
+            angle_sign=-1,pause_deg=20,resume_deg=18)
 class PackageLoadTest(unittest.TestCase):
     def test_load_and_reject_malformed_packages(self):
         with tempfile.TemporaryDirectory() as directory:
-            p = Path(directory)
-            (p/'probe.c').write_text('#include "package.h"\n#include <stdio.h>\nint main(int n,char**v){edge_package p;char e[200];(void)n;int r=edge_package_load(v[1],&p,e,sizeof(e));if(r){puts(e);return 1;}printf("%.0f %d %d %s\\n",p.control_hz,p.action_scale_mm_s,p.acceleration_mm_s2,p.model_npu_path);return 0;}')
-            subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-I'+str(EDGE),str(p/'probe.c'),str(EDGE/'package.c'),'-lm','-o',str(p/'probe')],check=True)
-            (p/'policy.om').write_bytes(b'test-model')
-            def run(text):
-                (p/'edge-package.txt').write_text(text)
-                return subprocess.run([str(p/'probe'),str(p/'edge-package.txt')],capture_output=True,text=True)
-            good = run(BASE)
-            self.assertEqual(good.returncode,0,good.stdout)
-            self.assertIn('400 900 10000',good.stdout)
-            for text in (BASE+'extra\n', BASE.replace('400','nan'), BASE.replace('900','0'),
-                         BASE.replace('policy.om','../policy.om'),BASE.replace('angle_sign=-1','angle_sign=0'),
-                         BASE.replace('resume_deg=18','resume_deg=21'),BASE[:-1],BASE.replace('10000','99999999999999999999999')):
-                with self.subTest(text=text): self.assertNotEqual(run(text).returncode,0)
-            cpu = BASE.replace('model_cpu=none','model_cpu=policy.fp32').replace('model_npu=policy.om','model_npu=none').replace('sha256_cpu=none','sha256_cpu='+'b'*64).replace('sha256_npu='+'a'*64,'sha256_npu=none')
-            (p/'policy.fp32').write_bytes(b'cpu-model')
+            p=Path(directory)
+            (p/'probe.c').write_text('#include "package.h"\n#include <stdio.h>\nint main(int n,char**v){edge_package p;char e[200];(void)n;int r=edge_package_load(v[1],&p,e,sizeof(e));if(r){puts(e);return 1;}printf("%.0f %d\\n",p.control_hz,p.velocity_limit_mm_s);return 0;}')
+            subprocess.run(['cc','-DYYJSON_DISABLE_WRITER=1','-DYYJSON_DISABLE_UTILS=1','-DYYJSON_DISABLE_FILE=1','-DYYJSON_DISABLE_INCR_READER=1','-DYYJSON_READER_DEPTH_LIMIT=16','-std=c11','-Wall','-Wextra','-Werror','-I'+str(EDGE),str(p/'probe.c'),str(EDGE/'package.c'),str(EDGE/'third_party/yyjson/yyjson.c'),'-lm','-o',str(p/'probe')],check=True)
+            (p/'policy.om').write_bytes(b'model')
+            (p/'policy.fp32').write_bytes(b'cpu')
+            def run(value):
+                text=value if isinstance(value,str) else json.dumps(value)
+                (p/'edge-package.json').write_bytes(text.encode())
+                return subprocess.run([str(p/'probe'),str(p/'edge-package.json')],capture_output=True,text=True)
+            self.assertEqual(run(BASE).returncode,0)
+            self.assertEqual(run(dict(reversed(list(BASE.items())))).returncode,0)
+            cpu=dict(BASE,model_cpu='policy.fp32',sha256_cpu='b'*64,model_npu=None,sha256_npu=None)
             self.assertEqual(run(cpu).returncode,0)
-            absent = cpu.replace('model_cpu=policy.fp32','model_cpu=none').replace('sha256_cpu='+'b'*64,'sha256_cpu=none')
-            self.assertNotEqual(run(absent).returncode,0)
-            self.assertNotEqual(run(cpu.replace('sha256_npu=none','sha256_npu='+'a'*64)).returncode,0)
-            self.assertNotEqual(run(BASE.replace('EDGE_PACKAGE_V2','EDGE_PACKAGE_V1')).returncode,0)
-            (p/'policy.om').unlink()
-            self.assertNotEqual(run(BASE).returncode,0)
-if __name__ == '__main__': unittest.main()
+            bad=[dict(BASE,unknown=1),dict(BASE,schema_version=1),dict(BASE,schema_version=True),
+                 dict(BASE,control_hz='400'),dict(BASE,control_hz=float('nan')),dict(BASE,model_npu='../policy.om'),
+                 dict(BASE,model_npu={'file':'policy.om'}),dict(BASE,sha256_npu=None),dict(BASE,pause_deg=21),
+                 dict(BASE,acceleration_mm_s2=1.5),dict(BASE,acceleration_mm_s2=2**32),
+                 dict(BASE,model_npu=None,sha256_npu=None),
+                 json.dumps(BASE)[:-1]+',"control_hz":400}',json.dumps(BASE)+' {}',
+                 json.dumps(BASE)+'\x00junk',json.dumps(BASE).replace('policy.om','policy.om\\u0000junk'),'[]','x'*8193]
+            missing=dict(BASE);del missing['resume_deg'];bad.append(missing)
+            for value in bad:
+                with self.subTest(value=value): self.assertNotEqual(run(value).returncode,0)
+            (p/'policy.om').unlink();self.assertNotEqual(run(BASE).returncode,0)
+if __name__=='__main__': unittest.main()

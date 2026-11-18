@@ -44,9 +44,11 @@ add_executable(cartpole_edge
     cpu_policy.c
     control.c
     package.c
+    third_party/yyjson/yyjson.c
 )
 
 target_include_directories(cartpole_edge PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/npu/include)
+target_compile_definitions(cartpole_edge PRIVATE YYJSON_DISABLE_WRITER=1 YYJSON_DISABLE_UTILS=1 YYJSON_DISABLE_FILE=1 YYJSON_DISABLE_INCR_READER=1 YYJSON_READER_DEPTH_LIMIT=16)
 target_link_libraries(cartpole_edge PRIVATE m)
 target_compile_options(cartpole_edge PRIVATE -ffp-contract=off)
 if(EDGE_ENABLE_NPU)

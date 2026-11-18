@@ -1,35 +1,29 @@
 #include "package.h"
-#include <errno.h>
+#include "third_party/yyjson/yyjson.h"
 #include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* 有限业务清单，不解析 JSON。每个字段固定顺序且必须以 LF 结束。 */
-static int field(FILE *f, const char *key, char *value, size_t cap) {
-    char line[256];
-    if (!fgets(line, sizeof(line), f)) return -1;
-    size_t n = strlen(line), k = strlen(key);
-    if (!n || line[n-1] != '\n' || strncmp(line,key,k) || n <= k+1 || n-k > cap) return -1;
-    memcpy(value,line+k,n-k-1); value[n-k-1] = 0;
-    return 0;
+/* Package metadata is bounded and parsed by pinned upstream yyjson. */
+static const char *keys[]={"schema_version","model_cpu","model_npu","sha256_cpu","sha256_npu",
+    "control_hz","action_scale_mm_s","velocity_limit_mm_s","acceleration_mm_s2","angle_sign","pause_deg","resume_deg"};
+static int numeric(yyjson_val *root,const char *key,double *out) {
+    yyjson_val *v=yyjson_obj_get(root,key);
+    if(!yyjson_is_num(v) || !isfinite(yyjson_get_num(v))) return -1;
+    *out=yyjson_get_num(v); return 0;
 }
-static int integer(FILE *f, const char *key, int *out) {
-    char text[128], *end;
-    if (field(f,key,text,sizeof(text))) return -1;
-    errno = 0;
-    long v = strtol(text,&end,10);
-    if (errno || end == text || *end || v < INT_MIN || v > INT_MAX || text[0]==' ' || text[0]=='\t') return -1;
-    *out = (int)v; return 0;
+static int integer(yyjson_val *root,const char *key,int *out) {
+    double n;
+    if(numeric(root,key,&n) || n<INT_MIN || n>INT_MAX || trunc(n)!=n) return -1;
+    *out=(int)n; return 0;
 }
-static int number(FILE *f, const char *key, double *out) {
-    char text[128], *end;
-    if (field(f,key,text,sizeof(text))) return -1;
-    errno = 0;
-    double v = strtod(text,&end);
-    if (errno || end == text || *end || !isfinite(v) || text[0]==' ' || text[0]=='\t') return -1;
-    *out = v; return 0;
+static const char *optional_string(yyjson_val *root,const char *key) {
+    yyjson_val *v=yyjson_obj_get(root,key);
+    if(yyjson_is_null(v)) return "none";
+    if(!yyjson_is_str(v) || strlen(yyjson_get_str(v))!=yyjson_get_len(v)) return NULL;
+    return yyjson_get_str(v);
 }
 static int model_file(const char *manifest, const char *name, const char *expected,
                       const char *hash, char *dest, size_t cap) {
@@ -47,40 +41,60 @@ static int model_file(const char *manifest, const char *name, const char *expect
     return valid ? 0 : -1;
 }
 int edge_package_load(const char *path, edge_package *out, char *err, size_t cap) {
-    edge_package p = {0};
-    FILE *f = NULL;
-    const char *why = "invalid_manifest";
-    char header[64], cpu[128], npu[128];
-    if (out) memset(out,0,sizeof(*out));
-    if (err && cap) err[0] = 0;
-    if (!path || !out) goto fail;
-    f = fopen(path,"rb");
-    if (!f) { why="manifest_unreadable"; goto fail; }
-    if (!fgets(header,sizeof(header),f) || strcmp(header,"EDGE_PACKAGE_V2\n")) goto fail;
-    if (field(f,"model_cpu=",cpu,sizeof(cpu)) || field(f,"model_npu=",npu,sizeof(npu)) ||
-        field(f,"sha256_cpu=",p.sha256_cpu,sizeof(p.sha256_cpu)) ||
-        field(f,"sha256_npu=",p.sha256_npu,sizeof(p.sha256_npu))) goto fail;
-    if (number(f,"control_hz=",&p.control_hz) ||
-        integer(f,"action_scale_mm_s=",&p.action_scale_mm_s) ||
-        integer(f,"velocity_limit_mm_s=",&p.velocity_limit_mm_s) ||
-        integer(f,"acceleration_mm_s2=",&p.acceleration_mm_s2) ||
-        integer(f,"angle_sign=",&p.angle_sign) ||
-        number(f,"pause_deg=",&p.pause_deg) || number(f,"resume_deg=",&p.resume_deg) ||
-        fgetc(f)!=EOF || ferror(f)) goto fail;
-    if ((p.control_hz!=400 && p.control_hz!=500) ||
-        (p.action_scale_mm_s!=900 && p.action_scale_mm_s!=1250) ||
-        p.velocity_limit_mm_s!=p.action_scale_mm_s || p.acceleration_mm_s2<=0 ||
-        p.angle_sign!=-1 || p.pause_deg!=20 || p.resume_deg!=18) goto fail;
-    fclose(f); f=NULL;
+    edge_package p={0}; FILE *f=NULL; yyjson_doc *doc=NULL; yyjson_val *root=NULL;
+    char data[8193]; const char *why="invalid_manifest";
+    if(out) memset(out,0,sizeof(*out));
+    if(err && cap) err[0]=0;
+    if(!path || !out) goto fail;
+    f=fopen(path,"rb");
+    if(!f) { why="manifest_unreadable"; goto fail; }
+    size_t n=fread(data,1,sizeof(data)-1,f);
+    if(ferror(f) || fgetc(f)!=EOF || memchr(data,0,n)) goto fail;
+    fclose(f);f=NULL;data[n]=0;
+    doc=yyjson_read(data,n,0);
+    root=yyjson_doc_get_root(doc);
+    if(!yyjson_is_obj(root)) goto fail;
+    unsigned seen=0;
+    yyjson_obj_iter iter=yyjson_obj_iter_with(root);
+    yyjson_val *key;
+    while((key=yyjson_obj_iter_next(&iter))) {
+        size_t k;
+        for(k=0;k<sizeof(keys)/sizeof(keys[0]);k++)
+            if(yyjson_get_len(key)==strlen(keys[k]) && !strcmp(yyjson_get_str(key),keys[k])) break;
+        if(k==sizeof(keys)/sizeof(keys[0]) || (seen&(1u<<k))) goto fail;
+        seen|=1u<<k;
+    }
+    if(seen!=((1u<<12)-1)) goto fail;
+    int version;
+    if(integer(root,"schema_version",&version) || version!=2 ||
+       numeric(root,"control_hz",&p.control_hz) ||
+       integer(root,"action_scale_mm_s",&p.action_scale_mm_s) ||
+       integer(root,"velocity_limit_mm_s",&p.velocity_limit_mm_s) ||
+       integer(root,"acceleration_mm_s2",&p.acceleration_mm_s2) ||
+       integer(root,"angle_sign",&p.angle_sign) ||
+       numeric(root,"pause_deg",&p.pause_deg) || numeric(root,"resume_deg",&p.resume_deg)) goto fail;
+    if((p.control_hz!=400 && p.control_hz!=500) ||
+       (p.action_scale_mm_s!=900 && p.action_scale_mm_s!=1250) ||
+       p.velocity_limit_mm_s!=p.action_scale_mm_s || p.acceleration_mm_s2<=0 ||
+       p.angle_sign!=-1 || p.pause_deg!=20 || p.resume_deg!=18) goto fail;
+    const char *cpu=optional_string(root,"model_cpu"), *npu=optional_string(root,"model_npu");
+    const char *hc=optional_string(root,"sha256_cpu"), *hn=optional_string(root,"sha256_npu");
+    if(!cpu || !npu || !hc || !hn || strlen(hc)>=sizeof(p.sha256_cpu) || strlen(hn)>=sizeof(p.sha256_npu)) goto fail;
+    /* Literal "none" is not a filename: absent entries must be JSON null. */
+    for(int i=1;i<=4;i++) {
+        yyjson_val *v=yyjson_obj_get(root,keys[i]);
+        if(yyjson_is_str(v) && !strcmp(yyjson_get_str(v),"none")) goto fail;
+    }
+    strcpy(p.sha256_cpu,hc);strcpy(p.sha256_npu,hn);
     why="model_unreadable_or_invalid";
-    if (model_file(path,cpu,"policy.fp32",p.sha256_cpu,p.model_cpu_path,sizeof(p.model_cpu_path)) ||
-        model_file(path,npu,"policy.om",p.sha256_npu,p.model_npu_path,sizeof(p.model_npu_path)) ||
-        (!p.model_cpu_path[0] && !p.model_npu_path[0])) goto fail;
-    /* SHA256 是打包来源记录。运行时不检测模型文件事后替换。 */
-    *out=p;
-    return 0;
+    if(model_file(path,cpu,"policy.fp32",hc,p.model_cpu_path,sizeof(p.model_cpu_path)) ||
+       model_file(path,npu,"policy.om",hn,p.model_npu_path,sizeof(p.model_npu_path)) ||
+       (!p.model_cpu_path[0] && !p.model_npu_path[0])) goto fail;
+    /* Hashes record preparation provenance, not runtime tamper detection. */
+    yyjson_doc_free(doc);*out=p;return 0;
 fail:
-    if (f) fclose(f);
-    if (err && cap) snprintf(err,cap,"%s",why);
+    if(f) fclose(f);
+    yyjson_doc_free(doc);
+    if(err && cap) snprintf(err,cap,"%s",why);
     return -1;
 }

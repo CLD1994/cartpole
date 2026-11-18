@@ -27,7 +27,7 @@ python deploy/v2/edge/prepare_package.py \
   --output /path/to/new-edge-package
 ```
 
-输入目录须包含 `model.json`、`policy.onnx` 和其外部权重。工具检查来源散列和输入输出形状，派生频率、动作尺度和运行限值，导出 FP32 权重 `policy.fp32`，可选复制 OM，生成 V2 `edge-package.txt`。CPU 仅支持明确验证过的前馈算子图，未知结构直接拒绝；不隐式更换模型。它不能证明提交的 OM 确实由该 ONNX 转换；模型转换和数值对照仍是部署验收的一部分。包内 SHA256 是来源记录，C 运行器不进行运行时散列校验；生成后应整体部署，不单独替换文件。
+输入目录须包含 `model.json`、`policy.onnx` 和其外部权重。工具检查来源散列和输入输出形状，派生频率、动作尺度和运行限值，导出 FP32 权重 `policy.fp32`，可选复制 OM，生成 JSON `edge-package.json`（`schema_version: 2`）。CPU 仅支持明确验证过的前馈算子图，未知结构直接拒绝；不隐式更换模型。它不能证明提交的 OM 确实由该 ONNX 转换；模型转换和数值对照仍是部署验收的一部分。包内 SHA256 是来源记录，C 运行器不进行运行时散列校验；生成后应整体部署，不单独替换文件。
 
 ## 板端使用
 
@@ -37,7 +37,7 @@ CPU 后端不需要 NPU 服务或动态库。NPU 后端需要匹配的驱动、S
 ./cartpole_edge --port /dev/ttyXXXX query
 ./cartpole_edge --port /dev/ttyXXXX state --secs 1
 ./cartpole_edge --port /dev/ttyXXXX enable
-./cartpole_edge --port /dev/ttyXXXX run --backend cpu --package /path/to/new-edge-package/edge-package.txt
+./cartpole_edge --port /dev/ttyXXXX run --backend cpu --package /path/to/new-edge-package/edge-package.json
 ```
 
 `--backend cpu|npu` 必须显式选择，缺模型或该构建不支持时直接失败，不静默回退。
@@ -84,3 +84,5 @@ make -C deploy/v2/edge test-integration PYTHON=/path/to/python
 | `policy.c` / `npu/` | NPU 生命周期与原始动作推理 |
 
 真实板端验收仍需匹配工具链、当前模型 OM、实际 UART 节点、模型数值对照与闭环时序证据。
+
+清单解析使用固定版本 yyjson 静态编入，无板端 JSON 动态库依赖。清单上限 8 KiB，拒绝重复/未知字段、类型错误及不完整包；字段顺序无关。旧自定义文本清单不保留兼容。

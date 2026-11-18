@@ -37,11 +37,13 @@ class PrepareTest(unittest.TestCase):
             result=m.prepare(root,root/'source.om',root/'edge')
             self.assertEqual((result.parent/'policy.om').read_bytes(),b'om-fixture')
             self.assertIn(hashlib.sha256(b'om-fixture').hexdigest(),result.read_text())
-            self.assertIn('control_hz=400\n',result.read_text())
+            self.assertEqual(json.loads(result.read_text())['control_hz'],400)
+            self.assertEqual(result.name,'edge-package.json')
+            self.assertFalse((result.parent/'edge-package.txt').exists())
             self.assertTrue((result.parent/'source-model.json').is_file())
             with self.assertRaises(FileExistsError): m.prepare(root,root/'source.om',root/'edge')
 
-    def test_manifest_bytes_remain_lf_on_windows_text_translation(self):
+    def test_manifest_json_survives_windows_text_translation(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d); self.fixture(root)
             original = Path.write_text
@@ -51,15 +53,15 @@ class PrepareTest(unittest.TestCase):
             with patch.object(Path, 'write_text', windows_write_text):
                 result = m.prepare(root, root/'source.om', root/'edge')
             raw = result.read_bytes()
-            self.assertTrue(raw.startswith(b'EDGE_PACKAGE_V2\n'))
-            self.assertNotIn(b'\r', raw)
-            self.assertEqual(raw.count(b'\n'), 12)
+            self.assertEqual(json.loads(raw)['schema_version'],2)
+            self.assertEqual(json.loads(raw.replace(b'\n', b'\r\n'))['control_hz'],400)
 
     def test_cpu_only_package(self):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d); self.fixture(root)
             result=m.prepare(root,None,root/'cpu')
-            self.assertIn('model_npu=none\n',result.read_text())
+            self.assertIsNone(json.loads(result.read_text())['model_npu'])
+            self.assertIsNone(json.loads(result.read_text())['sha256_npu'])
             self.assertTrue((result.parent/'policy.fp32').read_bytes().startswith(b'CPFP32V1'))
             self.assertFalse((result.parent/'policy.om').exists())
 

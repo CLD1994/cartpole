@@ -32,10 +32,21 @@ def render_manifest(manifest, digest, npu_digest=None):
         raise ValueError('invalid_sha256')
     if npu_digest is not None and re.fullmatch('[0-9a-f]{64}', npu_digest) is None:
         raise ValueError('invalid_npu_sha256')
-    return (f'EDGE_PACKAGE_V2\nmodel_cpu=policy.fp32\nmodel_npu={"policy.om" if npu_digest else "none"}\n'
-            f'sha256_cpu={digest}\nsha256_npu={npu_digest or "none"}\ncontrol_hz={hz}\n'
-            f'action_scale_mm_s={speed}\nvelocity_limit_mm_s={speed}\n'
-            f'acceleration_mm_s2={acceleration}\nangle_sign=-1\npause_deg=20\nresume_deg=18\n')
+    return json.dumps({
+        'schema_version': 2,
+        'model_cpu': 'policy.fp32',
+        'model_npu': 'policy.om' if npu_digest is not None else None,
+        'sha256_cpu': digest,
+        'sha256_npu': npu_digest,
+        'control_hz': hz,
+        'action_scale_mm_s': speed,
+        'velocity_limit_mm_s': speed,
+        'acceleration_mm_s2': acceleration,
+        'angle_sign': -1,
+        'pause_deg': 20,
+        'resume_deg': 18,
+    }, indent=2, allow_nan=False) + '\n'
+
 
 
 def prepare(model_directory, om, destination):
@@ -70,13 +81,13 @@ def prepare(model_directory, om, destination):
             shutil.copyfile(om, copied)
             with copied.open('rb') as stream:
                 npu_digest = hashlib.file_digest(stream, 'sha256').hexdigest()
-        (destination / 'edge-package.txt').write_bytes(render_manifest(manifest, digest, npu_digest).encode('ascii'))
+        (destination / 'edge-package.json').write_bytes(render_manifest(manifest, digest, npu_digest).encode('ascii'))
         # 来源仅供追踪，不作为运行器额外配置。
         (destination / 'source-model.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + '\n', encoding='utf8')
     except BaseException:
         shutil.rmtree(destination)
         raise
-    return destination / 'edge-package.txt'
+    return destination / 'edge-package.json'
 
 
 def main():

@@ -1,7 +1,7 @@
 # 原生无硬件测试。生产目标仅由 CMake + build.sh 构建，可选真实 NPU 后端。
 CC ?= cc
 CFLAGS ?= -O2 -Wall -Wextra -Werror
-CPPFLAGS += -D_DEFAULT_SOURCE -I. -Inpu/include
+CPPFLAGS += -DYYJSON_DISABLE_WRITER=1 -DYYJSON_DISABLE_UTILS=1 -DYYJSON_DISABLE_FILE=1 -DYYJSON_DISABLE_INCR_READER=1 -DYYJSON_READER_DEPTH_LIMIT=16 -D_DEFAULT_SOURCE -I. -Inpu/include
 PYTHON ?= python3
 TEST_BUILD := .test-build
 UNIT := proto_test policy_test console_test $(TEST_BUILD)/control_test $(TEST_BUILD)/session_test $(TEST_BUILD)/edge_proto_test
@@ -39,8 +39,8 @@ $(TEST_BUILD)/uart_test: tests/integration/test_edge_uart.c uart.c uart.h | $(TE
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ tests/integration/test_edge_uart.c uart.c -lm
 
 # 只供 PTY 集成测试的可执行文件，名称和输出均标记 TEST_ONLY。
-$(TEST_BUILD)/edge_TEST_ONLY: main.c uart.c proto.c rig.c console.c control.c package.c tests/support/policy_stub.c $(wildcard *.h) | $(TEST_BUILD)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -DEDGE_TEST_STUB -o $@ main.c uart.c proto.c rig.c console.c control.c package.c tests/support/policy_stub.c -lm
+$(TEST_BUILD)/edge_TEST_ONLY: main.c uart.c proto.c rig.c console.c control.c package.c third_party/yyjson/yyjson.c tests/support/policy_stub.c $(wildcard *.h) | $(TEST_BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DEDGE_TEST_STUB -o $@ main.c uart.c proto.c rig.c console.c control.c package.c third_party/yyjson/yyjson.c tests/support/policy_stub.c -lm
 
 test-integration: $(TEST_BUILD)/uart_test $(TEST_BUILD)/edge_TEST_ONLY
 	./$(TEST_BUILD)/uart_test

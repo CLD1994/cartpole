@@ -3,6 +3,7 @@
 不打开实际设备。针对参数索引、MODE 回执、无效 lane 显示、预检写入边界和停机确认。
 """
 import hashlib
+import json
 import os
 from pathlib import Path
 import pty
@@ -102,8 +103,11 @@ class Firmware:
 def package(directory):
     model = b"test model, not an OM file"
     Path(directory, "policy.om").write_bytes(model)
-    manifest = Path(directory, "edge.package")
-    manifest.write_text("EDGE_PACKAGE_V2\nmodel_cpu=none\nmodel_npu=policy.om\nsha256_cpu=none\nsha256_npu=" + hashlib.sha256(model).hexdigest() + "\ncontrol_hz=400\naction_scale_mm_s=900\nvelocity_limit_mm_s=900\nacceleration_mm_s2=10000\nangle_sign=-1\npause_deg=20\nresume_deg=18\n")
+    manifest = Path(directory, "edge-package.json")
+    manifest.write_text(json.dumps(dict(schema_version=2,model_cpu=None,model_npu="policy.om",
+        sha256_cpu=None,sha256_npu=hashlib.sha256(model).hexdigest(),control_hz=400,
+        action_scale_mm_s=900,velocity_limit_mm_s=900,acceleration_mm_s2=10000,
+        angle_sign=-1,pause_deg=20,resume_deg=18)))
     return str(manifest)
 
 

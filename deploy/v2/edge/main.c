@@ -151,7 +151,7 @@ static int run_policy(int argc, char **argv, int first)
         else { manifest=NULL; break; }
     }
     if (!manifest || !backend_name || (strcmp(backend_name,"cpu") && strcmp(backend_name,"npu"))) {
-        fprintf(stderr,"[edge] run requires --backend cpu|npu --package path/to/edge-package.txt\n"); return 1;
+        fprintf(stderr,"[edge] run requires --backend cpu|npu --package path/to/edge-package.json\n"); return 1;
     }
     policy_backend backend=!strcmp(backend_name,"cpu") ? POLICY_CPU : POLICY_NPU;
     edge_package package;
@@ -378,7 +378,7 @@ static void print_usage(const char *prog)
             "usage: %s [--port /dev/ttyXXXX] [command [args]]\n"
             "  (no command)                     interactive console (default)\n"
             "  console                          same as above\n"
-            "  run --backend cpu|npu --package edge-package.txt       policy control (validated package; firmware must be READY)\n"
+            "  run --backend cpu|npu --package edge-package.json       policy control (validated package; firmware must be READY)\n"
             "  calib                            one-shot: interactive 2-point calibration (MARK LEFT/RIGHT + ENABLE)\n"
             "  mark-left                        one-shot: send MARK LEFT (cart at left end)\n"
             "  mark-right                       one-shot: send MARK RIGHT (cart at right end)\n"
