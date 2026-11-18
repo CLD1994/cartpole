@@ -39,6 +39,9 @@ add_executable(cartpole_edge
     uart.c
     proto.c
     cartpole.c
+    cartpole_runtime.c
+    cartpole_schedule.c
+    serial_cartpole.c
     cartpole_controller.c
     cartpole_motion.c
     console.c

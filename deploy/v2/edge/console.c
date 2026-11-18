@@ -15,6 +15,7 @@
 
 #include "cartpole.h"
 #include "config.h"
+#include "serial_cartpole.h"
 
 #define CONSOLE_LINE_MAX 128
 #define DUMP_WINDOW_S 0.5 /* CONFIG? dump 的应答收集窗口 */
@@ -222,9 +223,9 @@ static void consume_line(void)
     input.ready = 0;
     input.overflow = 0;
 }
-static int wait_enter(void)
+static int wait_enter(cartpole_t *c)
 {
-    cartpole_result_t rc = cartpole_run_loop(.020, 0, read_line_tick, NULL);
+    cartpole_result_t rc = cartpole_run_loop(c, .020, 0, read_line_tick, NULL);
     int ok = rc == CARTPOLE_OK && input.ready && !input.eof;
     consume_line();
     return ok ? 0 : -1;
@@ -240,19 +241,19 @@ int console_transaction_result(const char *operation, cartpole_result_t result)
                                        : "");
     return -1;
 }
-static int query_mode_for_command(void)
+static int query_mode_for_command(cartpole_t *c)
 {
-    return console_transaction_result("QUERY", cartpole_query_mode(1.0));
+    return console_transaction_result("QUERY", cartpole_query_mode(c, 1.0));
 }
 
-int console_exec(const console_req_t *req)
+int console_exec(cartpole_t *c, const console_req_t *req)
 {
     switch (req->cmd) {
     case CONSOLE_CMD_CALIB: {
-        if (query_mode_for_command() != 0)
+        if (query_mode_for_command(c) != 0)
             return -1;
         int known;
-        cartpole_session_t snapshot = cartpole_session();
+        cartpole_session_t snapshot = cartpole_get_session_state(c);
         known = snapshot.is_mode_received;
         cartpole_mode_t m = snapshot.reported_mode;
         if (known && m != CARTPOLE_MODE_DISABLED) {
@@ -261,84 +262,85 @@ int console_exec(const console_req_t *req)
         }
         printf("[edge] push cart to LEFT end, then press Enter...");
         fflush(stdout);
-        if (wait_enter() != 0) {
+        if (wait_enter(c) != 0) {
             return -1;
         }
-        if (console_transaction_result("MARK LEFT", cartpole_mark(CARTPOLE_LEFT, 1.0)) != 0) {
+        if (console_transaction_result("MARK LEFT", cartpole_mark(c, CARTPOLE_LEFT, 1.0)) != 0) {
             return -1;
         }
         printf("[edge] push cart to RIGHT end, then press Enter...");
         fflush(stdout);
-        if (wait_enter() != 0) {
+        if (wait_enter(c) != 0) {
             return -1;
         }
-        if (console_transaction_result("MARK RIGHT", cartpole_mark(CARTPOLE_RIGHT, 1.0)) != 0) {
+        if (console_transaction_result("MARK RIGHT", cartpole_mark(c, CARTPOLE_RIGHT, 1.0)) != 0) {
             return -1;
         }
-        if (console_transaction_result("ENABLE", cartpole_enable(2.0)) != 0) {
+        if (console_transaction_result("ENABLE", cartpole_enable(c, 2.0)) != 0) {
             return -1;
         }
         printf("[edge] calibrated & READY; use 'center' to move to mid-track\n");
         return 0;
     }
     case CONSOLE_CMD_MARK_LEFT:
-        return console_transaction_result("MARK LEFT", cartpole_mark(CARTPOLE_LEFT, 1.0));
+        return console_transaction_result("MARK LEFT", cartpole_mark(c, CARTPOLE_LEFT, 1.0));
     case CONSOLE_CMD_MARK_RIGHT:
-        return console_transaction_result("MARK RIGHT", cartpole_mark(CARTPOLE_RIGHT, 1.0));
+        return console_transaction_result("MARK RIGHT", cartpole_mark(c, CARTPOLE_RIGHT, 1.0));
     case CONSOLE_CMD_ENABLE:
-        return console_transaction_result("ENABLE", cartpole_enable(2.0));
+        return console_transaction_result("ENABLE", cartpole_enable(c, 2.0));
     case CONSOLE_CMD_CENTER:
-        if (console_goto_center(15.0) != 0) {
+        if (console_goto_center(c, 15.0) != 0) {
             fprintf(stderr, "[edge] move-to-center failed\n");
             return -1;
         }
         return 0;
     case CONSOLE_CMD_STATE:
-        console_print_state();
+        console_print_state(c);
         return 0;
     case CONSOLE_CMD_QUERY: {
-        if (console_transaction_result("QUERY", cartpole_query_mode(1.0)) != 0) {
+        if (console_transaction_result("QUERY", cartpole_query_mode(c, 1.0)) != 0) {
             return -1;
         }
-        cartpole_reason_t reason = cartpole_session().reported_mode_reason;
-        cartpole_mode_t m = cartpole_session().reported_mode;
+        cartpole_reason_t reason = cartpole_get_session_state(c).reported_mode_reason;
+        cartpole_mode_t m = cartpole_get_session_state(c).reported_mode;
         printf("MODE %s %s\n", cartpole_mode_name(m), cartpole_reason_name(reason));
         return 0;
     }
     case CONSOLE_CMD_CONFIG: {
         if (req->dump) {
             if (console_transaction_result("metadata",
-                                           cartpole_refresh_configuration(DUMP_WINDOW_S)))
+                                           cartpole_refresh_configuration(c, DUMP_WINDOW_S)))
                 return -1;
-            cartpole_configuration_t c = cartpole_configuration();
+            cartpole_configuration_t config = cartpole_get_configuration(c);
             printf("[edge] calibration=%s length=%" PRId64 " um; VEL_MAX=%" PRId64
                    " ACC_MAX=%" PRId64 " WDT_MS=%" PRId64 " X_MARGIN_UM=%" PRId64 "\n",
-                   c.calibration_state == CARTPOLE_CALIBRATION_READY ? "ready"
-                   : c.calibration_state == CARTPOLE_CALIBRATION_REFERENCE_REQUIRED
+                   config.calibration_state == CARTPOLE_CALIBRATION_READY ? "ready"
+                   : config.calibration_state == CARTPOLE_CALIBRATION_REFERENCE_REQUIRED
                        ? "reference-required"
                        : "not-ready",
-                   c.track_length_um, c.velocity_limit_mm_s, c.acceleration_limit_mm_s2,
-                   c.watchdog_timeout_ms, c.track_margin_um);
+                   config.track_length_um, config.velocity_limit_mm_s,
+                   config.acceleration_limit_mm_s2, config.watchdog_timeout_ms,
+                   config.track_margin_um);
             return 0;
         }
         char operation[32];
         snprintf(operation, sizeof operation, "CONFIG %s", req->name);
         cartpole_setting_t setting;
-        if (cartpole_setting_from_name(req->name, &setting) != 0) {
+        if (serial_cartpole_setting_from_name(req->name, &setting) != 0) {
             fprintf(stderr, "[edge] unsupported setting %s\n", req->name);
             return -1;
         }
         int rc =
-            console_transaction_result(operation, cartpole_configure(setting, req->value, 1.0));
+            console_transaction_result(operation, cartpole_configure(c, setting, req->value, 1.0));
         if (rc == 0)
-            printf("[edge] %s = %ld\n", cartpole_setting_name(setting), req->value);
+            printf("[edge] %s = %ld\n", serial_cartpole_setting_name(setting), req->value);
         return rc;
     }
     case CONSOLE_CMD_RESET: {
-        if (query_mode_for_command() != 0)
+        if (query_mode_for_command(c) != 0)
             return -1;
         int known;
-        cartpole_session_t snapshot = cartpole_session();
+        cartpole_session_t snapshot = cartpole_get_session_state(c);
         known = snapshot.is_mode_received;
         cartpole_mode_t m = snapshot.reported_mode;
         if (known && m == CARTPOLE_MODE_DISABLED) {
@@ -349,7 +351,7 @@ int console_exec(const console_req_t *req)
             fprintf(stderr, "[edge] RESET only clears FAULT (current %s)\n", cartpole_mode_name(m));
             return -1;
         }
-        if (console_transaction_result("RESET", cartpole_reset(2.0)) != 0)
+        if (console_transaction_result("RESET", cartpole_reset(c, 2.0)) != 0)
             return -1;
         return 0;
     }
@@ -363,8 +365,10 @@ int console_exec(const console_req_t *req)
 static void print_help(void)
 {
     printf("commands:\n"
-           "  vel <mm/s>            set held target velocity (kept while READY & STATE fresh)\n"
-           "  calib                 interactive 2-point calibration (MARK LEFT/RIGHT + ENABLE)\n"
+           "  vel <mm/s>            set held target velocity (kept while READY & "
+           "STATE fresh)\n"
+           "  calib                 interactive 2-point calibration (MARK "
+           "LEFT/RIGHT + ENABLE)\n"
            "  mark-left             send MARK LEFT (cart at left end)\n"
            "  mark-right            send MARK RIGHT (cart at right end)\n"
            "  enable                ENABLE after calibration, wait READY\n"
@@ -392,14 +396,14 @@ static int console_tick(double elapsed, cartpole_tick_action_t *action, void *co
     }
     return 0;
 }
-int console_run(void)
+int console_run(cartpole_t *c)
 {
     console_hold hold = {0};
     memset(&input, 0, sizeof input);
     print_help();
     puts("[edge] console ready (quit/Ctrl+D to exit)");
-    while (!cartpole_stop_requested()) {
-        cartpole_result_t result = cartpole_run_loop(.020, 0, console_tick, &hold);
+    while (!cartpole_stop_requested(c)) {
+        cartpole_result_t result = cartpole_run_loop(c, .020, 0, console_tick, &hold);
         if (result == CARTPOLE_CANCELLED)
             return 0;
         if (result != CARTPOLE_OK)
@@ -426,9 +430,9 @@ int console_run(void)
             continue;
         }
         if (req.cmd == CONSOLE_CMD_VEL) {
-            if (query_mode_for_command() ||
+            if (query_mode_for_command(c) ||
                 console_transaction_result("STATE",
-                                           cartpole_wait_measurement(CFG_STATE_TIMEOUT_S))) {
+                                           cartpole_wait_measurement(c, CFG_STATE_TIMEOUT_S))) {
                 hold.holding = 0;
                 continue;
             }
@@ -438,17 +442,17 @@ int console_run(void)
         }
         if (req.cmd != CONSOLE_CMD_QUERY && req.cmd != CONSOLE_CMD_STATE)
             hold.holding = 0;
-        (void)console_exec(&req);
+        (void)console_exec(c, &req);
     }
     return 0;
 }
-int console_goto_center(double timeout_s)
+int console_goto_center(cartpole_t *c, double timeout_s)
 {
-    return console_transaction_result("center", cartpole_move_to_center(timeout_s));
+    return console_transaction_result("center", cartpole_move_to_center(c, timeout_s));
 }
-void console_print_state(void)
+void console_print_state(cartpole_t *c)
 {
-    cartpole_measurement_t m = cartpole_measurement();
+    cartpole_measurement_t m = cartpole_get_latest_measurement(c);
     if (m.received_host_monotonic_s < 0) {
         puts("[edge] no STATE received");
         return;
@@ -462,5 +466,5 @@ void console_print_state(void)
                m.pole_angular_velocity_rad_s);
     else
         puts("[edge] pole measurement unavailable");
-    printf("[edge] measurement age=%.1f ms\n", cartpole_measurement_age_s(m) * 1000);
+    printf("[edge] measurement age=%.1f ms\n", cartpole_measurement_age_s(c, m) * 1000);
 }

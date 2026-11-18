@@ -1,9 +1,11 @@
 /* CV610 应用层：组织模型、用户命令与输出；设备循环由 cartpole 会话负责。 */
 #include "cartpole.h"
+#include "cartpole_device.h"
 #include "config.h"
 #include "console.h"
 #include "package.h"
 #include "policy.h"
+#include "serial_cartpole.h"
 #include <inttypes.h>
 #include <math.h>
 #include <signal.h>
@@ -12,10 +14,11 @@
 #include <string.h>
 static void print_usage(const char *prog);
 static int g_motion_session;
+static volatile sig_atomic_t signal_stop;
 static void on_signal(int sig)
 {
     (void)sig;
-    cartpole_request_stop();
+    signal_stop = 1;
 }
 static void print_event(const cartpole_event_t *event, void *context)
 {
@@ -39,7 +42,7 @@ static int infer_model(const cartpole_measurement_t *m, float *action, void *con
                     (float)(p->angle_sign * m->pole_angular_velocity_rad_s)};
     return policy_forward(obs, action);
 }
-static int run_policy(int argc, char **argv, int first)
+static int run_policy(cartpole_t *c, int argc, char **argv, int first)
 {
     const char *manifest = NULL, *backend_name = NULL;
     if (argc - first == 4)
@@ -55,8 +58,8 @@ static int run_policy(int argc, char **argv, int first)
         }
     if (!manifest || !backend_name ||
         (strcmp(backend_name, "cpu") && strcmp(backend_name, "npu"))) {
-        fprintf(stderr,
-                "[edge] run requires --backend cpu|npu --package path/to/edge-package.json\n");
+        fprintf(stderr, "[edge] run requires --backend cpu|npu --package "
+                        "path/to/edge-package.json\n");
         return 1;
     }
     policy_backend backend = !strcmp(backend_name, "cpu") ? POLICY_CPU : POLICY_NPU;
@@ -74,12 +77,12 @@ static int run_policy(int argc, char **argv, int first)
     if (policy_init(backend, model) != 0)
         return 1;
     fprintf(stderr, "[edge] backend=%s\n", backend_name);
-    if (console_transaction_result("preflight QUERY", cartpole_query_mode(1.0)) != 0 ||
-        console_transaction_result("preflight metadata", cartpole_refresh_configuration(1.0)) !=
+    if (console_transaction_result("preflight QUERY", cartpole_query_mode(c, 1.0)) != 0 ||
+        console_transaction_result("preflight metadata", cartpole_refresh_configuration(c, 1.0)) !=
             0 ||
-        console_transaction_result("preflight STATE", cartpole_wait_measurement(1.0)) != 0)
+        console_transaction_result("preflight STATE", cartpole_wait_measurement(c, 1.0)) != 0)
         return 1;
-    cartpole_configuration_t config = cartpole_configuration();
+    cartpole_configuration_t config = cartpole_get_configuration(c);
     if (!config.complete || config.calibration_state != CARTPOLE_CALIBRATION_READY ||
         !config.calibration_saved || !config.calibration_storage_ok ||
         config.track_length_um < 100000 || config.track_length_um > 1000000 ||
@@ -90,13 +93,13 @@ static int run_policy(int argc, char **argv, int first)
         fprintf(stderr, "[edge] preflight: calibration/config mismatch\n");
         return 1;
     }
-    cartpole_session_t session = cartpole_session();
-    cartpole_measurement_t measurement = cartpole_measurement();
+    cartpole_session_t session = cartpole_get_session_state(c);
+    cartpole_measurement_t measurement = cartpole_get_latest_measurement(c);
     if (!session.is_mode_received || session.reported_mode != CARTPOLE_MODE_READY ||
         session.reported_mode_reason != CARTPOLE_REASON_NONE || session.has_received_fault_mode ||
         session.has_stream_failure_latch || !measurement.cart_valid || !measurement.pole_valid ||
-        cartpole_measurement_age_s(measurement) < 0 ||
-        cartpole_measurement_age_s(measurement) > .020) {
+        cartpole_measurement_age_s(c, measurement) < 0 ||
+        cartpole_measurement_age_s(c, measurement) > .020) {
         fprintf(stderr, "[edge] preflight requires READY NONE and fresh valid STATE\n");
         return 1;
     }
@@ -105,29 +108,31 @@ static int run_policy(int argc, char **argv, int first)
                                              .velocity_limit_mm_s = package.velocity_limit_mm_s,
                                              .expected_configuration = config};
     g_motion_session = 1;
-    printf("[edge] %.0f Hz; scale %d mm/s; limit %d mm/s; angle pause 20/resume 18 deg\n",
+    printf("[edge] %.0f Hz; scale %d mm/s; limit %d mm/s; angle pause 20/resume "
+           "18 deg\n",
            package.control_hz, package.action_scale_mm_s, package.velocity_limit_mm_s);
-    cartpole_result_t result = cartpole_run_controller(&options, infer_model, &package);
+    cartpole_result_t result = cartpole_run_controller(c, &options, infer_model, &package);
     return result == CARTPOLE_OK || result == CARTPOLE_CANCELLED
                ? 0
                : (console_transaction_result("control", result), 1);
 }
 
-static int run_console(void)
+static int run_console(cartpole_t *c)
 {
-    if (console_transaction_result("QUERY", cartpole_query_mode(1.0)))
+    if (console_transaction_result("QUERY", cartpole_query_mode(c, 1.0)))
         return 1;
     g_motion_session = 1;
-    return console_run();
+    return console_run(c);
 }
-static int oneshot_state(void)
+static int oneshot_state(cartpole_t *c)
 {
-    if (console_transaction_result("STATE", cartpole_wait_measurement(1.0)))
+    if (console_transaction_result("STATE", cartpole_wait_measurement(c, 1.0)))
         return 1;
-    console_print_state();
+    console_print_state(c);
     return 0;
 }
 typedef struct {
+    cartpole_t *cartpole;
     double xmin, xmax, tmin, tmax;
     int cart, pole;
 } state_window;
@@ -136,7 +141,8 @@ static int sample_window(double elapsed, cartpole_tick_action_t *action, void *c
     (void)elapsed;
     action->kind = CARTPOLE_TICK_OBSERVE;
     state_window *w = context;
-    cartpole_measurement_t m = cartpole_measurement();
+    cartpole_t *c = w->cartpole;
+    cartpole_measurement_t m = cartpole_get_latest_measurement(c);
     if (m.cart_valid) {
         if (!w->cart || m.cart_position_m < w->xmin)
             w->xmin = m.cart_position_m;
@@ -153,16 +159,16 @@ static int sample_window(double elapsed, cartpole_tick_action_t *action, void *c
     }
     return 0;
 }
-static int oneshot_state_window(double secs)
+static int oneshot_state_window(cartpole_t *c, serial_cartpole_t *serial, double secs)
 {
-    if (console_transaction_result("STATE", cartpole_wait_measurement(1.0)))
+    if (console_transaction_result("STATE", cartpole_wait_measurement(c, 1.0)))
         return 1;
-    cartpole_statistics_t before = cartpole_statistics();
-    state_window w = {0};
-    double start = cartpole_host_monotonic_s();
-    cartpole_result_t result = cartpole_run_loop(.020, secs, sample_window, &w);
-    double dt = cartpole_host_monotonic_s() - start;
-    cartpole_statistics_t after = cartpole_statistics();
+    serial_cartpole_statistics_t before = serial_cartpole_get_statistics(serial);
+    state_window w = {.cartpole = c};
+    double start = cartpole_host_monotonic_s(c);
+    cartpole_result_t result = cartpole_run_loop(c, .020, secs, sample_window, &w);
+    double dt = cartpole_host_monotonic_s(c) - start;
+    serial_cartpole_statistics_t after = serial_cartpole_get_statistics(serial);
     uint64_t count = after.received_measurements - before.received_measurements;
     uint64_t unknown = after.unknown_received_lines - before.unknown_received_lines;
     printf("[edge] window %.1f s: %" PRIu64 " STATE lines -> %.1f Hz (observed)\n", dt, count,
@@ -185,30 +191,31 @@ static int watchdog_tick(double elapsed, cartpole_tick_action_t *action, void *c
     action->velocity_mm_s = 200;
     return 0;
 }
-static int oneshot_wdt_test(void)
+static int oneshot_wdt_test(cartpole_t *c)
 {
-    if (console_transaction_result("QUERY", cartpole_query_mode(1.0)) ||
-        console_transaction_result("STATE", cartpole_wait_measurement(CFG_STATE_TIMEOUT_S)))
+    if (console_transaction_result("QUERY", cartpole_query_mode(c, 1.0)) ||
+        console_transaction_result("STATE", cartpole_wait_measurement(c, CFG_STATE_TIMEOUT_S)))
         return 1;
-    cartpole_session_t s = cartpole_session();
+    cartpole_session_t s = cartpole_get_session_state(c);
     if (!s.is_mode_received || s.reported_mode != CARTPOLE_MODE_READY ||
         s.reported_mode_reason != CARTPOLE_REASON_NONE)
         return 1;
     g_motion_session = 1;
-    if (console_transaction_result("wdt-test", cartpole_run_loop(.005, 2.0, watchdog_tick, NULL)))
+    if (console_transaction_result("wdt-test",
+                                   cartpole_run_loop(c, .005, 2.0, watchdog_tick, NULL)))
         return 1;
-    if (console_transaction_result("QUERY", cartpole_query_mode(1.0)))
+    if (console_transaction_result("QUERY", cartpole_query_mode(c, 1.0)))
         return 1;
-    s = cartpole_session();
+    s = cartpole_get_session_state(c);
     return s.is_mode_received && s.reported_mode == CARTPOLE_MODE_READY &&
                    s.reported_mode_reason == CARTPOLE_REASON_NONE
                ? 0
                : 1;
 }
-static int oneshot_vel(double velocity, double hold)
+static int oneshot_vel(cartpole_t *c, double velocity, double hold)
 {
     g_motion_session = 1;
-    cartpole_result_t result = cartpole_hold_velocity(velocity, hold);
+    cartpole_result_t result = cartpole_hold_velocity(c, velocity, hold);
     return result == CARTPOLE_OK || result == CARTPOLE_CANCELLED
                ? 0
                : (console_transaction_result(result == CARTPOLE_MEASUREMENT_UNAVAILABLE
@@ -248,31 +255,41 @@ static int parse_duration(const char *s, double *out)
 
 static void print_usage(const char *prog)
 {
-    fprintf(
-        stderr,
-        "usage: %s [--port /dev/ttyXXXX] [command [args]]\n"
-        "  (no command)                     interactive console (default)\n"
-        "  console                          same as above\n"
-        "  run --backend cpu|npu --package edge-package.json       policy control (validated "
-        "package; firmware must be READY)\n"
-        "  calib                            one-shot: interactive 2-point calibration (MARK "
-        "LEFT/RIGHT + ENABLE)\n"
-        "  mark-left                        one-shot: send MARK LEFT (cart at left end)\n"
-        "  mark-right                       one-shot: send MARK RIGHT (cart at right end)\n"
-        "  enable                           one-shot: ENABLE after calibration, wait READY\n"
-        "  center                           one-shot: move cart to track center (needs READY)\n"
-        "  vel <mm/s> [--hold s]            one-shot: hold velocity for s seconds (default 1.0)\n"
-        "  state [--secs s]                one-shot: STATE snapshot, or s-second window stats"
-        " (rate/unknown/ranges)\n"
-        "  query                            one-shot: print firmware mode\n"
-        "  config [NAME VALUE]              one-shot: set one param, or dump all with no args\n"
-        "  reset                           one-shot: clear FAULT\n"
-        "  wdt-test                        one-shot: watchdog drop test (needs READY;"
-        " cart moves ~200 mm/s for 1 s)\n",
-        prog);
+    fprintf(stderr,
+            "usage: %s [--port /dev/ttyXXXX] [command [args]]\n"
+            "  (no command)                     interactive console (default)\n"
+            "  console                          same as above\n"
+            "  run --backend cpu|npu --package edge-package.json       policy "
+            "control (validated "
+            "package; firmware must be READY)\n"
+            "  calib                            one-shot: interactive 2-point "
+            "calibration (MARK "
+            "LEFT/RIGHT + ENABLE)\n"
+            "  mark-left                        one-shot: send MARK LEFT (cart "
+            "at left end)\n"
+            "  mark-right                       one-shot: send MARK RIGHT (cart "
+            "at right end)\n"
+            "  enable                           one-shot: ENABLE after "
+            "calibration, wait READY\n"
+            "  center                           one-shot: move cart to track "
+            "center (needs READY)\n"
+            "  vel <mm/s> [--hold s]            one-shot: hold velocity for s "
+            "seconds (default 1.0)\n"
+            "  state [--secs s]                one-shot: STATE snapshot, or "
+            "s-second window stats"
+            " (rate/unknown/ranges)\n"
+            "  query                            one-shot: print firmware mode\n"
+            "  config [NAME VALUE]              one-shot: set one param, or dump "
+            "all with no args\n"
+            "  reset                           one-shot: clear FAULT\n"
+            "  wdt-test                        one-shot: watchdog drop test "
+            "(needs READY;"
+            " cart moves ~200 mm/s for 1 s)\n",
+            prog);
 }
 
-static int dispatch(const char *cmd, int argc, char **argv, int first)
+static int dispatch(cartpole_t *c, serial_cartpole_t *serial, const char *cmd, int argc,
+                    char **argv, int first)
 {
     int nargs = argc - first;
     const char *prog = argv[0];
@@ -282,10 +299,10 @@ static int dispatch(const char *cmd, int argc, char **argv, int first)
             print_usage(prog);
             return 1;
         }
-        return run_console();
+        return run_console(c);
     }
     if (strcmp(cmd, "run") == 0) {
-        return run_policy(argc, argv, first);
+        return run_policy(c, argc, argv, first);
     }
     if (strcmp(cmd, "calib") == 0 || strcmp(cmd, "mark-left") == 0 ||
         strcmp(cmd, "mark-right") == 0 || strcmp(cmd, "enable") == 0) {
@@ -298,7 +315,7 @@ static int dispatch(const char *cmd, int argc, char **argv, int first)
             print_usage(prog);
             return 1;
         }
-        return console_exec(&req) == 0 ? 0 : 1;
+        return console_exec(c, &req) == 0 ? 0 : 1;
     }
     if (strcmp(cmd, "center") == 0 || strcmp(cmd, "query") == 0 || strcmp(cmd, "reset") == 0) {
         if (nargs != 0) {
@@ -312,7 +329,7 @@ static int dispatch(const char *cmd, int argc, char **argv, int first)
         }
         if (strcmp(cmd, "center") == 0)
             g_motion_session = 1;
-        return console_exec(&req) == 0 ? 0 : 1;
+        return console_exec(c, &req) == 0 ? 0 : 1;
     }
     if (strcmp(cmd, "state") == 0) {
         double secs = 0.0;
@@ -325,14 +342,14 @@ static int dispatch(const char *cmd, int argc, char **argv, int first)
             print_usage(prog);
             return 1;
         }
-        return secs > 0.0 ? oneshot_state_window(secs) : oneshot_state();
+        return secs > 0.0 ? oneshot_state_window(c, serial, secs) : oneshot_state(c);
     }
     if (strcmp(cmd, "wdt-test") == 0) {
         if (nargs != 0) {
             fprintf(stderr, "[edge] wdt-test takes no arguments\n");
             return 1;
         }
-        return oneshot_wdt_test();
+        return oneshot_wdt_test(c);
     }
     if (strcmp(cmd, "vel") == 0) {
         double hold = 1.0;
@@ -350,7 +367,7 @@ static int dispatch(const char *cmd, int argc, char **argv, int first)
             print_usage(prog);
             return 1;
         }
-        return oneshot_vel(req.vel_mm_s, hold);
+        return oneshot_vel(c, req.vel_mm_s, hold);
     }
     if (strcmp(cmd, "config") == 0) {
         console_req_t req;
@@ -360,7 +377,7 @@ static int dispatch(const char *cmd, int argc, char **argv, int first)
                 fprintf(stderr, "[edge] invalid config arguments\n");
                 return 1;
             }
-            return console_exec(&req) == 0 ? 0 : 1;
+            return console_exec(c, &req) == 0 ? 0 : 1;
         }
         print_usage(prog);
         return 1;
@@ -407,21 +424,33 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    if (cartpole_open(port, CFG_BAUD) != 0) {
+    cartpole_runtime_t runtime;
+    if (cartpole_runtime_init(&runtime, NULL))
+        return 1;
+    runtime.external_stop = &signal_stop;
+    serial_cartpole_t *serial = serial_cartpole_open(port, CFG_BAUD, &runtime);
+    if (!serial) {
         fprintf(stderr, "[edge] cannot open %s\n", port);
         return 1;
     }
 
-    if (cartpole_subscribe(print_event, NULL) != CARTPOLE_OK) {
-        cartpole_close();
+    cartpole_t *c = cartpole_create(serial_cartpole_device(serial), &runtime);
+    if (!c) {
+        serial_cartpole_close(serial);
         return 1;
     }
-    int rc = dispatch(cmd, argc, argv, first);
+
+    if (cartpole_subscribe(c, print_event, NULL) != CARTPOLE_OK) {
+        cartpole_destroy(c);
+        serial_cartpole_close(serial);
+        return 1;
+    }
+    int rc = dispatch(c, serial, cmd, argc, argv, first);
 
     /* 会话形态（run/console）退出即停机；一次性命令不干预电机状态，
      * 其中 vel 自身管理起停。 */
     if (g_motion_session) {
-        cartpole_stop_result_t stopped = cartpole_stop_and_confirm(2.0);
+        cartpole_stop_result_t stopped = cartpole_stop_and_confirm(c, 2.0);
         if (stopped == CARTPOLE_STOP_DISABLED)
             printf("[edge] stop: DISABLED confirmed\n");
         else {
@@ -432,6 +461,7 @@ int main(int argc, char **argv)
         }
     }
     policy_deinit(); /* 未初始化时是幂等空操作 */
-    cartpole_close();
+    cartpole_destroy(c);
+    serial_cartpole_close(serial);
     return rc;
 }

@@ -35,13 +35,13 @@ int console_parse(const char *line, console_req_t *req);
 /* 执行单条非保持命令。返回 0 成功，-1 失败（诊断已打印）。
  * 仅处理 CALIB/MARK_LEFT/MARK_RIGHT/ENABLE/CENTER/STATE/QUERY/CONFIG/RESET；
  * 其余命令返回 -1。 */
-int console_exec(const console_req_t *req);
+int console_exec(cartpole_t *c, const console_req_t *req);
 
 /* 进入交互循环；会话须已打开并同步。失败返回非零，main统一确认停车。 */
-int console_run(void);
+int console_run(cartpole_t *c);
 
 int console_transaction_result(const char *operation, cartpole_result_t result);
-void console_print_state(void);
-int console_goto_center(double timeout_s);
+void console_print_state(cartpole_t *c);
+int console_goto_center(cartpole_t *c, double timeout_s);
 
 #endif /* EDGE_CONSOLE_H */
