@@ -5,8 +5,8 @@
 #ifndef EDGE_TEST_STUB
 #error "policy_stub.c is test-only"
 #endif
-int policy_init(const char *path) {
-    (void)path;
+int policy_init(policy_backend backend, const char *path) {
+    (void)path; (void)backend;
     fputs("[TEST ONLY] NPU stub: never deploy this binary\n", stderr);
     return 0;
 }

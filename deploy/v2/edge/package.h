@@ -3,8 +3,10 @@
 #include <stddef.h>
 /* 模型包由 prepare_package.py 从正式 model.json 派生，不手工维护参数。 */
 typedef struct edge_package {
-    char model_path[4096];
-    char model_sha256[65];
+    char model_cpu_path[4096];
+    char model_npu_path[4096];
+    char sha256_cpu[65];
+    char sha256_npu[65];
     double control_hz;
     int action_scale_mm_s;
     int velocity_limit_mm_s;

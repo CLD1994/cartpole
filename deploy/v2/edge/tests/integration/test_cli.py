@@ -103,14 +103,25 @@ def package(directory):
     model = b"test model, not an OM file"
     Path(directory, "policy.om").write_bytes(model)
     manifest = Path(directory, "edge.package")
-    manifest.write_text("EDGE_PACKAGE_V1\nmodel=policy.om\nsha256=" + hashlib.sha256(model).hexdigest() + "\ncontrol_hz=400\naction_scale_mm_s=900\nvelocity_limit_mm_s=900\nacceleration_mm_s2=10000\nangle_sign=-1\npause_deg=20\nresume_deg=18\n")
+    manifest.write_text("EDGE_PACKAGE_V2\nmodel_cpu=none\nmodel_npu=policy.om\nsha256_cpu=none\nsha256_npu=" + hashlib.sha256(model).hexdigest() + "\ncontrol_hz=400\naction_scale_mm_s=900\nvelocity_limit_mm_s=900\nacceleration_mm_s2=10000\nangle_sign=-1\npause_deg=20\nresume_deg=18\n")
     return str(manifest)
 
 
 @unittest.skipUnless(BINARY, "需 make test-integration 构建 PTY 测试应用，或设置 EDGE_TEST_BINARY")
 class CommandTests(unittest.TestCase):
+    def test_backend_required_and_missing_model_no_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp, Firmware() as fw:
+            manifest=package(tmp)
+            for args in [("run","--package",manifest),
+                         ("run","--backend","bad","--package",manifest),
+                         ("run","--backend","cpu","--package",manifest)]:
+                result=fw.run(*args)
+                self.assertNotEqual(result.returncode,0)
+                self.assertFalse(any(c.startswith("VEL ") for c in fw.commands))
+            self.assertIn("no cpu model; no fallback",result.stderr)
+
     def start_run(self, fw, tmp):
-        process = subprocess.Popen([BINARY, "--port", fw.path, "run", "--package", package(tmp)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        process = subprocess.Popen([BINARY, "--port", fw.path, "run", "--backend", "npu", "--package", package(tmp)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.addCleanup(lambda: self.finish(process))
         self.assertTrue(fw.driving.wait(3), "策略未开始发送动作")
         return process
@@ -222,14 +233,14 @@ class CommandTests(unittest.TestCase):
 
     def test_run_mismatch_emits_no_velocity_or_configuration(self):
         with tempfile.TemporaryDirectory() as tmp, Firmware(velocity=1250) as fw:
-            result = fw.run("run", "--package", package(tmp))
+            result = fw.run("run", "--backend", "npu", "--package", package(tmp))
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("CONFIG?", fw.commands)
             self.assertFalse(any(c.startswith(("VEL ", "CONFIG ")) for c in fw.commands), fw.commands)
 
     def test_run_drives_without_enable_or_auto_center_and_confirms_stop(self):
         with tempfile.TemporaryDirectory() as tmp, Firmware() as fw:
-            process = subprocess.Popen([BINARY, "--port", fw.path, "run", "--package", package(tmp)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            process = subprocess.Popen([BINARY, "--port", fw.path, "run", "--backend", "npu", "--package", package(tmp)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             try:
                 drove = fw.driving.wait(3)
                 process.send_signal(signal.SIGINT)

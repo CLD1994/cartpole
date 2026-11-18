@@ -144,15 +144,25 @@ static int control_loop(const edge_package *package, int64_t length, int64_t mar
 
 static int run_policy(int argc, char **argv, int first)
 {
-    if (argc-first!=2 || strcmp(argv[first],"--package")!=0) {
-        fprintf(stderr,"[edge] run requires --package path/to/edge-package.txt\n"); return 1;
+    const char *manifest=NULL, *backend_name=NULL;
+    if (argc-first==4) for (int i=first;i<argc;i+=2) {
+        if (!strcmp(argv[i],"--package") && !manifest) manifest=argv[i+1];
+        else if (!strcmp(argv[i],"--backend") && !backend_name) backend_name=argv[i+1];
+        else { manifest=NULL; break; }
     }
+    if (!manifest || !backend_name || (strcmp(backend_name,"cpu") && strcmp(backend_name,"npu"))) {
+        fprintf(stderr,"[edge] run requires --backend cpu|npu --package path/to/edge-package.txt\n"); return 1;
+    }
+    policy_backend backend=!strcmp(backend_name,"cpu") ? POLICY_CPU : POLICY_NPU;
     edge_package package;
     char error[256];
-    if (edge_package_load(argv[first+1],&package,error,sizeof(error))!=0) {
+    if (edge_package_load(manifest,&package,error,sizeof(error))!=0) {
         fprintf(stderr,"[edge] package: %s\n",error); return 1;
     }
-    if (policy_init(package.model_path)!=0) return 1;
+    const char *model=backend==POLICY_CPU ? package.model_cpu_path : package.model_npu_path;
+    if (!model[0]) { fprintf(stderr,"[edge] package has no %s model; no fallback\n",backend_name); return 1; }
+    if (policy_init(backend,model)!=0) return 1;
+    fprintf(stderr,"[edge] backend=%s\n",backend_name);
     if (rig_sync_mode(1.0)!=0 || rig_refresh_metadata(1.0)!=0 || rig_wait_state(1.0)!=0) {
         fprintf(stderr,"[edge] preflight readback unavailable\n"); return 1;
     }
@@ -368,7 +378,7 @@ static void print_usage(const char *prog)
             "usage: %s [--port /dev/ttyXXXX] [command [args]]\n"
             "  (no command)                     interactive console (default)\n"
             "  console                          same as above\n"
-            "  run --package edge-package.txt       policy control (validated package; firmware must be READY)\n"
+            "  run --backend cpu|npu --package edge-package.txt       policy control (validated package; firmware must be READY)\n"
             "  calib                            one-shot: interactive 2-point calibration (MARK LEFT/RIGHT + ENABLE)\n"
             "  mark-left                        one-shot: send MARK LEFT (cart at left end)\n"
             "  mark-right                       one-shot: send MARK RIGHT (cart at right end)\n"

@@ -206,7 +206,7 @@ static void reset_state(void)
 static void test_init_happy_path(void)
 {
     reset_state();
-    assert(policy_init("model.om") == 0);
+    assert(policy_init(POLICY_NPU, "model.om") == 0);
     assert(before(EV_ACL_INIT, EV_SET_DEVICE) && before(EV_SET_DEVICE, EV_OPEN));
     assert(count(EV_OPEN) == 1 && count(EV_ACL_FINALIZE) == 0);
 
@@ -219,8 +219,8 @@ static void test_init_happy_path(void)
     assert(before(EV_CLOSE, EV_RESET_DEVICE) && before(EV_RESET_DEVICE, EV_ACL_FINALIZE));
     assert(count(EV_CLOSE) == 1 && count(EV_RESET_DEVICE) == 1 && count(EV_ACL_FINALIZE) == 1);
 
-    policy_deinit(); /* 幂等：仅剩对 NULL 句柄的幂等 close，不再释放任何资源 */
-    assert(count(EV_CLOSE) == 2); /* 幂等 close 仍被调用（契约允许） */
+    policy_deinit(); /* 幂等：不再释放任何资源 */
+    assert(count(EV_CLOSE) == 1);
     assert(count(EV_RESET_DEVICE) == 1 && count(EV_ACL_FINALIZE) == 1);
     assert(count(EV_OPEN) == 1 && count(EV_INFER) == 1);
 }
@@ -229,7 +229,7 @@ static void test_init_acl_init_fails(void)
 {
     reset_state();
     g_acl_init_ret = 1;
-    assert(policy_init("model.om") != 0);
+    assert(policy_init(POLICY_NPU, "model.om") != 0);
     assert(count(EV_ACL_INIT) == 1 && count(EV_SET_DEVICE) == 0 && count(EV_OPEN) == 0);
 
     policy_deinit(); /* 运行时未建立：不得 finalize */
@@ -240,7 +240,7 @@ static void test_init_set_device_fails(void)
 {
     reset_state();
     g_set_device_ret = 2;
-    assert(policy_init("model.om") != 0);
+    assert(policy_init(POLICY_NPU, "model.om") != 0);
     assert(count(EV_OPEN) == 0 && count(EV_RESET_DEVICE) == 0);
     assert(count(EV_ACL_FINALIZE) == 1); /* init 已成功：须 finalize 释放 */
     policy_deinit();
@@ -251,7 +251,7 @@ static void test_init_open_fails_clean(void)
 {
     reset_state();
     g_open_ret = CARTPOLE_IO;
-    assert(policy_init("model.om") != 0);
+    assert(policy_init(POLICY_NPU, "model.om") != 0);
     /* 退出梯子仍完整：close（NULL 幂等）-> reset -> finalize */
     assert(count(EV_CLOSE) == 1 && count(EV_RESET_DEVICE) == 1 && count(EV_ACL_FINALIZE) == 1);
     policy_deinit();
@@ -263,7 +263,7 @@ static void test_init_open_leaves_close_only_handle(void)
     reset_state();
     g_open_ret = CARTPOLE_MODEL;
     g_open_leave_handle = 1;
-    assert(policy_init("model.om") != 0);
+    assert(policy_init(POLICY_NPU, "model.om") != 0);
     /* 残留句柄由退出路径的 close 释放，随后正常释放运行时 */
     assert(count(EV_CLOSE) == 1 && count(EV_RESET_DEVICE) == 1 && count(EV_ACL_FINALIZE) == 1);
     policy_deinit();
@@ -276,7 +276,7 @@ static void test_close_failure_holds_runtime(void)
     g_open_leave_handle = 1;
     g_open_ret = CARTPOLE_MODEL;
     g_close_fail_times = 1; /* 第一次 close 失败 */
-    assert(policy_init("model.om") != 0);
+    assert(policy_init(POLICY_NPU, "model.om") != 0);
     assert(count(EV_CLOSE) == 1 && count(EV_RESET_DEVICE) == 0 && count(EV_ACL_FINALIZE) == 0);
 
     policy_deinit(); /* 重试 close：成功后补全梯子 */
@@ -296,7 +296,7 @@ static void test_forward_before_init(void)
 static void test_forward_infer_failure_invalidates_handle(void)
 {
     reset_state();
-    assert(policy_init("model.om") == 0);
+    assert(policy_init(POLICY_NPU, "model.om") == 0);
     float action = 1.0f;
     g_infer_ret = CARTPOLE_SDK;
     assert(policy_forward((const float[4]){0.5f, 0.1f, 0, 0}, &action) != 0);
@@ -313,18 +313,18 @@ static void test_forward_infer_failure_invalidates_handle(void)
 static void test_forward_rejects_nonfinite_observation(void)
 {
     reset_state();
-    assert(policy_init("model.om") == 0);
+    assert(policy_init(POLICY_NPU, "model.om") == 0);
     float action = 1.0f;
     const float obs[4] = {0.0f, NAN, 0.0f, 0.0f};
     assert(policy_forward(obs, &action) != 0);
-    assert(action == 0.0f && g_infer_calls == 1);
+    assert(action == 0.0f && g_infer_calls == 0);
     policy_deinit();
 }
 
 static void test_forward_rejects_nonfinite_action(void)
 {
     reset_state();
-    assert(policy_init("model.om") == 0);
+    assert(policy_init(POLICY_NPU, "model.om") == 0);
     g_infer_inf_output = 1;
     float action = 1.0f;
     assert(policy_forward((const float[4]){1, 1, 1, 1}, &action) != 0);
@@ -339,15 +339,31 @@ static void test_forward_rejects_nonfinite_action(void)
 static void test_double_init_rejected(void)
 {
     reset_state();
-    assert(policy_init("model.om") == 0);
-    assert(policy_init("model.om") != 0);
+    assert(policy_init(POLICY_NPU, "model.om") == 0);
+    assert(policy_init(POLICY_NPU, "model.om") != 0);
     assert(count(EV_OPEN) == 1); /* 未重复 open，也未破坏现有会话 */
     policy_deinit();
     assert(count(EV_CLOSE) == 1);
 }
 
+static void test_finalize_failure_retains_resources(void)
+{
+    reset_state();
+    assert(policy_init(POLICY_NPU, "model.om") == 0);
+    g_finalize_ret = 9;
+    policy_deinit();
+    assert(policy_init(POLICY_NPU, "model.om") != 0);
+    assert(policy_init(POLICY_CPU, "absent.fp32") != 0);
+    g_finalize_ret = 0;
+    policy_deinit();
+    assert(count(EV_ACL_FINALIZE) == 2);
+    assert(policy_init(POLICY_NPU, "model.om") == 0);
+    policy_deinit();
+}
+
 int main(void)
 {
+    test_finalize_failure_retains_resources();
     test_init_happy_path();
     test_init_acl_init_fails();
     test_init_set_device_fails();

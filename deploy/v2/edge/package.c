@@ -31,20 +31,35 @@ static int number(FILE *f, const char *key, double *out) {
     if (errno || end == text || *end || !isfinite(v) || text[0]==' ' || text[0]=='\t') return -1;
     *out = v; return 0;
 }
+static int model_file(const char *manifest, const char *name, const char *expected,
+                      const char *hash, char *dest, size_t cap) {
+    if (!strcmp(name,"none")) return strcmp(hash,"none") ? -1 : 0;
+    if (strcmp(name,expected) || strlen(hash)!=64) return -1;
+    for (int i=0;i<64;i++) if (!((hash[i]>='0' && hash[i]<='9') || (hash[i]>='a' && hash[i]<='f'))) return -1;
+    const char *slash=strrchr(manifest,'/');
+    size_t prefix=slash ? (size_t)(slash-manifest+1) : 0;
+    if (prefix+strlen(name)>=cap) return -1;
+    memcpy(dest,manifest,prefix); strcpy(dest+prefix,name);
+    FILE *f=fopen(dest,"rb");
+    if (!f) return -1;
+    int valid=fgetc(f)!=EOF;
+    fclose(f);
+    return valid ? 0 : -1;
+}
 int edge_package_load(const char *path, edge_package *out, char *err, size_t cap) {
     edge_package p = {0};
-    FILE *f = NULL, *model = NULL;
+    FILE *f = NULL;
     const char *why = "invalid_manifest";
-    char header[64], name[128];
+    char header[64], cpu[128], npu[128];
     if (out) memset(out,0,sizeof(*out));
     if (err && cap) err[0] = 0;
     if (!path || !out) goto fail;
     f = fopen(path,"rb");
     if (!f) { why="manifest_unreadable"; goto fail; }
-    if (!fgets(header,sizeof(header),f) || strcmp(header,"EDGE_PACKAGE_V1\n")) goto fail;
-    if (field(f,"model=",name,sizeof(name)) || strcmp(name,"policy.om") ||
-        field(f,"sha256=",p.model_sha256,sizeof(p.model_sha256)) || strlen(p.model_sha256)!=64) goto fail;
-    for (int i=0;i<64;i++) if (!((p.model_sha256[i]>='0' && p.model_sha256[i]<='9') || (p.model_sha256[i]>='a' && p.model_sha256[i]<='f'))) goto fail;
+    if (!fgets(header,sizeof(header),f) || strcmp(header,"EDGE_PACKAGE_V2\n")) goto fail;
+    if (field(f,"model_cpu=",cpu,sizeof(cpu)) || field(f,"model_npu=",npu,sizeof(npu)) ||
+        field(f,"sha256_cpu=",p.sha256_cpu,sizeof(p.sha256_cpu)) ||
+        field(f,"sha256_npu=",p.sha256_npu,sizeof(p.sha256_npu))) goto fail;
     if (number(f,"control_hz=",&p.control_hz) ||
         integer(f,"action_scale_mm_s=",&p.action_scale_mm_s) ||
         integer(f,"velocity_limit_mm_s=",&p.velocity_limit_mm_s) ||
@@ -57,19 +72,15 @@ int edge_package_load(const char *path, edge_package *out, char *err, size_t cap
         p.velocity_limit_mm_s!=p.action_scale_mm_s || p.acceleration_mm_s2<=0 ||
         p.angle_sign!=-1 || p.pause_deg!=20 || p.resume_deg!=18) goto fail;
     fclose(f); f=NULL;
-    const char *slash = strrchr(path,'/');
-    size_t prefix = slash ? (size_t)(slash-path+1) : 0;
-    if (prefix + strlen(name) >= sizeof(p.model_path)) { why="model_path_too_long"; goto fail; }
-    memcpy(p.model_path,path,prefix); strcpy(p.model_path+prefix,name);
-    model=fopen(p.model_path,"rb");
-    if (!model || fgetc(model)==EOF) { why="model_unreadable_or_empty"; goto fail; }
-    fclose(model);
-    /* SHA256 是打包来源记录。运行时不检测 OM 文件事后替换。 */
+    why="model_unreadable_or_invalid";
+    if (model_file(path,cpu,"policy.fp32",p.sha256_cpu,p.model_cpu_path,sizeof(p.model_cpu_path)) ||
+        model_file(path,npu,"policy.om",p.sha256_npu,p.model_npu_path,sizeof(p.model_npu_path)) ||
+        (!p.model_cpu_path[0] && !p.model_npu_path[0])) goto fail;
+    /* SHA256 是打包来源记录。运行时不检测模型文件事后替换。 */
     *out=p;
     return 0;
 fail:
     if (f) fclose(f);
-    if (model) fclose(model);
     if (err && cap) snprintf(err,cap,"%s",why);
     return -1;
 }

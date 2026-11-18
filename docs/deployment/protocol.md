@@ -6,7 +6,7 @@
 
 | 路径 | 适用对象 |
 |---|---|
-| [`edge/`](../../deploy/v2/edge/README.md) | 正式 CV610 端侧单动作 OM 推理与控制；以 `run --package <edge-package.txt>` 加载从正式模型清单派生的模型包。目标板验证范围见该目录说明。 |
+| [`edge/`](../../deploy/v2/edge/README.md) | 正式 CV610 端侧单动作 OM 推理与控制；以 `run --backend cpu --package <edge-package.txt>` 加载从正式模型清单派生的模型包。目标板验证范围见该目录说明。 |
 | [`device/run_policy.py`](../../deploy/v2/device/README.md) | Windows Python 单动作 ONNX 运行器及调试参照；频率与速度尺度读取 `model.json`，支持 400/500 Hz、0.9/1.25 m/s。 |
 | [`device/edge/`](../../deploy/v2/device/edge/README.md) | C 会话及接收适配接口；尚未集成目标板 NPU 控制循环。 |
 | `pc_runner.py` | 旧 V2 参考入口，不用于正式模型部署。 |

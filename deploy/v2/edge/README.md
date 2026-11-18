@@ -1,14 +1,15 @@
 # CV610 端侧推理与控制
 
-本目录在 Hi3516CV610 上加载 `.om` 策略，读取 ESP32 的串口状态并发送速度目标。训练和模型事实来自正式 ONNX 目录的 `model.json`，端侧模型包由工具生成。程序不自动修改固件配置、使能或回中。
+本目录在 Hi3516CV610 上显式选择 CPU FP32 或 NPU `.om` 策略，读取 ESP32 的串口状态并发送速度目标。训练和模型事实来自正式 ONNX 目录的 `model.json`，端侧模型包由工具生成。程序不自动修改固件配置、使能或回中。
 
 ## 构建
 
-生产构建需要 ARM32 musl 交叉编译器、配套 SVP ACL SDK 和本目录的真实 NPU 静态库。交接包放在 WSL 内部 ext4 文件系统，不能把工具链长期放在 NTFS。
+默认 CPU-only 构建只需要 ARM32 musl 交叉编译器，不依赖 NPU SDK。启用 NPU 后端才需要配套 SVP ACL SDK 和本目录的真实 NPU 静态库。交接包放在 WSL 内部 ext4 文件系统，不能把工具链长期放在 NTFS。
 
 ```sh
 bash deploy/v2/edge/setup-wsl.sh /mnt/c/<交接包目录>
-bash deploy/v2/edge/build.sh
+bash deploy/v2/edge/build.sh  # 默认 EDGE_ENABLE_NPU=OFF
+EDGE_ENABLE_NPU=ON bash deploy/v2/edge/build.sh  # 同时包含 CPU/NPU
 ```
 
 默认依赖目录为 `~/cv610`，可用 `CROSS_ROOT` 指定。产物是 `deploy/v2/edge/build-arm/cartpole_edge`。构建脚本检查 ARM32、musl 解释器、SDK 动态依赖和 RPATH；这些检查不代表真实 NPU 或控制性能已验收。导入时必须检查完整性报告，不能忽略工具链或 SDK 文件校验失败。
@@ -17,7 +18,7 @@ bash deploy/v2/edge/build.sh
 
 ## 准备模型包
 
-已有配套工具转换生成的 OM 后，在安装了 `onnx` 的 Python 环境执行：
+在安装了 `onnx` 的 Python 环境执行（`--om` 可省略，生成 CPU-only 包）：
 
 ```sh
 python deploy/v2/edge/prepare_package.py \
@@ -26,18 +27,20 @@ python deploy/v2/edge/prepare_package.py \
   --output /path/to/new-edge-package
 ```
 
-输入目录须包含 `model.json`、`policy.onnx` 和其外部权重。工具检查来源散列和输入输出形状，派生频率、动作尺度和运行限值，复制 OM，生成 `edge-package.txt`。它不能证明提交的 OM 确实由该 ONNX 转换；模型转换和数值对照仍是部署验收的一部分。包内 SHA256 是来源记录，C 运行器不进行运行时散列校验；生成后应整体部署，不单独替换文件。
+输入目录须包含 `model.json`、`policy.onnx` 和其外部权重。工具检查来源散列和输入输出形状，派生频率、动作尺度和运行限值，导出 FP32 权重 `policy.fp32`，可选复制 OM，生成 V2 `edge-package.txt`。CPU 仅支持明确验证过的前馈算子图，未知结构直接拒绝；不隐式更换模型。它不能证明提交的 OM 确实由该 ONNX 转换；模型转换和数值对照仍是部署验收的一部分。包内 SHA256 是来源记录，C 运行器不进行运行时散列校验；生成后应整体部署，不单独替换文件。
 
 ## 板端使用
 
-板端需要匹配的 NPU 驱动与 SDK 动态库。复制生产程序和整个模型包目录；不要部署 `.test-build/` 中任何文件。
+CPU 后端不需要 NPU 服务或动态库。NPU 后端需要匹配的驱动、SDK 动态库与已启动的 `sdk_server`。若板端现有服务未运行，可手动执行 `/usr/bin/sdk_server &`；不自动设自启，不同时重复启动服务。复制生产程序和整个模型包目录；不要部署 `.test-build/` 中任何文件。
 
 ```sh
 ./cartpole_edge --port /dev/ttyXXXX query
 ./cartpole_edge --port /dev/ttyXXXX state --secs 1
 ./cartpole_edge --port /dev/ttyXXXX enable
-./cartpole_edge --port /dev/ttyXXXX run --package /path/to/new-edge-package/edge-package.txt
+./cartpole_edge --port /dev/ttyXXXX run --backend cpu --package /path/to/new-edge-package/edge-package.txt
 ```
+
+`--backend cpu|npu` 必须显式选择，缺模型或该构建不支持时直接失败，不静默回退。
 
 `--port` 放在子命令之前；默认 `/dev/ttyAMA1` 只是可配置默认值，实际 UART 节点必须按接线确认。波特率固定 460800。
 
@@ -67,7 +70,7 @@ make -C deploy/v2/edge test-integration PYTHON=/path/to/python
 
 `test` 默认只运行单元测试。集成测试 Python 环境需要安装 `onnx`（模型包构建测试）。集成测试在 Linux/WSL 使用 PTY 和 socketpair，不打开真实串口，不需要 NPU。它以真实 CLI、协议、会话和 UART 实现配合测试固件及 NPU 替身，覆盖 MODE 回执、STATE 有效位、参数预检、启动写入边界及退出确认。
 
-测试程序明确命名 `.test-build/edge_TEST_ONLY`，启动推理时输出测试标识。生产 CMake 没有测试替身选项，缺 SDK 头文件或链接库时构建失败；可使用厂商交叉链接 stub，板端使用匹配的真实运行库。测试通过不能代替真实 ARM 链接、目标 SDK 加载、模型精度、400 Hz 板端时序或真机验证。
+测试程序明确命名 `.test-build/edge_TEST_ONLY`，启动推理时输出测试标识。生产 CMake 没有测试替身选项；CPU-only 无 SDK 依赖，开启 NPU 时缺 SDK 头文件或链接库会构建失败；可使用厂商交叉链接 stub，板端使用匹配的真实运行库。测试通过不能代替真实 ARM 链接、目标 SDK 加载、模型精度、400 Hz 板端时序或真机验证。
 
 ## 模块边界
 

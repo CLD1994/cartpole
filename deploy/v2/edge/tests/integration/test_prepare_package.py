@@ -7,6 +7,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 import onnx
+import numpy as np
+from onnx import numpy_helper
 from onnx import helper, TensorProto
 EDGE = Path(__file__).parents[2]
 spec = importlib.util.spec_from_file_location('prepare_package_integration', EDGE/'prepare_package.py')
@@ -15,9 +17,10 @@ spec.loader.exec_module(m)
 
 class PrepareTest(unittest.TestCase):
     def fixture(self, root, shape=(1,4)):
-        graph = helper.make_graph([helper.make_node('ReduceMean',['x'],['y'],axes=[1],keepdims=1)],'policy',
-            [helper.make_tensor_value_info('x',TensorProto.FLOAT,shape)],
-            [helper.make_tensor_value_info('y',TensorProto.FLOAT,[1,1])])
+        arrays = [np.ones((3,4),np.float32),np.zeros(3,np.float32),np.ones((2,3),np.float32),np.zeros(2,np.float32),np.ones((1,2),np.float32),np.zeros(1,np.float32)]
+        names=['w0','b0','w1','b1','w2','b2']
+        nodes=[helper.make_node('Gemm',['x','w0','b0'],['a'],transB=1),helper.make_node('Elu',['a'],['b']),helper.make_node('Gemm',['b','w1','b1'],['c'],transB=1),helper.make_node('Elu',['c'],['d']),helper.make_node('Gemm',['d','w2','b2'],['y'],transB=1)]
+        graph=helper.make_graph(nodes,'policy',[helper.make_tensor_value_info('x',TensorProto.FLOAT,shape)],[helper.make_tensor_value_info('y',TensorProto.FLOAT,[1,1])],[numpy_helper.from_array(a,n) for a,n in zip(arrays,names)])
         onnx.save(helper.make_model(graph),root/'policy.onnx')
         manifest = dict(schema_version=1, observation_order=['x','theta','xdot','thetadot'],
             observation_units=['m','rad','m/s','rad/s'],action_type='cart_target_velocity',action_dim=1,
@@ -48,9 +51,17 @@ class PrepareTest(unittest.TestCase):
             with patch.object(Path, 'write_text', windows_write_text):
                 result = m.prepare(root, root/'source.om', root/'edge')
             raw = result.read_bytes()
-            self.assertTrue(raw.startswith(b'EDGE_PACKAGE_V1\n'))
+            self.assertTrue(raw.startswith(b'EDGE_PACKAGE_V2\n'))
             self.assertNotIn(b'\r', raw)
-            self.assertEqual(raw.count(b'\n'), 10)
+            self.assertEqual(raw.count(b'\n'), 12)
+
+    def test_cpu_only_package(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d); self.fixture(root)
+            result=m.prepare(root,None,root/'cpu')
+            self.assertIn('model_npu=none\n',result.read_text())
+            self.assertTrue((result.parent/'policy.fp32').read_bytes().startswith(b'CPFP32V1'))
+            self.assertFalse((result.parent/'policy.om').exists())
 
     def test_bad_onnx_hash_creates_no_output(self):
         with tempfile.TemporaryDirectory() as d:
