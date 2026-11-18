@@ -26,7 +26,7 @@ int cartpole_runtime_init(cartpole_runtime_t *runtime, const cartpole_clock_t *c
     runtime->clock = clock ? *clock : (cartpole_clock_t){monotonic_now, monotonic_sleep, runtime};
     return 0;
 }
-double cartpole_runtime_now(cartpole_runtime_t *runtime)
+double cartpole_runtime_get_monotonic_time_s(cartpole_runtime_t *runtime)
 {
     return runtime->clock.now(runtime->clock.context);
 }

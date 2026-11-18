@@ -7,7 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-const char *serial_cartpole_setting_name(cartpole_setting_t setting)
+const char *serial_cartpole_setting_to_string(cartpole_setting_t setting)
 {
     switch (setting) {
     case CARTPOLE_SETTING_VELOCITY_LIMIT:
@@ -29,12 +29,12 @@ const char *serial_cartpole_setting_name(cartpole_setting_t setting)
     }
     return NULL;
 }
-int serial_cartpole_setting_from_name(const char *name, cartpole_setting_t *setting)
+int serial_cartpole_parse_setting(const char *name, cartpole_setting_t *setting)
 {
     if (!name || !setting)
         return -1;
     for (int i = CARTPOLE_SETTING_VELOCITY_LIMIT; i <= CARTPOLE_SETTING_STEP_LOSS_THRESHOLD; i++) {
-        if (!strcmp(name, serial_cartpole_setting_name((cartpole_setting_t)i))) {
+        if (!strcmp(name, serial_cartpole_setting_to_string((cartpole_setting_t)i))) {
             *setting = (cartpole_setting_t)i;
             return 0;
         }
@@ -74,7 +74,7 @@ struct serial_cartpole {
     void *event_context;
     int session_event_pending, delivering, configuration_changed;
 };
-static double adapter_now(serial_cartpole_t *s) { return cartpole_runtime_now(s->runtime); }
+static double adapter_now(serial_cartpole_t *s) { return cartpole_runtime_get_monotonic_time_s(s->runtime); }
 static double state_age(serial_cartpole_t *s)
 {
     return s->snapshot.last_state_received_host_monotonic_s < 0
@@ -456,7 +456,7 @@ static cartpole_result_t adapter_configure(serial_cartpole_t *s, cartpole_settin
 {
     double end;
     TX_TRY(adapter_deadline(s, timeout_s, &end));
-    const char *name = serial_cartpole_setting_name(setting);
+    const char *name = serial_cartpole_setting_to_string(setting);
     char line[64];
     if (!name || strlen(name) >= sizeof s->wait_name || !proto_format_config(line, name, value))
         return CARTPOLE_INVALID_ARGUMENT;
@@ -775,11 +775,11 @@ static const cartpole_device_ops_t operations = {
     .receive = port_receive,
     .get_error = port_get_error,
     .query_mode = port_query_mode,
-    .wait_measurement = port_wait_measurement,
+    .wait_for_measurement = port_wait_measurement,
     .enable = port_enable,
     .reset = port_reset,
     .refresh_configuration = port_refresh_configuration,
-    .mark = port_mark,
+    .mark_endpoint = port_mark,
     .configure = port_configure,
     .stop_and_confirm = port_stop_and_confirm,
     .attach_observer = port_attach_observer,
@@ -805,7 +805,7 @@ serial_cartpole_t *serial_cartpole_open(const char *port, int baud, cartpole_run
     s->snapshot.is_serial_open = 1;
     return s;
 }
-cartpole_device_t serial_cartpole_device(serial_cartpole_t *s)
+cartpole_device_t serial_cartpole_get_device(serial_cartpole_t *s)
 {
     return (cartpole_device_t){.ops = &operations, .context = s, .runtime = s ? s->runtime : NULL};
 }

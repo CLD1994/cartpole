@@ -1,3 +1,4 @@
+#include "cartpole_format.h"
 /* CV610 应用层：组织模型、用户命令与输出；设备循环由 cartpole 会话负责。 */
 #include "cartpole.h"
 #include "cartpole_device.h"
@@ -26,8 +27,8 @@ static void print_event(const cartpole_event_t *event, void *context)
     if (event->kind == CARTPOLE_EVENT_SESSION) {
         const cartpole_session_t *s = &event->data.session;
         if (s->is_mode_received)
-            printf("[edge] MODE %s %s\n", cartpole_mode_name(s->reported_mode),
-                   cartpole_reason_name(s->reported_mode_reason));
+            printf("[edge] MODE %s %s\n", cartpole_mode_to_string(s->reported_mode),
+                   cartpole_reason_to_string(s->reported_mode_reason));
     } else if (event->kind == CARTPOLE_EVENT_STEP_LOSS) {
         printf("[edge] STEP_LOSS event=%" PRId64 " run=%" PRId64 " device_us=%" PRId64 "\n",
                event->data.step_loss.event_id, event->data.step_loss.run_id,
@@ -80,7 +81,7 @@ static int run_policy(cartpole_t *c, int argc, char **argv, int first)
     if (console_transaction_result("preflight QUERY", cartpole_query_mode(c, 1.0)) != 0 ||
         console_transaction_result("preflight metadata", cartpole_refresh_configuration(c, 1.0)) !=
             0 ||
-        console_transaction_result("preflight STATE", cartpole_wait_measurement(c, 1.0)) != 0)
+        console_transaction_result("preflight STATE", cartpole_wait_for_measurement(c, 1.0)) != 0)
         return 1;
     cartpole_configuration_t config = cartpole_get_configuration(c);
     if (!config.complete || config.calibration_state != CARTPOLE_CALIBRATION_READY ||
@@ -98,8 +99,8 @@ static int run_policy(cartpole_t *c, int argc, char **argv, int first)
     if (!session.is_mode_received || session.reported_mode != CARTPOLE_MODE_READY ||
         session.reported_mode_reason != CARTPOLE_REASON_NONE || session.has_received_fault_mode ||
         session.has_stream_failure_latch || !measurement.cart_valid || !measurement.pole_valid ||
-        cartpole_measurement_age_s(c, measurement) < 0 ||
-        cartpole_measurement_age_s(c, measurement) > .020) {
+        cartpole_calculate_measurement_age_s(c, measurement) < 0 ||
+        cartpole_calculate_measurement_age_s(c, measurement) > .020) {
         fprintf(stderr, "[edge] preflight requires READY NONE and fresh valid STATE\n");
         return 1;
     }
@@ -126,7 +127,7 @@ static int run_console(cartpole_t *c)
 }
 static int oneshot_state(cartpole_t *c)
 {
-    if (console_transaction_result("STATE", cartpole_wait_measurement(c, 1.0)))
+    if (console_transaction_result("STATE", cartpole_wait_for_measurement(c, 1.0)))
         return 1;
     console_print_state(c);
     return 0;
@@ -161,13 +162,13 @@ static int sample_window(double elapsed, cartpole_tick_action_t *action, void *c
 }
 static int oneshot_state_window(cartpole_t *c, serial_cartpole_t *serial, double secs)
 {
-    if (console_transaction_result("STATE", cartpole_wait_measurement(c, 1.0)))
+    if (console_transaction_result("STATE", cartpole_wait_for_measurement(c, 1.0)))
         return 1;
     serial_cartpole_statistics_t before = serial_cartpole_get_statistics(serial);
     state_window w = {.cartpole = c};
-    double start = cartpole_host_monotonic_s(c);
+    double start = cartpole_get_monotonic_time_s(c);
     cartpole_result_t result = cartpole_run_loop(c, .020, secs, sample_window, &w);
-    double dt = cartpole_host_monotonic_s(c) - start;
+    double dt = cartpole_get_monotonic_time_s(c) - start;
     serial_cartpole_statistics_t after = serial_cartpole_get_statistics(serial);
     uint64_t count = after.received_measurements - before.received_measurements;
     uint64_t unknown = after.unknown_received_lines - before.unknown_received_lines;
@@ -194,7 +195,7 @@ static int watchdog_tick(double elapsed, cartpole_tick_action_t *action, void *c
 static int oneshot_wdt_test(cartpole_t *c)
 {
     if (console_transaction_result("QUERY", cartpole_query_mode(c, 1.0)) ||
-        console_transaction_result("STATE", cartpole_wait_measurement(c, CFG_STATE_TIMEOUT_S)))
+        console_transaction_result("STATE", cartpole_wait_for_measurement(c, CFG_STATE_TIMEOUT_S)))
         return 1;
     cartpole_session_t s = cartpole_get_session_state(c);
     if (!s.is_mode_received || s.reported_mode != CARTPOLE_MODE_READY ||
@@ -434,7 +435,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    cartpole_t *c = cartpole_create(serial_cartpole_device(serial), &runtime);
+    cartpole_t *c = cartpole_create(serial_cartpole_get_device(serial), &runtime);
     if (!c) {
         serial_cartpole_close(serial);
         return 1;

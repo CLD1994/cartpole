@@ -133,11 +133,11 @@ static const cartpole_device_ops_t ops = {.get_latest_measurement = measurement,
                                           .detach_observer = detach,
                                           .report_failure = report_failure,
                                           .query_mode = transaction,
-                                          .wait_measurement = transaction,
+                                          .wait_for_measurement = transaction,
                                           .enable = transaction,
                                           .reset = transaction,
                                           .refresh_configuration = transaction,
-                                          .mark = mark,
+                                          .mark_endpoint = mark,
                                           .configure = configure,
                                           .stop_and_confirm = stop,
                                           .send_velocity = send_velocity};
@@ -190,18 +190,18 @@ static void test_lifecycle_and_cached_queries(void)
     assert(cartpole_get_configuration(ca).complete);
     assert(a.reads == 0);
     a.now = 1.005;
-    assert(cartpole_measurement_age_s(ca, measurement(&a)) > .0049);
+    assert(cartpole_calculate_measurement_age_s(ca, measurement(&a)) > .0049);
     cartpole_request_stop(ca);
-    assert(cartpole_stop_requested(ca));
-    assert(!cartpole_stop_requested(cb));
+    assert(cartpole_is_stop_requested(ca));
+    assert(!cartpole_is_stop_requested(cb));
     cartpole_destroy(ca);
     assert(!a.observer && b.observer);
     assert(!a.runtime.session_bound);
     volatile sig_atomic_t external_stop = 0;
     b.runtime.external_stop = &external_stop;
-    assert(!cartpole_stop_requested(cb));
+    assert(!cartpole_is_stop_requested(cb));
     external_stop = 1;
-    assert(cartpole_stop_requested(cb));
+    assert(cartpole_is_stop_requested(cb));
     cartpole_destroy(cb);
     assert(!b.observer);
     emit(&a, CARTPOLE_EVENT_SESSION); /* 销毁已解绑，不再触及已释放context。 */

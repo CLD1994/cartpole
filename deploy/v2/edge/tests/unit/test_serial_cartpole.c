@@ -68,7 +68,7 @@ int main(void)
     serial_cartpole_t *a = serial_cartpole_open("one", 460800, &runtime);
     serial_cartpole_t *b = serial_cartpole_open("two", 460800, &runtime);
     assert(a && b);
-    cartpole_device_t d = serial_cartpole_device(a), other = serial_cartpole_device(b);
+    cartpole_device_t d = serial_cartpole_get_device(a), other = serial_cartpole_get_device(b);
     assert(d.ops->attach_observer(d.context, event, NULL) == CARTPOLE_OK);
     assert(d.ops->attach_observer(d.context, event, NULL) == CARTPOLE_REJECTED);
     line = "STATE 3 1000 2000 3 4\n";

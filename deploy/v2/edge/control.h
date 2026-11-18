@@ -9,6 +9,6 @@ typedef struct {
 } control_input;
 control_decision control_check(control_gate *gate, const control_input *in);
 control_decision control_observe(control_gate *gate, const control_input *in, double received_at);
-double control_velocity(double action, double scale, double limit, double x_m, double track_limit_m);
-double control_next_tick(double previous, double now, double period);
+double control_calculate_velocity(double action, double scale, double limit, double x_m, double track_limit_m);
+double control_calculate_next_tick(double previous, double now, double period);
 #endif

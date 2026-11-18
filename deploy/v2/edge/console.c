@@ -1,3 +1,4 @@
+#include "cartpole_format.h"
 /* 交互控制台实现。协议契约见 docs/deployment/protocol.md。 */
 
 #include "console.h"
@@ -236,7 +237,7 @@ int console_transaction_result(const char *operation, cartpole_result_t result)
 {
     if (result == CARTPOLE_OK)
         return 0;
-    fprintf(stderr, "[edge] %s: %s%s\n", operation, cartpole_result_name(result),
+    fprintf(stderr, "[edge] %s: %s%s\n", operation, cartpole_result_to_string(result),
             result == CARTPOLE_TIMEOUT ? " (execution unconfirmed; do not automatically retry)"
                                        : "");
     return -1;
@@ -257,7 +258,7 @@ int console_exec(cartpole_t *c, const console_req_t *req)
         known = snapshot.is_mode_received;
         cartpole_mode_t m = snapshot.reported_mode;
         if (known && m != CARTPOLE_MODE_DISABLED) {
-            fprintf(stderr, "[edge] calib requires DISABLED (current %s)\n", cartpole_mode_name(m));
+            fprintf(stderr, "[edge] calib requires DISABLED (current %s)\n", cartpole_mode_to_string(m));
             return -1;
         }
         printf("[edge] push cart to LEFT end, then press Enter...");
@@ -265,7 +266,7 @@ int console_exec(cartpole_t *c, const console_req_t *req)
         if (wait_enter(c) != 0) {
             return -1;
         }
-        if (console_transaction_result("MARK LEFT", cartpole_mark(c, CARTPOLE_LEFT, 1.0)) != 0) {
+        if (console_transaction_result("MARK LEFT", cartpole_mark_endpoint(c, CARTPOLE_LEFT, 1.0)) != 0) {
             return -1;
         }
         printf("[edge] push cart to RIGHT end, then press Enter...");
@@ -273,7 +274,7 @@ int console_exec(cartpole_t *c, const console_req_t *req)
         if (wait_enter(c) != 0) {
             return -1;
         }
-        if (console_transaction_result("MARK RIGHT", cartpole_mark(c, CARTPOLE_RIGHT, 1.0)) != 0) {
+        if (console_transaction_result("MARK RIGHT", cartpole_mark_endpoint(c, CARTPOLE_RIGHT, 1.0)) != 0) {
             return -1;
         }
         if (console_transaction_result("ENABLE", cartpole_enable(c, 2.0)) != 0) {
@@ -283,9 +284,9 @@ int console_exec(cartpole_t *c, const console_req_t *req)
         return 0;
     }
     case CONSOLE_CMD_MARK_LEFT:
-        return console_transaction_result("MARK LEFT", cartpole_mark(c, CARTPOLE_LEFT, 1.0));
+        return console_transaction_result("MARK LEFT", cartpole_mark_endpoint(c, CARTPOLE_LEFT, 1.0));
     case CONSOLE_CMD_MARK_RIGHT:
-        return console_transaction_result("MARK RIGHT", cartpole_mark(c, CARTPOLE_RIGHT, 1.0));
+        return console_transaction_result("MARK RIGHT", cartpole_mark_endpoint(c, CARTPOLE_RIGHT, 1.0));
     case CONSOLE_CMD_ENABLE:
         return console_transaction_result("ENABLE", cartpole_enable(c, 2.0));
     case CONSOLE_CMD_CENTER:
@@ -303,7 +304,7 @@ int console_exec(cartpole_t *c, const console_req_t *req)
         }
         cartpole_reason_t reason = cartpole_get_session_state(c).reported_mode_reason;
         cartpole_mode_t m = cartpole_get_session_state(c).reported_mode;
-        printf("MODE %s %s\n", cartpole_mode_name(m), cartpole_reason_name(reason));
+        printf("MODE %s %s\n", cartpole_mode_to_string(m), cartpole_reason_to_string(reason));
         return 0;
     }
     case CONSOLE_CMD_CONFIG: {
@@ -326,14 +327,14 @@ int console_exec(cartpole_t *c, const console_req_t *req)
         char operation[32];
         snprintf(operation, sizeof operation, "CONFIG %s", req->name);
         cartpole_setting_t setting;
-        if (serial_cartpole_setting_from_name(req->name, &setting) != 0) {
+        if (serial_cartpole_parse_setting(req->name, &setting) != 0) {
             fprintf(stderr, "[edge] unsupported setting %s\n", req->name);
             return -1;
         }
         int rc =
             console_transaction_result(operation, cartpole_configure(c, setting, req->value, 1.0));
         if (rc == 0)
-            printf("[edge] %s = %ld\n", serial_cartpole_setting_name(setting), req->value);
+            printf("[edge] %s = %ld\n", serial_cartpole_setting_to_string(setting), req->value);
         return rc;
     }
     case CONSOLE_CMD_RESET: {
@@ -348,7 +349,7 @@ int console_exec(cartpole_t *c, const console_req_t *req)
             return 0;
         }
         if (m != CARTPOLE_MODE_FAULT) {
-            fprintf(stderr, "[edge] RESET only clears FAULT (current %s)\n", cartpole_mode_name(m));
+            fprintf(stderr, "[edge] RESET only clears FAULT (current %s)\n", cartpole_mode_to_string(m));
             return -1;
         }
         if (console_transaction_result("RESET", cartpole_reset(c, 2.0)) != 0)
@@ -402,7 +403,7 @@ int console_run(cartpole_t *c)
     memset(&input, 0, sizeof input);
     print_help();
     puts("[edge] console ready (quit/Ctrl+D to exit)");
-    while (!cartpole_stop_requested(c)) {
+    while (!cartpole_is_stop_requested(c)) {
         cartpole_result_t result = cartpole_run_loop(c, .020, 0, console_tick, &hold);
         if (result == CARTPOLE_CANCELLED)
             return 0;
@@ -432,7 +433,7 @@ int console_run(cartpole_t *c)
         if (req.cmd == CONSOLE_CMD_VEL) {
             if (query_mode_for_command(c) ||
                 console_transaction_result("STATE",
-                                           cartpole_wait_measurement(c, CFG_STATE_TIMEOUT_S))) {
+                                           cartpole_wait_for_measurement(c, CFG_STATE_TIMEOUT_S))) {
                 hold.holding = 0;
                 continue;
             }
@@ -466,5 +467,5 @@ void console_print_state(cartpole_t *c)
                m.pole_angular_velocity_rad_s);
     else
         puts("[edge] pole measurement unavailable");
-    printf("[edge] measurement age=%.1f ms\n", cartpole_measurement_age_s(c, m) * 1000);
+    printf("[edge] measurement age=%.1f ms\n", cartpole_calculate_measurement_age_s(c, m) * 1000);
 }

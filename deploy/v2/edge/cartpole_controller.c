@@ -39,7 +39,7 @@ static control_input control_state(cartpole_t *c, const control_snapshot_t *snap
                                !snapshot->session.has_received_fault_mode,
                            .flags = (snapshot->measurement.cart_valid ? 1 : 0) |
                                     (snapshot->measurement.pole_valid ? 2 : 0),
-                           .age_s = cartpole_measurement_age_s(c, snapshot->measurement),
+                           .age_s = cartpole_calculate_measurement_age_s(c, snapshot->measurement),
                            .theta_rad = snapshot->measurement.pole_angle_rad,
                            .backlog = received > 0,
                            .io_error = received < 0 || snapshot->session.has_stream_failure_latch};
@@ -48,8 +48,8 @@ static cartpole_result_t gate_reason(cartpole_t *c, const control_input *input,
                                      const control_snapshot_t *snapshot)
 {
     if (input->io_error)
-        return cartpole_stream_result(c) == CARTPOLE_OK ? CARTPOLE_SESSION_UNAVAILABLE
-                                                        : cartpole_stream_result(c);
+        return cartpole_get_stream_result(c) == CARTPOLE_OK ? CARTPOLE_SESSION_UNAVAILABLE
+                                                        : cartpole_get_stream_result(c);
     if (snapshot->session.has_received_fault_mode)
         return CARTPOLE_FAULT;
     if (!input->ready)
@@ -122,18 +122,18 @@ cartpole_result_t cartpole_run_controller(cartpole_t *c,
     controller.gate.has_time = 1;
     controller.gate.last_observed_at = cartpole_get_latest_measurement(c).received_host_monotonic_s;
     cartpole_set_control_observer(c, observe_control, &controller);
-    double next = cartpole_host_monotonic_s(c), period = 1. / options->control_hz;
+    double next = cartpole_get_monotonic_time_s(c), period = 1. / options->control_hz;
     double track_limit = (options->expected_configuration.track_length_um * .5 -
                           options->expected_configuration.track_margin_um) *
                          1e-6;
     uint64_t consumed = 0;
-    while (!cartpole_stop_requested(c)) {
-        cartpole_sleep_to(c, next);
-        if (cartpole_stop_requested(c))
+    while (!cartpole_is_stop_requested(c)) {
+        cartpole_sleep_until(c, next);
+        if (cartpole_is_stop_requested(c))
             break;
         int received = cartpole_receive(c);
         if (received < 0)
-            return finish_controller(c, cartpole_stream_result(c));
+            return finish_controller(c, cartpole_get_stream_result(c));
         control_snapshot_t snapshot = current_state(c);
         control_input input = control_state(c, &snapshot, received);
         if (!configuration_matches(c, &options->expected_configuration))
@@ -154,7 +154,7 @@ cartpole_result_t cartpole_run_controller(cartpole_t *c,
                 return finish_controller(c, CARTPOLE_CALLBACK_ERROR);
             received = cartpole_receive(c);
             if (received < 0)
-                return finish_controller(c, cartpole_stream_result(c));
+                return finish_controller(c, cartpole_get_stream_result(c));
             snapshot = current_state(c);
             input = control_state(c, &snapshot, received);
             if (!configuration_matches(c, &options->expected_configuration))
@@ -163,8 +163,8 @@ cartpole_result_t cartpole_run_controller(cartpole_t *c,
             if (decision == CONTROL_STOP)
                 return finish_controller(c, stopped_reason(&controller, &input, &snapshot));
             if (decision == CONTROL_DRIVE && generation == controller.gate.generation &&
-                !cartpole_stop_requested(c) && cartpole_measurement_age_s(c, measurement) <= .020) {
-                double velocity = control_velocity(
+                !cartpole_is_stop_requested(c) && cartpole_calculate_measurement_age_s(c, measurement) <= .020) {
+                double velocity = control_calculate_velocity(
                     normalized_action, options->action_scale_mm_s, options->velocity_limit_mm_s,
                     snapshot.measurement.cart_position_m, track_limit);
                 if (!isfinite(velocity))
@@ -174,12 +174,12 @@ cartpole_result_t cartpole_run_controller(cartpole_t *c,
                 if (sent == CARTPOLE_SEND_LATE)
                     return finish_controller(c, CARTPOLE_TIMEOUT);
                 if (sent == CARTPOLE_SEND_ERROR)
-                    return finish_controller(c, cartpole_stream_result(c) == CARTPOLE_OK
+                    return finish_controller(c, cartpole_get_stream_result(c) == CARTPOLE_OK
                                                     ? CARTPOLE_SESSION_UNAVAILABLE
-                                                    : cartpole_stream_result(c));
+                                                    : cartpole_get_stream_result(c));
             }
         }
-        next = control_next_tick(next, cartpole_host_monotonic_s(c), period);
+        next = control_calculate_next_tick(next, cartpole_get_monotonic_time_s(c), period);
     }
     return finish_controller(c, CARTPOLE_CANCELLED);
 }

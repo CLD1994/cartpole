@@ -12,22 +12,22 @@ cartpole_result_t cartpole_run_loop(cartpole_t *c, double period_s, double durat
         cartpole_loop_end(c);
         return CARTPOLE_SESSION_UNAVAILABLE;
     }
-    double start = cartpole_host_monotonic_s(c), next = start;
+    double start = cartpole_get_monotonic_time_s(c), next = start;
     cartpole_result_t result = CARTPOLE_OK;
-    while (!cartpole_stop_requested(c)) {
+    while (!cartpole_is_stop_requested(c)) {
         double until = duration_s > 0 ? fmin(next, start + duration_s) : next;
-        cartpole_sleep_to(c, until);
-        if (cartpole_stop_requested(c))
+        cartpole_sleep_until(c, until);
+        if (cartpole_is_stop_requested(c))
             break;
-        double now = cartpole_host_monotonic_s(c);
+        double now = cartpole_get_monotonic_time_s(c);
         if (duration_s > 0 && now - start >= duration_s)
             break;
         int received = cartpole_receive(c);
         if (received < 0) {
-            result = cartpole_stream_result(c);
+            result = cartpole_get_stream_result(c);
             break;
         }
-        if (duration_s > 0 && cartpole_host_monotonic_s(c) - start >= duration_s)
+        if (duration_s > 0 && cartpole_get_monotonic_time_s(c) - start >= duration_s)
             break;
         if (received == 0) {
             cartpole_tick_action_t action = {.kind = CARTPOLE_TICK_OBSERVE};
@@ -41,28 +41,28 @@ cartpole_result_t cartpole_run_loop(cartpole_t *c, double period_s, double durat
                 result = CARTPOLE_CALLBACK_ERROR;
                 break;
             }
-            if (cartpole_stop_requested(c)) {
+            if (cartpole_is_stop_requested(c)) {
                 result = CARTPOLE_CANCELLED;
                 break;
             }
-            if (duration_s > 0 && cartpole_host_monotonic_s(c) - start >= duration_s)
+            if (duration_s > 0 && cartpole_get_monotonic_time_s(c) - start >= duration_s)
                 break;
             if (action.kind == CARTPOLE_TICK_FINISH)
                 break;
             if (action.kind == CARTPOLE_TICK_VELOCITY) {
                 received = cartpole_receive(c);
                 if (received < 0) {
-                    result = cartpole_stream_result(c);
+                    result = cartpole_get_stream_result(c);
                     break;
                 }
-                if (duration_s > 0 && cartpole_host_monotonic_s(c) - start >= duration_s)
+                if (duration_s > 0 && cartpole_get_monotonic_time_s(c) - start >= duration_s)
                     break;
                 if (received == 0 &&
                     cartpole_send_velocity(c, action.velocity_mm_s,
                                            duration_s > 0 ? start + duration_s : INFINITY,
                                            0) != CARTPOLE_SEND_COMPLETE) {
-                    result = cartpole_stream_result(c) == CARTPOLE_OK ? CARTPOLE_SESSION_UNAVAILABLE
-                                                                      : cartpole_stream_result(c);
+                    result = cartpole_get_stream_result(c) == CARTPOLE_OK ? CARTPOLE_SESSION_UNAVAILABLE
+                                                                      : cartpole_get_stream_result(c);
                     break;
                 }
             } else if (action.kind != CARTPOLE_TICK_OBSERVE) {
@@ -70,9 +70,9 @@ cartpole_result_t cartpole_run_loop(cartpole_t *c, double period_s, double durat
                 break;
             }
         }
-        next = control_next_tick(next, cartpole_host_monotonic_s(c), period_s);
+        next = control_calculate_next_tick(next, cartpole_get_monotonic_time_s(c), period_s);
     }
-    if (cartpole_stop_requested(c) && result == CARTPOLE_OK)
+    if (cartpole_is_stop_requested(c) && result == CARTPOLE_OK)
         result = CARTPOLE_CANCELLED;
     cartpole_loop_end(c);
     return result;

@@ -18,7 +18,7 @@ typedef struct {
 } cartpole_runtime_t;
 /* clock=NULL使用平台CLOCK_MONOTONIC；自定义时钟须提供两个回调。 */
 int cartpole_runtime_init(cartpole_runtime_t *, const cartpole_clock_t *);
-double cartpole_runtime_now(cartpole_runtime_t *);
+double cartpole_runtime_get_monotonic_time_s(cartpole_runtime_t *);
 void cartpole_runtime_sleep_until(cartpole_runtime_t *, double);
 int cartpole_runtime_is_cancelled(cartpole_runtime_t *);
 #endif

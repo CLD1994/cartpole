@@ -31,10 +31,10 @@ int main(void) {
     x.theta_rad=.4; control_observe(&g,&x,1.002);
     x.theta_rad=0; control_observe(&g,&x,1.004);
     assert(g.generation!=generation); /* 即使同批恢复，旧推理候选也应丢弃 */
-    assert(control_velocity(2,900,800,0,.4)==800);
-    assert(control_velocity(-1,900,900,-.41,.4)==0);
-    assert(control_velocity(1,900,900,-.41,.4)==900);
-    assert(isnan(control_velocity(NAN,900,900,0,.4)));
-    assert(fabs(control_next_tick(1.,1.020,.0025)-1.0225)<1e-8);
+    assert(control_calculate_velocity(2,900,800,0,.4)==800);
+    assert(control_calculate_velocity(-1,900,900,-.41,.4)==0);
+    assert(control_calculate_velocity(1,900,900,-.41,.4)==900);
+    assert(isnan(control_calculate_velocity(NAN,900,900,0,.4)));
+    assert(fabs(control_calculate_next_tick(1.,1.020,.0025)-1.0225)<1e-8);
     puts("control: passed");
 }

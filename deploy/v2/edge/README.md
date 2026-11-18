@@ -79,6 +79,7 @@ make -C deploy/v2/edge test-integration PYTHON=/path/to/python
 | `main.c` | CLI、串口与业务实例装配、模型选择、部署预检、推理回调与退出 |
 | `control.c` | 控制门控、速度换算与周期推进 |
 | `package.c` / `prepare_package.py` | 模型包读取与从正式模型目录派生 |
+| `cartpole_format.c` / `cartpole_format.h` | 枚举展示转换（`*_to_string`），与设备事务分离 |
 | `cartpole.c` / `cartpole.h` | 倒立摆业务会话、只读查询、类型化事件与业务事务入口 |
 | `cartpole_device.h` | 业务定义的设备能力，由实际设备适配器实现 |
 | `serial_cartpole.c` / `serial_cartpole.h` | 串口实例、固件协议事务、接收缓存与通信统计 |
@@ -97,7 +98,7 @@ make -C deploy/v2/edge test-integration PYTHON=/path/to/python
 
 `cartpole.h` 只描述倒立摆的测量、设备状态、配置与业务操作。端口和波特率属于 `serial_cartpole` 适配器的构造参数；控制器和维护业务不依赖 UART 或固件协议。
 
-装配入口先初始化一个 `cartpole_runtime_t`，再用它打开串口适配器，将 `serial_cartpole_device()` 返回的设备能力注入 `cartpole_create()`。业务会话借用设备和运行环境，不拥有二者；释放顺序是完成停止确认、`cartpole_destroy()`、`serial_cartpole_close()`。每个会话独占一个运行环境，重复绑定被拒绝，避免共享取消或重入状态。适配器与业务必须使用同一时钟，注入不匹配的运行环境会构造失败。
+装配入口先初始化一个 `cartpole_runtime_t`，再用它打开串口适配器，将 `serial_cartpole_get_device()` 返回的设备能力注入 `cartpole_create()`。业务会话借用设备和运行环境，不拥有二者；释放顺序是完成停止确认、`cartpole_destroy()`、`serial_cartpole_close()`。每个会话独占一个运行环境，重复绑定被拒绝，避免共享取消或重入状态。适配器与业务必须使用同一时钟，注入不匹配的运行环境会构造失败。
 
 `cartpole_device_ops_t` 是业务定义的能力表，包括读取最近测量/状态/配置、逐事件接收、执行设备事务、提交带期限的速度目标与确认停车。实际适配器及测试替身实现这个契约；控制器无需链接串口或协议实现。`cartpole_clock_t` 可替换单调时钟与绝对等待，默认使用平台 `CLOCK_MONOTONIC`。
 
@@ -121,10 +122,12 @@ make -C deploy/v2/edge test-integration PYTHON=/path/to/python
 
 ### 事务与停车
 
-`cartpole_enable()`、`cartpole_reset()`、`cartpole_mark()`、`cartpole_configure()` 是完整业务事务。调用者不拼接底层发送、清积压和等回执；一次绝对期限覆盖全部阶段。返回结果区分取消、超时、传输失败、协议异常、设备拒绝、故障、回执值不符及非法参数，错误从发生处传递，不根据最终状态猜测。控制过程还区分测量不可用、会话不可用、控制期限、部署配置改变和应用回调错误，不把这些原因冒充成设备拒绝。
+`cartpole_enable()`、`cartpole_reset()`、`cartpole_mark_endpoint()`、`cartpole_configure()` 是完整业务事务。调用者不拼接底层发送、清积压和等回执；一次绝对期限覆盖全部阶段。返回结果区分取消、超时、传输失败、协议异常、设备拒绝、故障、回执值不符及非法参数，错误从发生处传递，不根据最终状态猜测。控制过程还区分测量不可用、会话不可用、控制期限、部署配置改变和应用回调错误，不把这些原因冒充成设备拒绝。
 
 超时只表示未在期限内确认，命令可能已经送达甚至执行，不能自动重试使能、标定或配置。写入成功也不等于设备执行；完整写入但已过期与未写入不是同一结果。
 
 连接关闭不等于停车。运动退出先完成有界零速、停稳与禁用确认，再关闭连接；故障保持故障，不伪装成禁用。停止确认必须使用新收到的证据，不能复用进入停车流程前的零速或模式。取消和既有流错误不妨碍必要的清理尝试。
 
 每次打开适配器创建新的缓存、统计和故障锁存；关闭后该实例不可再访问。销毁业务会话解除它的事件观察器，但不关闭借用的适配器。调用方保留的旧值只是一份旧副本，不代表当前设备状态。
+
+公开命名区分职责：缓存查询用 `get_*`，年龄计算用 `cartpole_calculate_measurement_age_s()`，取消谓词用 `cartpole_is_stop_requested()`。单调时钟查询为 `cartpole_get_monotonic_time_s()`；展示层显式包含 `cartpole_format.h` 使用枚举的 `*_to_string()`。串口配置词汇由 `serial_cartpole_setting_to_string()` / `serial_cartpole_parse_setting()` 转换，不属于业务会话接口。

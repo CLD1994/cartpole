@@ -29,7 +29,7 @@ control_decision control_observe(control_gate *gate, const control_input *in, do
     return control_check(gate,in);
 }
 
-double control_velocity(double action, double scale, double limit, double x_m, double track_limit_m)
+double control_calculate_velocity(double action, double scale, double limit, double x_m, double track_limit_m)
 {
     if (!isfinite(action) || !isfinite(scale) || !isfinite(limit) ||
         !isfinite(x_m) || !isfinite(track_limit_m) || scale <= 0 || limit <= 0 || track_limit_m <= 0)
@@ -40,7 +40,7 @@ double control_velocity(double action, double scale, double limit, double x_m, d
     return v;
 }
 
-double control_next_tick(double previous, double now, double period)
+double control_calculate_next_tick(double previous, double now, double period)
 {
     /* 跳过已错过的格点，不补发历史动作。 */
     if (previous > now) return previous;

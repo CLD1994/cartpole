@@ -3,68 +3,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-const char *cartpole_result_name(cartpole_result_t result)
-{
-    switch (result) {
-    case CARTPOLE_OK:
-        return "OK";
-    case CARTPOLE_CANCELLED:
-        return "CANCELLED";
-    case CARTPOLE_TIMEOUT:
-        return "TIMEOUT";
-    case CARTPOLE_TRANSPORT_ERROR:
-        return "TRANSPORT_ERROR";
-    case CARTPOLE_PROTOCOL_ERROR:
-        return "PROTOCOL_ERROR";
-    case CARTPOLE_REJECTED:
-        return "REJECTED";
-    case CARTPOLE_FAULT:
-        return "FAULT";
-    case CARTPOLE_REPLY_MISMATCH:
-        return "REPLY_MISMATCH";
-    case CARTPOLE_INVALID_ARGUMENT:
-        return "INVALID_ARGUMENT";
-    case CARTPOLE_CALLBACK_ERROR:
-        return "CALLBACK_ERROR";
-    case CARTPOLE_MEASUREMENT_UNAVAILABLE:
-        return "MEASUREMENT_UNAVAILABLE";
-    case CARTPOLE_SESSION_UNAVAILABLE:
-        return "SESSION_UNAVAILABLE";
-    case CARTPOLE_CONTROL_DEADLINE:
-        return "CONTROL_DEADLINE";
-    case CARTPOLE_CONFIGURATION_CHANGED:
-        return "CONFIGURATION_CHANGED";
-    }
-    return "UNKNOWN_RESULT";
-}
-
-const char *cartpole_mode_name(cartpole_mode_t mode)
-{
-    switch (mode) {
-    case CARTPOLE_MODE_READY:
-        return "READY";
-    case CARTPOLE_MODE_FAULT:
-        return "FAULT";
-    case CARTPOLE_MODE_DISABLED:
-        return "DISABLED";
-    }
-    return "UNKNOWN";
-}
-const char *cartpole_reason_name(cartpole_reason_t reason)
-{
-    switch (reason) {
-    case CARTPOLE_REASON_NONE:
-        return "NONE";
-    case CARTPOLE_REASON_STEP_LOSS:
-        return "STEP_LOSS";
-    case CARTPOLE_REASON_AS5600:
-        return "AS5600";
-    case CARTPOLE_REASON_MT6835:
-        return "MT6835";
-    }
-    return "UNKNOWN";
-}
-
 static void on_device_event(const cartpole_event_t *event, void *context);
 cartpole_t *cartpole_create(cartpole_device_t device, cartpole_runtime_t *runtime)
 {
@@ -73,7 +11,7 @@ cartpole_t *cartpole_create(cartpole_device_t device, cartpole_runtime_t *runtim
         !runtime->clock.now || !runtime->clock.sleep_until || !o->get_latest_measurement ||
         !o->get_session_state || !o->get_configuration || !o->receive || !o->get_error ||
         !o->report_failure || !o->attach_observer || !o->detach_observer || !o->query_mode ||
-        !o->wait_measurement || !o->enable || !o->reset || !o->refresh_configuration || !o->mark ||
+        !o->wait_for_measurement || !o->enable || !o->reset || !o->refresh_configuration || !o->mark_endpoint ||
         !o->configure || !o->stop_and_confirm || !o->send_velocity)
         return NULL;
     cartpole_t *c = calloc(1, sizeof *c);
@@ -112,17 +50,17 @@ cartpole_configuration_t cartpole_get_configuration(cartpole_t *c)
 {
     return c->device.ops->get_configuration(c->device.context);
 }
-double cartpole_host_monotonic_s(cartpole_t *c) { return cartpole_runtime_now(c->runtime); }
-double cartpole_measurement_age_s(cartpole_t *c, cartpole_measurement_t m)
+double cartpole_get_monotonic_time_s(cartpole_t *c) { return cartpole_runtime_get_monotonic_time_s(c->runtime); }
+double cartpole_calculate_measurement_age_s(cartpole_t *c, cartpole_measurement_t m)
 {
     return m.received_host_monotonic_s < 0
                ? -1.
-               : cartpole_host_monotonic_s(c) - m.received_host_monotonic_s;
+               : cartpole_get_monotonic_time_s(c) - m.received_host_monotonic_s;
 }
 void cartpole_request_stop(cartpole_t *c) { c->runtime->stop_requested = 1; }
-int cartpole_stop_requested(cartpole_t *c) { return cartpole_runtime_is_cancelled(c->runtime); }
-void cartpole_sleep_to(cartpole_t *c, double t) { cartpole_runtime_sleep_until(c->runtime, t); }
-cartpole_result_t cartpole_stream_result(cartpole_t *c)
+int cartpole_is_stop_requested(cartpole_t *c) { return cartpole_runtime_is_cancelled(c->runtime); }
+void cartpole_sleep_until(cartpole_t *c, double t) { cartpole_runtime_sleep_until(c->runtime, t); }
+cartpole_result_t cartpole_get_stream_result(cartpole_t *c)
 {
     return c->device.ops->get_error(c->device.context);
 }
@@ -208,11 +146,11 @@ cartpole_result_t cartpole_query_mode(cartpole_t *c, double timeout)
     cartpole_result_t result = transaction_check(c, timeout);
     return result != CARTPOLE_OK ? result : c->device.ops->query_mode(c->device.context, timeout);
 }
-cartpole_result_t cartpole_wait_measurement(cartpole_t *c, double timeout)
+cartpole_result_t cartpole_wait_for_measurement(cartpole_t *c, double timeout)
 {
     cartpole_result_t result = transaction_check(c, timeout);
     return result != CARTPOLE_OK ? result
-                                 : c->device.ops->wait_measurement(c->device.context, timeout);
+                                 : c->device.ops->wait_for_measurement(c->device.context, timeout);
 }
 cartpole_result_t cartpole_enable(cartpole_t *c, double timeout)
 {
@@ -230,11 +168,11 @@ cartpole_result_t cartpole_refresh_configuration(cartpole_t *c, double timeout)
     return result != CARTPOLE_OK ? result
                                  : c->device.ops->refresh_configuration(c->device.context, timeout);
 }
-cartpole_result_t cartpole_mark(cartpole_t *c, cartpole_endpoint_t endpoint, double timeout)
+cartpole_result_t cartpole_mark_endpoint(cartpole_t *c, cartpole_endpoint_t endpoint, double timeout)
 {
     cartpole_result_t result = transaction_check(c, timeout);
     return result != CARTPOLE_OK ? result
-                                 : c->device.ops->mark(c->device.context, endpoint, timeout);
+                                 : c->device.ops->mark_endpoint(c->device.context, endpoint, timeout);
 }
 cartpole_result_t cartpole_configure(cartpole_t *c, cartpole_setting_t setting, long value,
                                      double timeout)

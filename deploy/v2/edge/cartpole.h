@@ -96,22 +96,19 @@ cartpole_measurement_t cartpole_get_latest_measurement(cartpole_t *);
 cartpole_session_t cartpole_get_session_state(cartpole_t *);
 cartpole_configuration_t cartpole_get_configuration(cartpole_t *);
 /* CLOCK_MONOTONIC接收年龄（秒），不是设备采样年龄；未接收返回负数。 */
-double cartpole_measurement_age_s(cartpole_t *, cartpole_measurement_t);
-const char *cartpole_mode_name(cartpole_mode_t);
-const char *cartpole_reason_name(cartpole_reason_t);
-const char *cartpole_result_name(cartpole_result_t);
+double cartpole_calculate_measurement_age_s(cartpole_t *, cartpole_measurement_t);
 void cartpole_request_stop(cartpole_t *);
-int cartpole_stop_requested(cartpole_t *);
-double cartpole_host_monotonic_s(cartpole_t *);
+int cartpole_is_stop_requested(cartpole_t *);
+double cartpole_get_monotonic_time_s(cartpole_t *);
 /* timeout_s必须有限且>0，覆盖整次事务，不是每个阶段各自计时。
  * TIMEOUT只表示执行未确认，不自动重试。只读事务在FAULT下可用。
- * query_mode/wait_measurement成功只表示收到新报告，不承诺READY/测量有效。
+ * query_mode/wait_for_measurement成功只表示收到新报告，不承诺READY/测量有效。
  * configure值单位按setting：mm/s、mm/s²、ms、µm、µrad或反向布尔0/1。 */
 cartpole_result_t cartpole_query_mode(cartpole_t *, double timeout_s);
-cartpole_result_t cartpole_wait_measurement(cartpole_t *, double timeout_s);
+cartpole_result_t cartpole_wait_for_measurement(cartpole_t *, double timeout_s);
 cartpole_result_t cartpole_enable(cartpole_t *, double timeout_s);
 cartpole_result_t cartpole_reset(cartpole_t *, double timeout_s);
-cartpole_result_t cartpole_mark(cartpole_t *, cartpole_endpoint_t, double timeout_s);
+cartpole_result_t cartpole_mark_endpoint(cartpole_t *, cartpole_endpoint_t, double timeout_s);
 cartpole_result_t cartpole_configure(cartpole_t *, cartpole_setting_t, long value,
                                      double timeout_s);
 cartpole_result_t cartpole_refresh_configuration(cartpole_t *, double timeout_s);
