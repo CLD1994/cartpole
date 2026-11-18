@@ -46,4 +46,7 @@ int console_exec(const console_req_t *req);
 /* 进入交互循环（rig 已打开并同步模式）。始终返回 0。 */
 int console_run(void);
 
+void console_print_state(void);
+int console_goto_center(double timeout_s);
+
 #endif /* EDGE_CONSOLE_H */

@@ -79,10 +79,24 @@ make -C deploy/v2/edge test-integration PYTHON=/path/to/python
 | `main.c` | CLI、预检、控制循环及退出 |
 | `control.c` | 控制门控、速度换算与周期推进 |
 | `package.c` / `prepare_package.py` | 模型包读取与从正式模型目录派生 |
-| `cartpole.c` | 协议会话、回执、状态、参数及停止确认 |
+| `cartpole.c` / `cartpole.h` | 单设备会话、完整命令事务、状态快照、逐帧事件及停止确认 |
+| `console.c` | 维护命令、回中流程和人类可读显示 |
 | `proto.c` / `uart.c` | 严格行解析、串口读写与有限写等待 |
-| `policy.c` / `npu/` | NPU 生命周期与原始动作推理 |
+| `policy.c` / `cpu_policy.c` / `policy_npu.c` | 显式后端选择、FP32 CPU 与 NPU 生命周期及原始动作推理 |
 
 真实板端验收仍需匹配工具链、当前模型 OM、实际 UART 节点、模型数值对照与闭环时序证据。
 
 清单解析使用固定版本 yyjson 静态编入，无板端 JSON 动态库依赖。清单上限 8 KiB，拒绝重复/未知字段、类型错误及不完整包；字段顺序无关。旧自定义文本清单不保留兼容。
+
+## 会话接口的使用边界
+
+`cartpole.h` 是设备会话边界，不是模型或完整控制器。会话仅支持一个串口、一个调用线程；调用方主动推进有界接收，没有后台接收线程。信号处理器只请求停止，实际停车与确认在正常退出路径完成。
+
+- 遥测数值、有效位、模式及接收时刻属于同一快照。读取快照不会访问串口；没有推进接收就没有新数据。无效通道的零占位不能作为真实测量。
+- 时间来自主机单调时钟，表示本进程接收/解析时刻，不是编码器采样时刻；序号也是本会话接收计数，不是设备序号。未知模式不能当作已确认 DISABLED。
+- 逐帧事件用于观察同一批接收里的中间状态，不能用最后一帧覆盖掉无效、FAULT 或模式转换。事件处理不得重入接收或发送命令。
+- 缓存读取与设备查询分开。完整事务负责发送、回执匹配及超时，调用者不自行拼接底层发送和等待。
+- 正常维护发送与控制周期的单次非阻塞发送分开；“完整写入后已过期限”不能等同于“没有发送”。写入成功只证明内核接受，不证明固件已经执行。
+- 关闭串口不等于停机。运动会话先执行有界停止确认，再关闭连接；FAULT 保留故障，不伪装成 DISABLED。控制门控和模型推理仍由 `control.c`、`main.c`、`policy.c` 负责。
+
+典型调用顺序是 `cartpole_open` → `cartpole_sync_mode` / `cartpole_refresh_metadata` → `cartpole_wait_state` → 周期 `cartpole_pump`，然后一次 `cartpole_snapshot()` 复制当前状态供该轮使用。推理后的再次接收必须读取新的快照，不能把推理前的快照当作最新值。`cartpole_cached_value` 仅查询已收到的参数；`cartpole_enable`、`cartpole_reset`、`cartpole_mark`、`cartpole_configure` 各自完成一次请求事务，不需要调用者处理裸协议回执。运动退出使用 `cartpole_stop_and_confirm`，最后 `cartpole_close`。
