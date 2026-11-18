@@ -207,11 +207,12 @@ static int run_policy(int argc, char **argv, int first)
     if (policy_init(backend, model) != 0)
         return 1;
     fprintf(stderr, "[edge] backend=%s\n", backend_name);
-    if (cartpole_sync_mode(1.0) != 0 || cartpole_refresh_metadata(1.0) != 0 ||
-        cartpole_wait_state(1.0) != 0) {
-        fprintf(stderr, "[edge] preflight readback unavailable\n");
+    if (console_transaction_result("preflight QUERY", cartpole_sync_mode(1.0)) != 0)
         return 1;
-    }
+    if (console_transaction_result("preflight metadata", cartpole_refresh_metadata(1.0)) != 0)
+        return 1;
+    if (console_transaction_result("preflight STATE", cartpole_wait_state(1.0)) != 0)
+        return 1;
     int64_t cal, length, saved, storage, velocity, acceleration, wdt, margin;
     if (cartpole_cached_value("CAL_STATE", &cal) != 0 ||
         cartpole_cached_value("CAL_LENGTH_UM", &length) != 0 ||
@@ -246,8 +247,9 @@ static int run_policy(int argc, char **argv, int first)
 
 static int run_console(void)
 {
-    if (cartpole_sync_mode(1.0) != 0) {
-        fprintf(stderr, "[edge] no MODE reply (QUERY timed out) - firmware not running?\n");
+    cartpole_result_t query = cartpole_sync_mode(1.0);
+    if (query != CARTPOLE_OK) {
+        console_transaction_result("QUERY", query);
         return 1;
     }
     fw_mode_t mode = cartpole_snapshot().mode;
@@ -261,8 +263,7 @@ static int run_console(void)
 
 static int oneshot_state(void)
 {
-    if (cartpole_wait_state(1.0) != 0) {
-        fprintf(stderr, "[edge] no STATE stream\n");
+    if (console_transaction_result("STATE", cartpole_wait_state(1.0)) != 0) {
         return 1;
     }
     console_print_state();
@@ -273,8 +274,7 @@ static int oneshot_state(void)
  * 只统计主机采集到的有效快照，不宣称覆盖每个设备样本或验证设备采样频率。 */
 static int oneshot_state_window(double secs)
 {
-    if (cartpole_wait_state(1.0) != 0) {
-        fprintf(stderr, "[edge] no STATE stream\n");
+    if (console_transaction_result("STATE", cartpole_wait_state(1.0)) != 0) {
         return 1;
     }
     long states_before = cartpole_snapshot().state_count,
@@ -325,8 +325,7 @@ static int oneshot_state_window(double secs)
  * 1 s，随后停止发送观察 1 s——固件看门狗应减速停车但模式保持 READY。 */
 static int oneshot_wdt_test(void)
 {
-    if (cartpole_sync_mode(1.0) != 0) {
-        fprintf(stderr, "[edge] no MODE reply (QUERY timed out)\n");
+    if (console_transaction_result("QUERY", cartpole_sync_mode(1.0)) != 0) {
         return 1;
     }
     int known;
@@ -340,8 +339,7 @@ static int oneshot_wdt_test(void)
                 known ? proto_mode_name(mode) : "unknown");
         return 1;
     }
-    if (cartpole_wait_state(CFG_STATE_TIMEOUT_S) != 0) {
-        fprintf(stderr, "[edge] no STATE stream\n");
+    if (console_transaction_result("STATE", cartpole_wait_state(CFG_STATE_TIMEOUT_S)) != 0) {
         return 1;
     }
     g_motion_session = 1;
@@ -358,8 +356,7 @@ static int oneshot_wdt_test(void)
         cartpole_pump();
         nap_ms(20);
     }
-    if (cartpole_sync_mode(1.0) != 0) {
-        fprintf(stderr, "[edge] QUERY timed out after watchdog window\n");
+    if (console_transaction_result("QUERY", cartpole_sync_mode(1.0)) != 0) {
         return 1;
     }
     snapshot = cartpole_snapshot();
@@ -373,8 +370,7 @@ static int oneshot_wdt_test(void)
 
 static int oneshot_vel(double v_mm_s, double hold_s)
 {
-    if (cartpole_sync_mode(1.0) != 0) {
-        fprintf(stderr, "[edge] no MODE reply (QUERY timed out) - firmware not running?\n");
+    if (console_transaction_result("QUERY", cartpole_sync_mode(1.0)) != 0) {
         return 1;
     }
     int known;
@@ -388,8 +384,7 @@ static int oneshot_vel(double v_mm_s, double hold_s)
     }
     /* 保持前先等到 STATE 流就位：从未收到与已过期是不同状态，不能把
      * 起始竞态当成流过期立即中止。 */
-    if (cartpole_wait_state(CFG_STATE_TIMEOUT_S) != 0) {
-        fprintf(stderr, "[edge] no STATE stream\n");
+    if (console_transaction_result("STATE", cartpole_wait_state(CFG_STATE_TIMEOUT_S)) != 0) {
         return 1;
     }
     g_motion_session = 1;

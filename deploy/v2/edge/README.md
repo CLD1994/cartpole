@@ -100,3 +100,5 @@ make -C deploy/v2/edge test-integration PYTHON=/path/to/python
 - 关闭串口不等于停机。运动会话先执行有界停止确认，再关闭连接；FAULT 保留故障，不伪装成 DISABLED。控制门控和模型推理仍由 `control.c`、`main.c`、`policy.c` 负责。
 
 典型调用顺序是 `cartpole_open` → `cartpole_sync_mode` / `cartpole_refresh_metadata` → `cartpole_wait_state` → 周期 `cartpole_pump`，然后一次 `cartpole_snapshot()` 复制当前状态供该轮使用。推理后的再次接收必须读取新的快照，不能把推理前的快照当作最新值。`cartpole_cached_value` 仅查询已收到的参数；`cartpole_enable`、`cartpole_reset`、`cartpole_mark`、`cartpole_configure` 各自完成一次请求事务，不需要调用者处理裸协议回执。运动退出使用 `cartpole_stop_and_confirm`，最后 `cartpole_close`。
+
+完整事务用具名结果区分取消、超时、传输失败、协议异常、固件拒绝、FAULT、回执值不符及非法参数。错误在对应阶段产生并直接传递，上层不根据最后一份状态反推原因。CLI 保留操作名称，不把全部失败写成“超时”。超时只说明未在期限内确认，命令可能已经送达甚至执行；不会因此自动重发使能、标定或配置事务。传输失败也不证明设备没有执行，不应据此盲目重试。

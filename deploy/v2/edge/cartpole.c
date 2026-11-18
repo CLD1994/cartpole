@@ -13,7 +13,9 @@ static uart_t g_uart = {.fd = -1};
 static proto_rx_t g_rx;
 static cartpole_snapshot_t g_snapshot = {.state_received_at_s = -1.};
 static int g_need_frame_boundary;
-static uint64_t g_mode_seq;
+static uint64_t g_mode_seq, g_fault_seq;
+/* 首个流错误在发生处分类并锁存，独立于展示用snapshot。 */
+static cartpole_result_t g_stream_error;
 static char g_wait_name[16];
 static int g_reply_seen, g_reply_err;
 static int64_t g_reply_value;
@@ -59,33 +61,84 @@ int cartpole_stop_requested(void)
 {
     return g_stop != 0;
 }
-static int write_until(const uint8_t *data, size_t n, double end, int cleanup)
+const char *cartpole_result_name(cartpole_result_t result)
 {
-    while ((cleanup || !g_stop) && cartpole_now_s() < end) {
-        int result = uart_try_write_all(&g_uart, data, n);
-        if (result == 0)
-            return cartpole_now_s() < end ? 0 : -1;
-        if (result != 1)
-            return -1;
-        nap_ms(1);
+    switch (result) {
+    case CARTPOLE_OK:
+        return "OK";
+    case CARTPOLE_CANCELLED:
+        return "CANCELLED";
+    case CARTPOLE_TIMEOUT:
+        return "TIMEOUT";
+    case CARTPOLE_TRANSPORT_ERROR:
+        return "TRANSPORT_ERROR";
+    case CARTPOLE_PROTOCOL_ERROR:
+        return "PROTOCOL_ERROR";
+    case CARTPOLE_REJECTED:
+        return "REJECTED";
+    case CARTPOLE_FAULT:
+        return "FAULT";
+    case CARTPOLE_REPLY_MISMATCH:
+        return "REPLY_MISMATCH";
+    case CARTPOLE_INVALID_ARGUMENT:
+        return "INVALID_ARGUMENT";
     }
-    return -1;
+    return "UNKNOWN_RESULT";
 }
-static int send_line(const char *s, size_t n, double end, int cleanup)
+static void stream_failed(cartpole_result_t result)
+{
+    if (g_stream_error == CARTPOLE_OK)
+        g_stream_error = result;
+    g_snapshot.io_error = 1;
+}
+static cartpole_result_t checkpoint(double end, int cleanup)
 {
     if (!cleanup && g_stop)
-        return -1;
+        return CARTPOLE_CANCELLED;
+    if (cartpole_now_s() >= end)
+        return CARTPOLE_TIMEOUT;
+    return CARTPOLE_OK;
+}
+static cartpole_result_t deadline(double timeout, double *end)
+{
+    if (!isfinite(timeout) || timeout <= 0.)
+        return CARTPOLE_INVALID_ARGUMENT;
+    *end = cartpole_now_s() + timeout;
+    if (!isfinite(*end))
+        return CARTPOLE_INVALID_ARGUMENT;
+    return CARTPOLE_OK;
+}
+static cartpole_result_t write_until(const uint8_t *data, size_t n, double end, int cleanup)
+{
+    for (;;) {
+        cartpole_result_t result = checkpoint(end, cleanup);
+        if (result != CARTPOLE_OK)
+            return result;
+        int written = uart_try_write_all(&g_uart, data, n);
+        if (written < 0) {
+            stream_failed(CARTPOLE_TRANSPORT_ERROR);
+            g_need_frame_boundary = 1;
+            return CARTPOLE_TRANSPORT_ERROR;
+        }
+        if (written == 0)
+            return checkpoint(end, cleanup);
+        nap_ms(1);
+    }
+}
+static cartpole_result_t send_line(const char *s, size_t n, double end, int cleanup)
+{
+    if (!s || !n)
+        return CARTPOLE_INVALID_ARGUMENT;
+    cartpole_result_t result = checkpoint(end, cleanup);
+    if (result != CARTPOLE_OK)
+        return result;
     if (g_need_frame_boundary) {
-        if (write_until((const uint8_t *)"\n", 1, end, cleanup) != 0)
-            return -1;
+        result = write_until((const uint8_t *)"\n", 1, end, cleanup);
+        if (result != CARTPOLE_OK)
+            return result;
         g_need_frame_boundary = 0;
     }
-    if (!n || write_until((const uint8_t *)s, n, end, cleanup) != 0) {
-        g_snapshot.io_error = 1;
-        g_need_frame_boundary = 1;
-        return -1;
-    }
-    return 0;
+    return write_until((const uint8_t *)s, n, end, cleanup);
 }
 cartpole_send_result_t cartpole_try_send_vel(double v, double deadline_s)
 {
@@ -103,7 +156,7 @@ cartpole_send_result_t cartpole_try_send_vel(double v, double deadline_s)
         return CARTPOLE_SEND_ERROR;
     int result = uart_try_write_all(&g_uart, (const uint8_t *)line, n);
     if (result < 0) {
-        g_snapshot.io_error = 1;
+        stream_failed(CARTPOLE_TRANSPORT_ERROR);
         g_need_frame_boundary = 1;
         return CARTPOLE_SEND_ERROR;
     }
@@ -120,16 +173,22 @@ static void await_name(const char *name)
 }
 cartpole_send_result_t cartpole_send_vel(double v)
 {
-    char s[64];
-    /* 零速请求允许在未知模式或失效测量后用于停止；非零请求必须有新鲜小车测量。 */
+    char line[64];
+    size_t length = proto_format_vel(line, v);
+    if (!length)
+        return CARTPOLE_SEND_ERROR;
+    /* 零速清理可在错误/取消后执行；非零维护发送失败会锁住后续非零发送。 */
     if (v != 0. && (g_stop || g_snapshot.io_error || !g_snapshot.mode_known ||
                     g_snapshot.mode != FW_READY || g_snapshot.reason != FW_REASON_NONE ||
                     !(g_snapshot.valid_flags & 1) || cartpole_snapshot_age(g_snapshot) < 0 ||
                     cartpole_snapshot_age(g_snapshot) > CFG_STATE_TIMEOUT_S))
-        return -1;
-    return send_line(s, proto_format_vel(s, v), cartpole_now_s() + .020, v == 0.);
+        return CARTPOLE_SEND_ERROR;
+    cartpole_result_t result = send_line(line, length, cartpole_now_s() + .020, v == 0.);
+    if (result != CARTPOLE_OK && v != 0.)
+        stream_failed(result);
+    return result == CARTPOLE_OK ? CARTPOLE_SEND_COMPLETE : CARTPOLE_SEND_ERROR;
 }
-static int send_simple(const char *cmd, double end, int cleanup)
+static cartpole_result_t send_simple(const char *cmd, double end, int cleanup)
 {
     char s[64];
     if (!strcmp(cmd, "MARK LEFT"))
@@ -144,7 +203,7 @@ static int send_simple(const char *cmd, double end, int cleanup)
         await_name("DISABLE");
     return send_line(s, proto_format_simple(s, cmd), end, cleanup);
 }
-static int send_config(const char *name, long value, double end)
+static cartpole_result_t send_config(const char *name, long value, double end)
 {
     char s[64];
     await_name(name);
@@ -156,6 +215,8 @@ int cartpole_open(const char *port, int baud)
         uart_close(&g_uart);
     g_stop = 0;
     g_snapshot.io_error = 0;
+    g_stream_error = CARTPOLE_OK;
+    g_fault_seq = 0;
     g_need_frame_boundary = 0;
     g_snapshot.fault_seen = 0;
     g_snapshot.valid_flags = 0;
@@ -180,6 +241,7 @@ void cartpole_close(void)
     uart_close(&g_uart);
     g_snapshot = (cartpole_snapshot_t){.state_received_at_s = -1.};
     g_value_count = 0;
+    g_stream_error = CARTPOLE_OK;
     g_update_hook = NULL;
     g_update_context = NULL;
 }
@@ -215,7 +277,7 @@ static void handle_line(const char *line, size_t len, void *user)
     if (proto_parse_line(line, &m) == PROTO_UNKNOWN) {
         g_snapshot.unknown_count++;
         if (!strncmp(line, "STATE", 5) || !strncmp(line, "MODE", 4) || !strcmp(line, "!OVERLONG"))
-            g_snapshot.io_error = 2;
+            stream_failed(CARTPOLE_PROTOCOL_ERROR);
         return;
     }
     switch (m.type) {
@@ -236,8 +298,10 @@ static void handle_line(const char *line, size_t len, void *user)
         g_snapshot.reason = m.reason;
         g_snapshot.mode_known = 1;
         g_mode_seq++;
-        if (m.mode == FW_FAULT)
+        if (m.mode == FW_FAULT) {
             g_snapshot.fault_seen = 1;
+            g_fault_seq++;
+        }
         break;
     case PROTO_OK:
     case PROTO_ERR:
@@ -269,7 +333,7 @@ static int pump(int cleanup)
     for (size_t bytes = 0; bytes < 4096;) {
         int n = uart_read(&g_uart, buf, sizeof buf);
         if (n < 0) {
-            g_snapshot.io_error = 1;
+            stream_failed(CARTPOLE_TRANSPORT_ERROR);
             return -1;
         }
         if (n == 0)
@@ -285,124 +349,140 @@ cartpole_pump_result_t cartpole_pump(void)
 {
     return pump(0);
 }
-/* 发送控制面请求前读到空边界，避免用之前积压的回执满足新请求。 */
-static int drain(double deadline)
+/* 在接收错误发生处已有精确分类；事务不根据最后MODE/stop倒推错误。 */
+static cartpole_result_t receive(double end)
 {
-    if (g_stop || cartpole_now_s() >= deadline)
-        return -1;
-    int r;
-    do {
-        r = cartpole_pump();
-        if (r <= 0)
-            return r;
-        if (cartpole_now_s() >= deadline)
-            return -1;
-    } while (!g_stop);
-    return -1;
+    cartpole_result_t result = checkpoint(end, 0);
+    if (result != CARTPOLE_OK)
+        return result;
+    if (pump(0) < 0)
+        return g_stream_error;
+    return checkpoint(end, 0);
 }
-int cartpole_sync_mode(double timeout_s)
+static cartpole_result_t drain(double end)
 {
-    double end = cartpole_now_s() + timeout_s;
-    if (drain(end) != 0)
-        return -1;
+    for (;;) {
+        cartpole_result_t result = checkpoint(end, 0);
+        if (result != CARTPOLE_OK)
+            return result;
+        int pumped = pump(0);
+        if (pumped < 0)
+            return g_stream_error;
+        result = checkpoint(end, 0);
+        if (result != CARTPOLE_OK)
+            return result;
+        if (pumped == 0)
+            return CARTPOLE_OK;
+    }
+}
+/* 仅用于按顺序传播已分类的失败，不执行自动重试。 */
+#define TX_TRY(expression)                                                                         \
+    do {                                                                                           \
+        cartpole_result_t result_ = (expression);                                                  \
+        if (result_ != CARTPOLE_OK)                                                                \
+            return result_;                                                                        \
+    } while (0)
+cartpole_result_t cartpole_sync_mode(double timeout_s)
+{
+    double end;
+    TX_TRY(deadline(timeout_s, &end));
+    TX_TRY(drain(end));
     uint64_t seq = g_mode_seq;
-    if (send_simple("QUERY", end, 0) != 0)
-        return -1;
-    while (!g_stop && cartpole_now_s() < end) {
-        if (cartpole_pump() < 0 || cartpole_now_s() >= end)
-            return -1;
+    TX_TRY(send_simple("QUERY", end, 0));
+    for (;;) {
+        TX_TRY(receive(end));
         if (g_mode_seq != seq)
-            return 0;
+            return CARTPOLE_OK;
         nap_ms(1);
     }
-    return -1;
 }
-int cartpole_wait_state(double timeout_s)
+cartpole_result_t cartpole_wait_state(double timeout_s)
 {
+    double end;
+    TX_TRY(deadline(timeout_s, &end));
     uint64_t seq = g_snapshot.state_sequence;
-    double end = cartpole_now_s() + timeout_s;
-    while (!g_stop && cartpole_now_s() < end) {
-        if (cartpole_pump() < 0 || cartpole_now_s() >= end)
-            return -1;
+    for (;;) {
+        TX_TRY(receive(end));
         if (g_snapshot.state_sequence != seq)
-            return 0;
+            return CARTPOLE_OK;
         nap_ms(1);
     }
-    return -1;
 }
-static int wait_reply(double end)
+static cartpole_result_t wait_reply(double end, uint64_t faults)
 {
-    while (!g_stop && cartpole_now_s() < end) {
-        if (cartpole_pump() < 0 || cartpole_now_s() >= end)
-            return -1;
+    for (;;) {
+        TX_TRY(receive(end));
+        if (g_reply_seen && g_reply_err)
+            return CARTPOLE_REJECTED;
+        if (g_fault_seq != faults)
+            return CARTPOLE_FAULT;
         if (g_reply_seen)
-            return g_reply_err ? 1 : 0;
+            return CARTPOLE_OK;
         nap_ms(1);
     }
-    return -1;
 }
-int cartpole_configure(const char *name, long value, double timeout_s)
+cartpole_result_t cartpole_configure(const char *name, long value, double timeout_s)
 {
-    double end = cartpole_now_s() + timeout_s;
-    if (drain(end) != 0 || send_config(name, value, end) != 0)
-        return -1;
-    if (wait_reply(end) != 0 || g_reply_value != value)
-        return -1;
-    return 0;
+    double end;
+    TX_TRY(deadline(timeout_s, &end));
+    char line[64];
+    if (!name || strlen(name) >= sizeof g_wait_name || !proto_format_config(line, name, value))
+        return CARTPOLE_INVALID_ARGUMENT;
+    TX_TRY(drain(end));
+    uint64_t faults = g_fault_seq;
+    TX_TRY(send_config(name, value, end));
+    TX_TRY(wait_reply(end, faults));
+    return g_reply_value == value ? CARTPOLE_OK : CARTPOLE_REPLY_MISMATCH;
 }
-int cartpole_refresh_metadata(double timeout_s)
+cartpole_result_t cartpole_refresh_metadata(double timeout_s)
 {
     static const char *required[] = {"CAL_STATE", "CAL_LENGTH_UM", "CAL_SAVED", "CAL_STORAGE",
                                      "VEL_MAX",   "ACC_MAX",       "WDT_MS",    "X_MARGIN_UM"};
-    double end = cartpole_now_s() + timeout_s;
-    if (drain(end) != 0)
-        return -1;
+    double end;
+    TX_TRY(deadline(timeout_s, &end));
+    TX_TRY(drain(end));
     g_value_count = 0;
-    if (send_simple("CALIB?", end, 0) != 0 || send_simple("CONFIG?", end, 0) != 0)
-        return -1;
-    while (!g_stop && cartpole_now_s() < end) {
-        if (cartpole_pump() < 0 || cartpole_now_s() >= end)
-            return -1;
+    await_name(""); /* 批量查询没有可精确关联的单个ERR，缺项直到TIMEOUT。 */
+    TX_TRY(send_simple("CALIB?", end, 0));
+    TX_TRY(send_simple("CONFIG?", end, 0));
+    for (;;) {
+        TX_TRY(receive(end));
         size_t i;
         for (i = 0; i < sizeof required / sizeof required[0]; i++)
             if (cartpole_cached_value(required[i], NULL) != 0)
                 break;
         if (i == sizeof required / sizeof required[0])
-            return 0;
+            return CARTPOLE_OK;
         nap_ms(1);
     }
-    return -1;
 }
-static int wait_mode(fw_mode_t target, uint64_t seq, double end)
+static cartpole_result_t mode_transaction(const char *command, fw_mode_t target, double timeout_s)
 {
-    while (!g_stop && cartpole_now_s() < end) {
-        if (cartpole_pump() < 0 || cartpole_now_s() >= end)
-            return -1;
+    double end;
+    TX_TRY(deadline(timeout_s, &end));
+    TX_TRY(drain(end));
+    uint64_t seq = g_mode_seq, faults = g_fault_seq;
+    TX_TRY(send_simple(command, end, 0));
+    for (;;) {
+        TX_TRY(receive(end));
         if (g_reply_seen && g_reply_err)
-            return -1;
-        if (g_mode_seq != seq) {
-            if (g_snapshot.mode == target && g_snapshot.reason == FW_REASON_NONE)
-                return 0;
-            if (g_snapshot.mode == FW_FAULT)
-                return -1;
-        }
+            return CARTPOLE_REJECTED;
+        if (g_fault_seq != faults)
+            return CARTPOLE_FAULT;
+        if (g_mode_seq != seq && g_snapshot.mode == target && g_snapshot.reason == FW_REASON_NONE)
+            return CARTPOLE_OK;
         nap_ms(1);
     }
-    return -1;
 }
-int cartpole_enable(double timeout_s)
+cartpole_result_t cartpole_enable(double timeout_s)
 {
-    double end = cartpole_now_s() + timeout_s;
-    if (drain(end) != 0)
-        return -1;
-    uint64_t seq = g_mode_seq;
-    if (cartpole_now_s() >= end || send_simple("ENABLE", end, 0) != 0)
-        return -1;
-    return wait_mode(FW_READY, seq, end);
+    return mode_transaction("ENABLE", FW_READY, timeout_s);
 }
 cartpole_stop_result_t cartpole_stop_and_confirm(double timeout_s)
 {
-    double end = cartpole_now_s() + timeout_s;
+    double end;
+    if (deadline(timeout_s, &end) != CARTPOLE_OK)
+        return CARTPOLE_STOP_UNCONFIRMED;
     /* 清理读边界不受停止标记或此前协议错误锁存阻挡。旧MODE不能证明本次停止。 */
     int drained;
     do {
@@ -439,23 +519,18 @@ cartpole_stop_result_t cartpole_stop_and_confirm(double timeout_s)
     return CARTPOLE_STOP_UNCONFIRMED;
 }
 
-int cartpole_reset(double timeout_s)
+cartpole_result_t cartpole_reset(double timeout_s)
 {
-    double end = cartpole_now_s() + timeout_s;
-    if (drain(end) != 0)
-        return -1;
-    uint64_t seq = g_mode_seq;
-    if (cartpole_now_s() >= end || send_simple("RESET", end, 0) != 0)
-        return -1;
-    return wait_mode(FW_DISABLED, seq, end);
+    return mode_transaction("RESET", FW_DISABLED, timeout_s);
 }
-int cartpole_mark(cartpole_endpoint_t endpoint, double timeout_s)
+cartpole_result_t cartpole_mark(cartpole_endpoint_t endpoint, double timeout_s)
 {
-    double end = cartpole_now_s() + timeout_s;
+    double end;
+    TX_TRY(deadline(timeout_s, &end));
     if (endpoint != CARTPOLE_LEFT && endpoint != CARTPOLE_RIGHT)
-        return -1;
-    if (drain(end) != 0 || cartpole_now_s() >= end ||
-        send_simple(endpoint == CARTPOLE_LEFT ? "MARK LEFT" : "MARK RIGHT", end, 0) != 0)
-        return -1;
-    return wait_reply(end) == 0 ? 0 : -1;
+        return CARTPOLE_INVALID_ARGUMENT;
+    TX_TRY(drain(end));
+    uint64_t faults = g_fault_seq;
+    TX_TRY(send_simple(endpoint == CARTPOLE_LEFT ? "MARK LEFT" : "MARK RIGHT", end, 0));
+    return wait_reply(end, faults);
 }

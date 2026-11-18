@@ -24,13 +24,14 @@ if __name__ == "__main__":
 
 
 class Firmware:
-    def __init__(self, flags=3, stream=True, mode="READY", velocity=900, acknowledge_stop=True):
+    def __init__(self, flags=3, stream=True, mode="READY", velocity=900, acknowledge_stop=True, acknowledge_enable=True):
         self.master, self.slave = pty.openpty()
         tty.setraw(self.slave)
         os.set_blocking(self.master, False)
         self.path = os.ttyname(self.slave)
         self.flags, self.stream, self.mode = flags, stream, mode
         self.velocity, self.acknowledge_stop = velocity, acknowledge_stop
+        self.acknowledge_enable = acknowledge_enable
         self.commands = []
         self.end = threading.Event()
         self.driving = threading.Event()
@@ -73,8 +74,9 @@ class Firmware:
                         command = raw.decode().strip()
                         self.commands.append(command)
                         if command == "ENABLE":
-                            self.mode = "READY"
-                            self.send("MODE READY NONE")
+                            if self.acknowledge_enable:
+                                self.mode = "READY"
+                                self.send("MODE READY NONE")
                         elif command == "QUERY":
                             self.send(f"MODE {self.mode} NONE")
                         elif command == "DISABLE":
@@ -196,6 +198,42 @@ class CommandTests(unittest.TestCase):
             result = fw.run("enable")
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("ENABLE", fw.commands)
+
+    def test_query_protocol_error_is_not_reported_as_timeout(self):
+        with Firmware(mode="INVALID_MODE") as fw:
+            result = fw.run("query")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("QUERY: PROTOCOL_ERROR", result.stderr)
+            self.assertNotIn("timed out", result.stderr.lower())
+            self.assertNotIn("TIMEOUT", result.stderr)
+
+    def test_enable_cancelled_while_waiting_reports_cancellation(self):
+        with Firmware(mode="DISABLED", acknowledge_enable=False) as fw:
+            process = subprocess.Popen([BINARY, "--port", fw.path, "enable"],
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                deadline = time.monotonic() + 1
+                while "ENABLE" not in fw.commands and time.monotonic() < deadline:
+                    time.sleep(.002)
+                self.assertIn("ENABLE", fw.commands)
+                process.send_signal(signal.SIGINT)
+                stdout, stderr = process.communicate(timeout=3)
+                self.assertNotEqual(process.returncode, 0, stdout + stderr)
+                self.assertIn("ENABLE: CANCELLED", stderr)
+                self.assertNotIn("TIMEOUT", stderr)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate()
+
+    def test_timeout_reports_unconfirmed_and_no_automatic_retry(self):
+        with Firmware(mode="DISABLED", acknowledge_enable=False) as fw:
+            result = fw.run("enable")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("ENABLE: TIMEOUT", result.stderr)
+            self.assertIn("execution unconfirmed", result.stderr)
+            self.assertIn("do not automatically retry", result.stderr)
+            self.assertEqual(fw.commands.count("ENABLE"), 1)
 
     def test_state_duration_accepts_argument_and_observes_lines(self):
         with Firmware() as fw:

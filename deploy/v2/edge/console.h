@@ -8,6 +8,7 @@
  */
 #ifndef EDGE_CONSOLE_H
 #define EDGE_CONSOLE_H
+#include "cartpole.h"
 
 typedef enum {
     CONSOLE_CMD_NONE = 0, /* 空行 */
@@ -46,6 +47,7 @@ int console_exec(const console_req_t *req);
 /* 进入交互循环（rig 已打开并同步模式）。始终返回 0。 */
 int console_run(void);
 
+int console_transaction_result(const char *operation, cartpole_result_t result);
 void console_print_state(void);
 int console_goto_center(double timeout_s);
 

@@ -178,11 +178,19 @@ static int wait_enter(void)
     return c == EOF ? -1 : 0;
 }
 
-/* 模式未知时先 QUERY 同步（一次性命令是新进程、控制台首条命令同理）。
- * 返回 0 表示模式已知，-1 表示 QUERY 超时。 */
+/* 统一结果提示，不将拒绝、取消或故障统称为超时。 */
+int console_transaction_result(const char *operation, cartpole_result_t result)
+{
+    if (result == CARTPOLE_OK)
+        return 0;
+    fprintf(stderr, "[edge] %s: %s%s\n", operation, cartpole_result_name(result),
+            result == CARTPOLE_TIMEOUT ? " (execution unconfirmed; do not automatically retry)"
+                                       : "");
+    return -1;
+}
 static int ensure_mode_known(void)
 {
-    return cartpole_sync_mode(1.0) == 0 ? 0 : -1;
+    return console_transaction_result("QUERY", cartpole_sync_mode(1.0));
 }
 
 int console_exec(const console_req_t *req)
@@ -204,8 +212,7 @@ int console_exec(const console_req_t *req)
         if (wait_enter() != 0) {
             return -1;
         }
-        if (cartpole_mark(CARTPOLE_LEFT, 1.0) != 0) {
-            fprintf(stderr, "[edge] MARK LEFT rejected/failed\n");
+        if (console_transaction_result("MARK", cartpole_mark(CARTPOLE_LEFT, 1.0)) != 0) {
             return -1;
         }
         printf("[edge] push cart to RIGHT end, then press Enter...");
@@ -213,23 +220,21 @@ int console_exec(const console_req_t *req)
         if (wait_enter() != 0) {
             return -1;
         }
-        if (cartpole_mark(CARTPOLE_RIGHT, 1.0) != 0) {
-            fprintf(stderr, "[edge] MARK RIGHT rejected (L invalid? no left mark?)\n");
+        if (console_transaction_result("MARK", cartpole_mark(CARTPOLE_RIGHT, 1.0)) != 0) {
             return -1;
         }
-        if (cartpole_enable(2.0) != 0) {
-            fprintf(stderr, "[edge] ENABLE failed (see MODE events)\n");
+        if (console_transaction_result("ENABLE", cartpole_enable(2.0)) != 0) {
             return -1;
         }
         printf("[edge] calibrated & READY; use 'center' to move to mid-track\n");
         return 0;
     }
     case CONSOLE_CMD_MARK_LEFT:
-        return cartpole_mark(CARTPOLE_LEFT, 1.0);
+        return console_transaction_result("MARK", cartpole_mark(CARTPOLE_LEFT, 1.0));
     case CONSOLE_CMD_MARK_RIGHT:
-        return cartpole_mark(CARTPOLE_RIGHT, 1.0);
+        return console_transaction_result("MARK", cartpole_mark(CARTPOLE_RIGHT, 1.0));
     case CONSOLE_CMD_ENABLE:
-        return cartpole_enable(2.0);
+        return console_transaction_result("ENABLE", cartpole_enable(2.0));
     case CONSOLE_CMD_CENTER:
         if (console_goto_center(15.0) != 0) {
             fprintf(stderr, "[edge] move-to-center failed\n");
@@ -240,8 +245,7 @@ int console_exec(const console_req_t *req)
         console_print_state();
         return 0;
     case CONSOLE_CMD_QUERY: {
-        if (cartpole_sync_mode(1.0) != 0) {
-            fprintf(stderr, "[edge] no MODE reply (QUERY timed out)\n");
+        if (console_transaction_result("QUERY", cartpole_sync_mode(1.0)) != 0) {
             return -1;
         }
         fw_reason_t reason = cartpole_snapshot().reason;
@@ -251,14 +255,12 @@ int console_exec(const console_req_t *req)
     }
     case CONSOLE_CMD_CONFIG:
         if (req->dump) {
-            return cartpole_refresh_metadata(DUMP_WINDOW_S);
+            return console_transaction_result("metadata", cartpole_refresh_metadata(DUMP_WINDOW_S));
         }
-        return cartpole_configure(req->name, req->value, 1.0);
+        return console_transaction_result("CONFIG", cartpole_configure(req->name, req->value, 1.0));
     case CONSOLE_CMD_RESET: {
-        if (ensure_mode_known() != 0) {
-            fprintf(stderr, "[edge] no MODE reply (QUERY timed out)\n");
+        if (ensure_mode_known() != 0)
             return -1;
-        }
         int known;
         cartpole_snapshot_t snapshot = cartpole_snapshot();
         known = snapshot.mode_known;
@@ -271,7 +273,7 @@ int console_exec(const console_req_t *req)
             fprintf(stderr, "[edge] RESET only clears FAULT (current %s)\n", proto_mode_name(m));
             return -1;
         }
-        if (cartpole_reset(2.0) != 0)
+        if (console_transaction_result("RESET", cartpole_reset(2.0)) != 0)
             return -1;
         return 0;
     }
@@ -317,8 +319,7 @@ static int handle_line(const char *line, int *holding, double *held_vel)
     case CONSOLE_CMD_VEL:
         /* 保持前先等 STATE 流就位、模式已知（与一次性 vel 子命令同语义）：
          * tick_hold 对未知模式会立即释放保持，首条命令必须先 QUERY 同步 */
-        if (cartpole_wait_state(CFG_STATE_TIMEOUT_S) != 0) {
-            printf("[edge] WARNING: no STATE stream, ignoring vel\n");
+        if (console_transaction_result("STATE", cartpole_wait_state(CFG_STATE_TIMEOUT_S)) != 0) {
             return 0;
         }
         if (ensure_mode_known() != 0) {
@@ -441,7 +442,8 @@ out:
 int console_goto_center(double timeout_s)
 {
     double end = cartpole_now_s() + timeout_s;
-    if (cartpole_sync_mode(fmax(0., end - cartpole_now_s())) != 0)
+    if (console_transaction_result("QUERY", cartpole_sync_mode(fmax(0., end - cartpole_now_s()))) !=
+        0)
         return -1;
     while (!cartpole_stop_requested() && cartpole_now_s() < end) {
         int p = cartpole_pump();

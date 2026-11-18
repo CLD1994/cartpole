@@ -1,6 +1,7 @@
 #include "cartpole.h"
 #include "uart.h"
 #include <assert.h>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -12,6 +13,7 @@ static const char *query_reply, *enable_reply, *disable_reply, *config_reply, *m
 static int zero_state = 1;
 static int config_queries, calib_queries;
 static int try_result, try_calls, framing_newlines, cancel_once, enable_writes;
+static int cancel_transport, metadata_missing;
 static double clock_s = 1., write_delay, read_delay;
 int clock_gettime(clockid_t id, struct timespec *t)
 {
@@ -27,6 +29,10 @@ int uart_try_write_all(uart_t *u, const uint8_t *data, size_t n)
     (void)data;
     (void)n;
     try_calls++;
+    if (cancel_transport) {
+        cartpole_request_stop();
+        return -1;
+    }
     if (cancel_once) {
         cancel_once = 0;
         cartpole_request_stop();
@@ -102,7 +108,9 @@ int uart_write_all(uart_t *u, const uint8_t *d, size_t n)
         queue(config_reply);
     if (!strcmp(cmd, "CONFIG?\n")) {
         config_queries++;
-        queue("OK VEL_MAX 900\nOK ACC_MAX 10000\nOK WDT_MS 100\nOK X_MARGIN_UM 10000\n");
+        queue(metadata_missing
+                  ? "ERR VEL_MAX\n"
+                  : "OK VEL_MAX 900\nOK ACC_MAX 10000\nOK WDT_MS 100\nOK X_MARGIN_UM 10000\n");
     }
     if (!strcmp(cmd, "CALIB?\n")) {
         calib_queries++;
@@ -139,7 +147,7 @@ int main(void)
 {
     open_ready();
     query_reply = "MODE FAULT MT6835\n";
-    assert(cartpole_sync_mode(.02) == 0);
+    assert(cartpole_sync_mode(.02) == CARTPOLE_OK);
     assert(cartpole_snapshot().mode == FW_FAULT);
     cartpole_request_stop();
     cartpole_close();
@@ -157,20 +165,20 @@ int main(void)
     enable_reply = "MODE READY NONE\n";
     write_delay = .01;
     double started = cartpole_now_s();
-    assert(cartpole_enable(.003) == -1);
+    assert(cartpole_enable(.003) == CARTPOLE_TIMEOUT);
     assert(cartpole_now_s() - started < .014);
     write_delay = 0;
     /* 每次QUERY必须等新响应。 */
     open_ready();
     query_reply = NULL;
-    assert(cartpole_sync_mode(.003) == -1);
+    assert(cartpole_sync_mode(.003) == CARTPOLE_TIMEOUT);
     /* ENABLE按新MODE而非OK确认，不能复用已有READY。 */
     open_ready();
-    assert(cartpole_enable(.003) == -1);
+    assert(cartpole_enable(.003) == CARTPOLE_TIMEOUT);
     enable_reply = "MODE READY NONE\n";
     assert(cartpole_enable(.02) == 0);
     enable_reply = "ERR ENABLE\nMODE READY NONE\n";
-    assert(cartpole_enable(.02) == -1);
+    assert(cartpole_enable(.02) == CARTPOLE_REJECTED);
     /* 无效小车不能变成零值有效测量。 */
     queue("STATE 2 0 20 0 2\n");
     assert(cartpole_pump() == 0);
@@ -180,13 +188,13 @@ int main(void)
     /* 不匹配回执不能满足配置，回显不同不能报成功。 */
     open_ready();
     config_reply = "OK ACC_MAX 5000\n";
-    assert(cartpole_configure("VEL_MAX", 900, .003) == -1);
+    assert(cartpole_configure("VEL_MAX", 900, .003) == CARTPOLE_TIMEOUT);
     config_reply = "OK VEL_MAX 800\n";
-    assert(cartpole_configure("VEL_MAX", 900, .02) == -1);
+    assert(cartpole_configure("VEL_MAX", 900, .02) == CARTPOLE_REPLY_MISMATCH);
     config_reply = "ERR VEL_MAX\n";
-    assert(cartpole_configure("VEL_MAX", 900, .02) == -1);
+    assert(cartpole_configure("VEL_MAX", 900, .02) == CARTPOLE_REJECTED);
     config_reply = "ERR VEL_MAX\nOK VEL_MAX 900\n";
-    assert(cartpole_configure("VEL_MAX", 900, .02) == -1);
+    assert(cartpole_configure("VEL_MAX", 900, .02) == CARTPOLE_REJECTED);
     config_reply = "OK ACC_MAX 5000\nOK VEL_MAX 900\n";
     assert(cartpole_configure("VEL_MAX", 900, .02) == 0);
     /* 一次刷新采集全部元数据，读缓存不再发查询。 */
@@ -280,24 +288,65 @@ int main(void)
     assert(cartpole_cached_value("VEL_MAX", &v) == -1);
     open_ready();
     queue("OK MARK_LEFT -42\n");
-    assert(cartpole_mark(CARTPOLE_LEFT, .003) == -1); /* stale response discarded */
+    assert(cartpole_mark(CARTPOLE_LEFT, .003) == CARTPOLE_TIMEOUT); /* stale response discarded */
     mark_reply = "OK MARK_RIGHT 84\n";
-    assert(cartpole_mark(CARTPOLE_LEFT, .003) == -1); /* request correlation */
+    assert(cartpole_mark(CARTPOLE_LEFT, .003) == CARTPOLE_TIMEOUT); /* request correlation */
     mark_reply = "OK MARK_LEFT -42\n";
     assert(cartpole_mark(CARTPOLE_LEFT, .02) == 0);
-    assert(cartpole_mark((cartpole_endpoint_t)99, .02) == -1);
+    assert(cartpole_mark((cartpole_endpoint_t)99, .02) == CARTPOLE_INVALID_ARGUMENT);
     reset_reply = "MODE DISABLED NONE\n";
     assert(cartpole_reset(.02) == 0);
     assert(cartpole_snapshot().mode == FW_DISABLED);
     reset_reply = "ERR RESET\nMODE DISABLED NONE\n";
-    assert(cartpole_reset(.02) == -1);
+    assert(cartpole_reset(.02) == CARTPOLE_REJECTED);
     open_ready();
     int before_enable = enable_writes;
     cancel_once = 1;
-    assert(cartpole_enable(.02) == -1);
+    assert(cartpole_enable(.02) == CARTPOLE_CANCELLED);
     assert(enable_writes == before_enable);
     query_reply = "MODE DISABLED NONE\n";
     assert(cartpole_stop_and_confirm(.02) == CARTPOLE_STOP_DISABLED);
+    open_ready();
+    assert(cartpole_configure(NULL, 900, .02) == CARTPOLE_INVALID_ARGUMENT);
+    assert(cartpole_configure("BAD\nNAME", 900, .02) == CARTPOLE_INVALID_ARGUMENT);
+    assert(!cartpole_snapshot().io_error);
+    assert(cartpole_sync_mode(0) == CARTPOLE_INVALID_ARGUMENT);
+    assert(cartpole_wait_state(-1) == CARTPOLE_INVALID_ARGUMENT);
+    broken = 1;
+    assert(cartpole_sync_mode(.02) == CARTPOLE_TRANSPORT_ERROR);
+    open_ready();
+    queue("STATE invalid\n");
+    assert(cartpole_wait_state(.02) == CARTPOLE_PROTOCOL_ERROR);
+    open_ready();
+    enable_reply = "MODE FAULT MT6835\nMODE READY NONE\n";
+    assert(cartpole_enable(.02) == CARTPOLE_FAULT);
+    open_ready();
+    assert(cartpole_enable(NAN) == CARTPOLE_INVALID_ARGUMENT);
+    assert(cartpole_reset(INFINITY) == CARTPOLE_INVALID_ARGUMENT);
+    assert(cartpole_refresh_metadata(-.1) == CARTPOLE_INVALID_ARGUMENT);
+    metadata_missing = 1;
+    assert(cartpole_refresh_metadata(.003) == CARTPOLE_TIMEOUT);
+    metadata_missing = 0;
+    cancel_transport = 1;
+    assert(cartpole_enable(.02) == CARTPOLE_TRANSPORT_ERROR);
+    cancel_transport = 0;
+    open_ready();
+    query_reply = "MODE FAULT MT6835\n";
+    assert(cartpole_sync_mode(.02) == CARTPOLE_OK);
+    assert(cartpole_refresh_metadata(.02) == CARTPOLE_OK);
+    reset_reply = "MODE DISABLED NONE\n";
+    assert(cartpole_reset(.02) == CARTPOLE_OK); /* historicalFAULT isn't newFAULT */
+    open_ready();
+    assert(cartpole_send_vel(NAN) == CARTPOLE_SEND_ERROR && !cartpole_snapshot().io_error);
+    try_result = 1;
+    assert(cartpole_send_vel(10) == CARTPOLE_SEND_ERROR);
+    assert(cartpole_snapshot().io_error);
+    try_result = 0;
+    int before_retry = try_calls;
+    assert(cartpole_send_vel(10) == CARTPOLE_SEND_ERROR && try_calls == before_retry);
+    assert(cartpole_send_vel(0) == CARTPOLE_SEND_COMPLETE);
+    assert(cartpole_sync_mode(.02) ==
+           CARTPOLE_TIMEOUT); /* original timeout, not invented IO error */
     puts("edge session passed");
     return 0;
 }
