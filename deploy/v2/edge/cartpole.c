@@ -1,7 +1,9 @@
 /* 串口会话：明确区分有效测量、模式、请求回执及传输错误。 */
-#include "cartpole.h"
+#include "cartpole_internal.h"
 #include "config.h"
+#include "control.h"
 #include "uart.h"
+#include <errno.h>
 #include <math.h>
 #include <signal.h>
 #include <stdio.h>
@@ -25,18 +27,21 @@ struct cached_value {
 };
 static struct cached_value g_values[24];
 static size_t g_value_count;
-static cartpole_observer_t g_update_hook;
+static void (*g_update_hook)(proto_msg_type_t, const cartpole_snapshot_t *, void *);
+static cartpole_event_handler_t g_event_handler;
+static void *g_event_context;
+static int g_callback_depth, g_callback_violation, g_loop_active;
+static int g_session_event_pending;
+static void flush_session_event(void);
 static void *g_update_context;
 
-void cartpole_set_observer(cartpole_observer_t hook, void *context)
+void cartpole_set_update_hook(void (*hook)(proto_msg_type_t, const cartpole_snapshot_t *, void *),
+                              void *context)
 {
     g_update_hook = hook;
     g_update_context = context;
 }
-cartpole_snapshot_t cartpole_snapshot(void)
-{
-    return g_snapshot;
-}
+cartpole_snapshot_t cartpole_snapshot(void) { return g_snapshot; }
 double cartpole_state_age_s(cartpole_snapshot_t s)
 {
     return s.last_state_received_host_monotonic_s < 0
@@ -55,14 +60,8 @@ double cartpole_host_monotonic_s(void)
     clock_gettime(CLOCK_MONOTONIC, &t);
     return t.tv_sec + t.tv_nsec * 1e-9;
 }
-void cartpole_request_stop(void)
-{
-    g_stop = 1;
-}
-int cartpole_stop_requested(void)
-{
-    return g_stop != 0;
-}
+void cartpole_request_stop(void) { g_stop = 1; }
+int cartpole_stop_requested(void) { return g_stop != 0; }
 const char *cartpole_result_name(cartpole_result_t result)
 {
     switch (result) {
@@ -84,6 +83,16 @@ const char *cartpole_result_name(cartpole_result_t result)
         return "REPLY_MISMATCH";
     case CARTPOLE_INVALID_ARGUMENT:
         return "INVALID_ARGUMENT";
+    case CARTPOLE_CALLBACK_ERROR:
+        return "CALLBACK_ERROR";
+    case CARTPOLE_MEASUREMENT_UNAVAILABLE:
+        return "MEASUREMENT_UNAVAILABLE";
+    case CARTPOLE_SESSION_UNAVAILABLE:
+        return "SESSION_UNAVAILABLE";
+    case CARTPOLE_CONTROL_DEADLINE:
+        return "CONTROL_DEADLINE";
+    case CARTPOLE_CONFIGURATION_CHANGED:
+        return "CONFIGURATION_CHANGED";
     }
     return "UNKNOWN_RESULT";
 }
@@ -91,7 +100,11 @@ static void stream_failed(cartpole_result_t result)
 {
     if (g_stream_error == CARTPOLE_OK)
         g_stream_error = result;
+    if (!g_snapshot.has_stream_failure_latch)
+        g_session_event_pending = 1;
     g_snapshot.has_stream_failure_latch = 1;
+    if (!g_callback_depth)
+        flush_session_event();
 }
 static cartpole_result_t checkpoint(double end, int cleanup)
 {
@@ -103,6 +116,10 @@ static cartpole_result_t checkpoint(double end, int cleanup)
 }
 static cartpole_result_t deadline(double timeout, double *end)
 {
+    if (g_callback_depth) {
+        g_callback_violation = 1;
+        return CARTPOLE_CALLBACK_ERROR;
+    }
     if (!isfinite(timeout) || timeout <= 0.)
         return CARTPOLE_INVALID_ARGUMENT;
     *end = cartpole_host_monotonic_s() + timeout;
@@ -164,7 +181,8 @@ cartpole_send_result_t cartpole_try_send_vel(double v, double deadline_host_mono
         return CARTPOLE_SEND_ERROR;
     }
     if (result == 0 && cartpole_host_monotonic_s() >= deadline_host_monotonic_s)
-        return CARTPOLE_SEND_LATE; /* 已完整写入，不能撤销；调用方终止控制并执行停止流程。 */
+        return CARTPOLE_SEND_LATE; /* 已完整写入，不能撤销；调用方终止控制并执行停止流程。
+                                    */
     return result == 0 ? CARTPOLE_SEND_COMPLETE : CARTPOLE_SEND_SKIPPED;
 }
 static void await_name(const char *name)
@@ -174,7 +192,7 @@ static void await_name(const char *name)
     g_reply_err = 0;
     g_reply_value = 0;
 }
-cartpole_send_result_t cartpole_send_vel(double v)
+cartpole_send_result_t cartpole_send_vel_until(double v, double end)
 {
     char line[64];
     size_t length = proto_format_vel(line, v);
@@ -188,10 +206,15 @@ cartpole_send_result_t cartpole_send_vel(double v)
                     cartpole_state_age_s(g_snapshot) < 0 ||
                     cartpole_state_age_s(g_snapshot) > CFG_STATE_TIMEOUT_S))
         return CARTPOLE_SEND_ERROR;
-    cartpole_result_t result = send_line(line, length, cartpole_host_monotonic_s() + .020, v == 0.);
+    cartpole_result_t result =
+        send_line(line, length, fmin(end, cartpole_host_monotonic_s() + .020), v == 0.);
     if (result != CARTPOLE_OK && v != 0.)
         stream_failed(result);
     return result == CARTPOLE_OK ? CARTPOLE_SEND_COMPLETE : CARTPOLE_SEND_ERROR;
+}
+cartpole_send_result_t cartpole_send_vel(double v)
+{
+    return cartpole_send_vel_until(v, cartpole_host_monotonic_s() + .020);
 }
 static cartpole_result_t send_simple(const char *cmd, double end, int cleanup)
 {
@@ -216,6 +239,10 @@ static cartpole_result_t send_config(const char *name, long value, double end)
 }
 int cartpole_open(const char *port, int baud)
 {
+    if (g_callback_depth) {
+        g_callback_violation = 1;
+        return -1;
+    }
     if (g_uart.fd >= 0)
         uart_close(&g_uart);
     g_stop = 0;
@@ -235,6 +262,11 @@ int cartpole_open(const char *port, int baud)
     g_value_count = 0;
     g_update_hook = NULL;
     g_update_context = NULL;
+    g_event_handler = NULL;
+    g_event_context = NULL;
+    g_callback_violation = 0;
+    g_loop_active = 0;
+    g_session_event_pending = 0;
     await_name("");
     proto_rx_init(&g_rx);
     int result = uart_open(&g_uart, port, baud);
@@ -243,12 +275,21 @@ int cartpole_open(const char *port, int baud)
 }
 void cartpole_close(void)
 {
+    if (g_callback_depth) {
+        g_callback_violation = 1;
+        return;
+    }
     uart_close(&g_uart);
     g_snapshot = (cartpole_snapshot_t){.last_state_received_host_monotonic_s = -1.};
     g_value_count = 0;
     g_stream_error = CARTPOLE_OK;
     g_update_hook = NULL;
     g_update_context = NULL;
+    g_event_handler = NULL;
+    g_event_context = NULL;
+    g_callback_violation = 0;
+    g_loop_active = 0;
+    g_session_event_pending = 0;
 }
 static void cache_value(const char *name, int64_t value)
 {
@@ -276,6 +317,7 @@ int cartpole_cached_value(const char *name, int64_t *value)
         }
     return -1;
 }
+static void dispatch_business_event(const proto_msg_t *message);
 static void handle_line(const char *line, size_t len, void *user)
 {
     (void)len;
@@ -298,9 +340,6 @@ static void handle_line(const char *line, size_t len, void *user)
         g_snapshot.received_state_count++;
         break;
     case PROTO_MODE:
-        if (!g_snapshot.is_mode_received || g_snapshot.reported_mode != m.mode ||
-            g_snapshot.reported_mode_reason != m.reason)
-            printf("[edge] MODE %s %s\n", proto_mode_name(m.mode), proto_reason_name(m.reason));
         g_snapshot.reported_mode = m.mode;
         g_snapshot.reported_mode_reason = m.reason;
         g_snapshot.is_mode_received = 1;
@@ -319,23 +358,19 @@ static void handle_line(const char *line, size_t len, void *user)
             g_reply_err = m.type == PROTO_ERR;
             g_reply_value = m.value;
         }
-        if (m.type == PROTO_OK)
-            printf("[edge] OK %s %lld\n", m.param, (long long)m.value);
-        else
-            printf("[edge] ERR %s\n", m.param);
         break;
     case PROTO_STEP_LOSS:
-        printf("[edge] STEP_LOSS event=%lld run=%lld device_us=%lld (record only)\n",
-               (long long)m.event_id, (long long)m.run_id, (long long)m.device_us);
         break;
     default:
         break;
     }
     if (g_update_hook && (m.type == PROTO_STATE || m.type == PROTO_MODE || m.type == PROTO_OK))
         g_update_hook(m.type, &g_snapshot, g_update_context);
+    dispatch_business_event(&m);
 }
 static int pump(int cleanup)
 {
+    flush_session_event();
     uint8_t buf[512];
     for (size_t bytes = 0; bytes < 4096;) {
         int n = uart_read(&g_uart, buf, sizeof buf);
@@ -352,10 +387,7 @@ static int pump(int cleanup)
     }
     return 1;
 }
-cartpole_pump_result_t cartpole_pump(void)
-{
-    return pump(0);
-}
+cartpole_pump_result_t cartpole_pump(void) { return pump(0); }
 /* 在接收错误发生处已有精确分类；事务不根据最后MODE/stop倒推错误。 */
 static cartpole_result_t receive(double end)
 {
@@ -389,7 +421,7 @@ static cartpole_result_t drain(double end)
         if (result_ != CARTPOLE_OK)                                                                \
             return result_;                                                                        \
     } while (0)
-cartpole_result_t cartpole_sync_mode(double timeout_s)
+cartpole_result_t cartpole_query_mode(double timeout_s)
 {
     double end;
     TX_TRY(deadline(timeout_s, &end));
@@ -403,7 +435,7 @@ cartpole_result_t cartpole_sync_mode(double timeout_s)
         nap_ms(1);
     }
 }
-cartpole_result_t cartpole_wait_state(double timeout_s)
+cartpole_result_t cartpole_wait_measurement(double timeout_s)
 {
     double end;
     TX_TRY(deadline(timeout_s, &end));
@@ -428,10 +460,11 @@ static cartpole_result_t wait_reply(double end, uint64_t faults)
         nap_ms(1);
     }
 }
-cartpole_result_t cartpole_configure(const char *name, long value, double timeout_s)
+cartpole_result_t cartpole_configure(cartpole_setting_t setting, long value, double timeout_s)
 {
     double end;
     TX_TRY(deadline(timeout_s, &end));
+    const char *name = cartpole_setting_name(setting);
     char line[64];
     if (!name || strlen(name) >= sizeof g_wait_name || !proto_format_config(line, name, value))
         return CARTPOLE_INVALID_ARGUMENT;
@@ -441,7 +474,7 @@ cartpole_result_t cartpole_configure(const char *name, long value, double timeou
     TX_TRY(wait_reply(end, faults));
     return g_reply_value == value ? CARTPOLE_OK : CARTPOLE_REPLY_MISMATCH;
 }
-cartpole_result_t cartpole_refresh_metadata(double timeout_s)
+cartpole_result_t cartpole_refresh_configuration(double timeout_s)
 {
     static const char *required[] = {"CAL_STATE", "CAL_LENGTH_UM", "CAL_SAVED", "CAL_STORAGE",
                                      "VEL_MAX",   "ACC_MAX",       "WDT_MS",    "X_MARGIN_UM"};
@@ -543,4 +576,316 @@ cartpole_result_t cartpole_mark(cartpole_endpoint_t endpoint, double timeout_s)
     uint64_t faults = g_fault_seq;
     TX_TRY(send_simple(endpoint == CARTPOLE_LEFT ? "MARK LEFT" : "MARK RIGHT", end, 0));
     return wait_reply(end, faults);
+}
+
+static cartpole_mode_t business_mode(fw_mode_t mode)
+{
+    switch (mode) {
+    case FW_READY:
+        return CARTPOLE_MODE_READY;
+    case FW_FAULT:
+        return CARTPOLE_MODE_FAULT;
+    default:
+        return CARTPOLE_MODE_DISABLED;
+    }
+}
+static cartpole_reason_t business_reason(fw_reason_t reason)
+{
+    switch (reason) {
+    case FW_REASON_STEP_LOSS:
+        return CARTPOLE_REASON_STEP_LOSS;
+    case FW_REASON_AS5600:
+        return CARTPOLE_REASON_AS5600;
+    case FW_REASON_MT6835:
+        return CARTPOLE_REASON_MT6835;
+    default:
+        return CARTPOLE_REASON_NONE;
+    }
+}
+const char *cartpole_mode_name(cartpole_mode_t mode)
+{
+    switch (mode) {
+    case CARTPOLE_MODE_READY:
+        return "READY";
+    case CARTPOLE_MODE_FAULT:
+        return "FAULT";
+    case CARTPOLE_MODE_DISABLED:
+        return "DISABLED";
+    }
+    return "UNKNOWN";
+}
+const char *cartpole_reason_name(cartpole_reason_t reason)
+{
+    switch (reason) {
+    case CARTPOLE_REASON_NONE:
+        return "NONE";
+    case CARTPOLE_REASON_STEP_LOSS:
+        return "STEP_LOSS";
+    case CARTPOLE_REASON_AS5600:
+        return "AS5600";
+    case CARTPOLE_REASON_MT6835:
+        return "MT6835";
+    }
+    return "UNKNOWN";
+}
+cartpole_measurement_t cartpole_measurement(void)
+{
+    return (cartpole_measurement_t){.cart_valid = !!(g_snapshot.measurement_validity_bits & 1),
+                                    .pole_valid = !!(g_snapshot.measurement_validity_bits & 2),
+                                    .cart_position_m = g_snapshot.x_um * 1e-6,
+                                    .pole_angle_rad = g_snapshot.theta_urad * 1e-6,
+                                    .cart_velocity_m_s = g_snapshot.vx_mm_s * 1e-3,
+                                    .pole_angular_velocity_rad_s = g_snapshot.vth_mrad_s * 1e-3,
+                                    .measurement_id = g_snapshot.received_state_count,
+                                    .received_host_monotonic_s =
+                                        g_snapshot.last_state_received_host_monotonic_s};
+}
+cartpole_session_t cartpole_session(void)
+{
+    return (cartpole_session_t){.connection_open = g_snapshot.is_serial_open,
+                                .is_mode_received = g_snapshot.is_mode_received,
+                                .reported_mode = business_mode(g_snapshot.reported_mode),
+                                .reported_mode_reason =
+                                    business_reason(g_snapshot.reported_mode_reason),
+                                .has_stream_failure_latch = g_snapshot.has_stream_failure_latch,
+                                .has_received_fault_mode = g_snapshot.has_received_fault_mode};
+}
+cartpole_statistics_t cartpole_statistics(void)
+{
+    return (cartpole_statistics_t){g_snapshot.received_state_count,
+                                   g_snapshot.received_unknown_line_count};
+}
+double cartpole_measurement_age_s(cartpole_measurement_t measurement)
+{
+    return measurement.received_host_monotonic_s < 0
+               ? -1.
+               : cartpole_host_monotonic_s() - measurement.received_host_monotonic_s;
+}
+cartpole_configuration_t cartpole_configuration(void)
+{
+    cartpole_configuration_t c = {0};
+    int64_t state = 0, saved = 0, storage = -1;
+    c.complete = cartpole_cached_value("CAL_STATE", &state) == 0;
+    c.calibration_state = state == 2   ? CARTPOLE_CALIBRATION_READY
+                          : state == 3 ? CARTPOLE_CALIBRATION_REFERENCE_REQUIRED
+                                       : CARTPOLE_CALIBRATION_NOT_READY;
+    c.complete &= cartpole_cached_value("CAL_LENGTH_UM", &c.track_length_um) == 0;
+    c.complete &= cartpole_cached_value("CAL_SAVED", &saved) == 0;
+    c.calibration_saved = saved == 1;
+    c.complete &= cartpole_cached_value("CAL_STORAGE", &storage) == 0;
+    c.calibration_storage_ok = storage == 0;
+    c.complete &= cartpole_cached_value("VEL_MAX", &c.velocity_limit_mm_s) == 0;
+    c.complete &= cartpole_cached_value("ACC_MAX", &c.acceleration_limit_mm_s2) == 0;
+    c.complete &= cartpole_cached_value("WDT_MS", &c.watchdog_timeout_ms) == 0;
+    c.complete &= cartpole_cached_value("X_MARGIN_UM", &c.track_margin_um) == 0;
+    return c;
+}
+const char *cartpole_setting_name(cartpole_setting_t setting)
+{
+    switch (setting) {
+    case CARTPOLE_SETTING_VELOCITY_LIMIT:
+        return "VEL_MAX";
+    case CARTPOLE_SETTING_ACCELERATION_LIMIT:
+        return "ACC_MAX";
+    case CARTPOLE_SETTING_WATCHDOG_TIMEOUT:
+        return "WDT_MS";
+    case CARTPOLE_SETTING_TRACK_MARGIN:
+        return "X_MARGIN_UM";
+    case CARTPOLE_SETTING_POLE_ZERO:
+        return "POLE_ZERO_URAD";
+    case CARTPOLE_SETTING_POLE_INVERT:
+        return "POLE_INV";
+    case CARTPOLE_SETTING_CART_INVERT:
+        return "X_INV";
+    case CARTPOLE_SETTING_STEP_LOSS_THRESHOLD:
+        return "STEP_LOSS_UM";
+    }
+    return NULL;
+}
+int cartpole_setting_from_name(const char *name, cartpole_setting_t *setting)
+{
+    if (!name || !setting)
+        return -1;
+    for (int i = CARTPOLE_SETTING_VELOCITY_LIMIT; i <= CARTPOLE_SETTING_STEP_LOSS_THRESHOLD; i++) {
+        if (!strcmp(name, cartpole_setting_name((cartpole_setting_t)i))) {
+            *setting = (cartpole_setting_t)i;
+            return 0;
+        }
+    }
+    return -1;
+}
+int cartpole_callback_enter(void)
+{
+    if (g_callback_depth) {
+        g_callback_violation = 1;
+        return -1;
+    }
+    g_callback_depth = 1;
+    g_callback_violation = 0;
+    return 0;
+}
+int cartpole_callback_leave(void)
+{
+    g_callback_depth = 0;
+    return g_callback_violation ? -1 : 0;
+}
+cartpole_result_t cartpole_subscribe(cartpole_event_handler_t handler, void *context)
+{
+    if (g_callback_depth) {
+        g_callback_violation = 1;
+        return CARTPOLE_CALLBACK_ERROR;
+    }
+    g_event_handler = handler;
+    g_event_context = context;
+    return CARTPOLE_OK;
+}
+static void deliver_event(const cartpole_event_t *event)
+{
+    if (!g_event_handler)
+        return;
+    if (cartpole_callback_enter() != 0) {
+        stream_failed(CARTPOLE_CALLBACK_ERROR);
+        return;
+    }
+    g_event_handler(event, g_event_context);
+    if (cartpole_callback_leave() != 0) {
+        /* 不递归派发callback自身造成的失败事件，延至下一安全边界。 */
+        if (g_stream_error == CARTPOLE_OK)
+            g_stream_error = CARTPOLE_CALLBACK_ERROR;
+        if (!g_snapshot.has_stream_failure_latch)
+            g_session_event_pending = 1;
+        g_snapshot.has_stream_failure_latch = 1;
+    }
+}
+static void flush_session_event(void)
+{
+    if (g_callback_depth || !g_session_event_pending)
+        return;
+    g_session_event_pending = 0;
+    cartpole_event_t event = {.kind = CARTPOLE_EVENT_SESSION, .data.session = cartpole_session()};
+    deliver_event(&event);
+}
+static void dispatch_business_event(const proto_msg_t *message)
+{
+    if (!g_event_handler)
+        return;
+    cartpole_event_t event;
+    switch (message->type) {
+    case PROTO_STATE:
+        event.kind = CARTPOLE_EVENT_MEASUREMENT;
+        event.data.measurement = cartpole_measurement();
+        break;
+    case PROTO_MODE:
+        event.kind = CARTPOLE_EVENT_SESSION;
+        event.data.session = cartpole_session();
+        break;
+    case PROTO_OK:
+        event.kind = CARTPOLE_EVENT_CONFIGURATION;
+        event.data.configuration = cartpole_configuration();
+        break;
+    case PROTO_STEP_LOSS:
+        event.kind = CARTPOLE_EVENT_STEP_LOSS;
+        event.data.step_loss.event_id = message->event_id;
+        event.data.step_loss.run_id = message->run_id;
+        event.data.step_loss.device_time_us = message->device_us;
+        break;
+    default:
+        return;
+    }
+    deliver_event(&event);
+}
+cartpole_result_t cartpole_stream_result(void) { return g_stream_error; }
+int cartpole_loop_begin(void)
+{
+    if (g_callback_depth) {
+        g_callback_violation = 1;
+        return -1;
+    }
+    if (g_loop_active)
+        return -1;
+    g_loop_active = 1;
+    return 0;
+}
+void cartpole_loop_end(void) { g_loop_active = 0; }
+void cartpole_sleep_to(double when)
+{
+    struct timespec ts = {(time_t)when, (long)((when - floor(when)) * 1e9)};
+    while (!g_stop && clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR) {
+    }
+}
+cartpole_result_t cartpole_run_loop(double period_s, double duration_s,
+                                    cartpole_tick_handler_t tick, void *context)
+{
+    if (!isfinite(period_s) || period_s <= 0 || !isfinite(duration_s) || duration_s < 0 || !tick)
+        return CARTPOLE_INVALID_ARGUMENT;
+    if (cartpole_loop_begin() != 0)
+        return CARTPOLE_CALLBACK_ERROR;
+    if (!g_snapshot.is_serial_open) {
+        cartpole_loop_end();
+        return CARTPOLE_SESSION_UNAVAILABLE;
+    }
+    double start = cartpole_host_monotonic_s(), next = start;
+    cartpole_result_t result = CARTPOLE_OK;
+    while (!g_stop) {
+        double until = duration_s > 0 ? fmin(next, start + duration_s) : next;
+        cartpole_sleep_to(until);
+        if (g_stop)
+            break;
+        double now = cartpole_host_monotonic_s();
+        if (duration_s > 0 && now - start >= duration_s)
+            break;
+        int received = pump(0);
+        if (received < 0) {
+            result = g_stream_error;
+            break;
+        }
+        if (duration_s > 0 && cartpole_host_monotonic_s() - start >= duration_s)
+            break;
+        if (received == 0) {
+            cartpole_tick_action_t action = {.kind = CARTPOLE_TICK_OBSERVE};
+            if (cartpole_callback_enter() != 0) {
+                result = CARTPOLE_CALLBACK_ERROR;
+                break;
+            }
+            int rc = tick(now - start, &action, context);
+            int violation = cartpole_callback_leave();
+            if (rc || violation) {
+                result = CARTPOLE_CALLBACK_ERROR;
+                break;
+            }
+            if (g_stop) {
+                result = CARTPOLE_CANCELLED;
+                break;
+            }
+            if (duration_s > 0 && cartpole_host_monotonic_s() - start >= duration_s)
+                break;
+            if (action.kind == CARTPOLE_TICK_FINISH)
+                break;
+            if (action.kind == CARTPOLE_TICK_VELOCITY) {
+                received = pump(0);
+                if (received < 0) {
+                    result = g_stream_error;
+                    break;
+                }
+                if (duration_s > 0 && cartpole_host_monotonic_s() - start >= duration_s)
+                    break;
+                if (received == 0 &&
+                    cartpole_send_vel_until(action.velocity_mm_s,
+                                            duration_s > 0 ? start + duration_s : INFINITY) !=
+                        CARTPOLE_SEND_COMPLETE) {
+                    result = g_stream_error == CARTPOLE_OK ? CARTPOLE_SESSION_UNAVAILABLE
+                                                           : g_stream_error;
+                    break;
+                }
+            } else if (action.kind != CARTPOLE_TICK_OBSERVE) {
+                result = CARTPOLE_CALLBACK_ERROR;
+                break;
+            }
+        }
+        next = control_next_tick(next, cartpole_host_monotonic_s(), period_s);
+    }
+    if (g_stop && result == CARTPOLE_OK)
+        result = CARTPOLE_CANCELLED;
+    cartpole_loop_end();
+    return result;
 }

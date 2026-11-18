@@ -1,11 +1,4 @@
-/* 交互控制台：无策略模型时的人工操作窗口（维护与板端联调）。
- *
- * console_parse 是纯字符串处理（主机可单测，console_test.c）；console_exec
- * 执行单条命令的非保持语义（calib/mark-left/mark-right/enable/center/state/
- * query/config/reset），一次性子命令与控制台共用；console_run 假设 rig 已
- * 打开并完成模式同步，进入行循环：stdin 命令、串口泵与 vel 目标保持合并
- * 在一个 select 循环里，退出（quit/Ctrl+D/信号）前发 VEL 0。
- */
+/* 交互控制台：解析用户命令并使用 cartpole 业务事务和循环。 */
 #ifndef EDGE_CONSOLE_H
 #define EDGE_CONSOLE_H
 #include "cartpole.h"
@@ -44,7 +37,7 @@ int console_parse(const char *line, console_req_t *req);
  * 其余命令返回 -1。 */
 int console_exec(const console_req_t *req);
 
-/* 进入交互循环（rig 已打开并同步模式）。始终返回 0。 */
+/* 进入交互循环；会话须已打开并同步。失败返回非零，main统一确认停车。 */
 int console_run(void);
 
 int console_transaction_result(const char *operation, cartpole_result_t result);

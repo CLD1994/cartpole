@@ -3,6 +3,7 @@
 #include "console.h"
 
 #include <errno.h>
+#include <inttypes.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -162,20 +163,71 @@ int console_parse(const char *line, console_req_t *req)
 
 /* ---- 单命令执行（控制台与一次性子命令共用） ---- */
 
-static void nap_ms(int ms)
+/* 输入缓存保留同一次 read 中尚未执行的后续命令。 */
+typedef struct {
+    char chunk[256], line[CONSOLE_LINE_MAX];
+    size_t pos, size, length;
+    int eof, overflow, ready;
+} console_input;
+static console_input input;
+static int read_line_tick(double elapsed, cartpole_tick_action_t *action, void *context)
 {
-    struct timespec ts = {0, (long)ms * 1000 * 1000};
-    nanosleep(&ts, NULL);
+    (void)elapsed;
+    (void)context;
+    action->kind = CARTPOLE_TICK_OBSERVE;
+    int filled = 0;
+    while (1) {
+        if (input.pos == input.size) {
+            if (filled)
+                return 0;
+            filled = 1;
+            fd_set rf;
+            FD_ZERO(&rf);
+            FD_SET(STDIN_FILENO, &rf);
+            struct timeval tv = {0, 0};
+            int rc = select(STDIN_FILENO + 1, &rf, NULL, NULL, &tv);
+            if (rc < 0)
+                return errno == EINTR ? 0 : -1;
+            if (!rc)
+                return 0;
+            ssize_t n = read(STDIN_FILENO, input.chunk, sizeof input.chunk);
+            if (n < 0)
+                return errno == EINTR || errno == EAGAIN ? 0 : -1;
+            if (!n) {
+                input.eof = 1;
+                action->kind = CARTPOLE_TICK_FINISH;
+                return 0;
+            }
+            input.pos = 0;
+            input.size = (size_t)n;
+        }
+        char c = input.chunk[input.pos++];
+        if (c == '\n') {
+            input.line[input.length] = 0;
+            input.ready = 1;
+            action->kind = CARTPOLE_TICK_FINISH;
+            return 0;
+        }
+        if (c == '\r')
+            continue;
+        if (input.length + 1 < sizeof input.line)
+            input.line[input.length++] = c;
+        else
+            input.overflow = 1;
+    }
 }
-
-/* 等操作者推车到位后按回车（calib 交互引导用）。 */
+static void consume_line(void)
+{
+    input.length = 0;
+    input.ready = 0;
+    input.overflow = 0;
+}
 static int wait_enter(void)
 {
-    int c = getchar();
-    while (c != '\n' && c != EOF) {
-        c = getchar();
-    }
-    return c == EOF ? -1 : 0;
+    cartpole_result_t rc = cartpole_run_loop(.020, 0, read_line_tick, NULL);
+    int ok = rc == CARTPOLE_OK && input.ready && !input.eof;
+    consume_line();
+    return ok ? 0 : -1;
 }
 
 /* 统一结果提示，不将拒绝、取消或故障统称为超时。 */
@@ -190,7 +242,7 @@ int console_transaction_result(const char *operation, cartpole_result_t result)
 }
 static int query_mode_for_command(void)
 {
-    return console_transaction_result("QUERY", cartpole_sync_mode(1.0));
+    return console_transaction_result("QUERY", cartpole_query_mode(1.0));
 }
 
 int console_exec(const console_req_t *req)
@@ -200,11 +252,11 @@ int console_exec(const console_req_t *req)
         if (query_mode_for_command() != 0)
             return -1;
         int known;
-        cartpole_snapshot_t snapshot = cartpole_snapshot();
+        cartpole_session_t snapshot = cartpole_session();
         known = snapshot.is_mode_received;
-        fw_mode_t m = snapshot.reported_mode;
-        if (known && m != FW_DISABLED) {
-            fprintf(stderr, "[edge] calib requires DISABLED (current %s)\n", proto_mode_name(m));
+        cartpole_mode_t m = snapshot.reported_mode;
+        if (known && m != CARTPOLE_MODE_DISABLED) {
+            fprintf(stderr, "[edge] calib requires DISABLED (current %s)\n", cartpole_mode_name(m));
             return -1;
         }
         printf("[edge] push cart to LEFT end, then press Enter...");
@@ -245,36 +297,56 @@ int console_exec(const console_req_t *req)
         console_print_state();
         return 0;
     case CONSOLE_CMD_QUERY: {
-        if (console_transaction_result("QUERY", cartpole_sync_mode(1.0)) != 0) {
+        if (console_transaction_result("QUERY", cartpole_query_mode(1.0)) != 0) {
             return -1;
         }
-        fw_reason_t reason = cartpole_snapshot().reported_mode_reason;
-        fw_mode_t m = cartpole_snapshot().reported_mode;
-        printf("MODE %s %s\n", proto_mode_name(m), proto_reason_name(reason));
+        cartpole_reason_t reason = cartpole_session().reported_mode_reason;
+        cartpole_mode_t m = cartpole_session().reported_mode;
+        printf("MODE %s %s\n", cartpole_mode_name(m), cartpole_reason_name(reason));
         return 0;
     }
     case CONSOLE_CMD_CONFIG: {
         if (req->dump) {
-            return console_transaction_result("metadata", cartpole_refresh_metadata(DUMP_WINDOW_S));
+            if (console_transaction_result("metadata",
+                                           cartpole_refresh_configuration(DUMP_WINDOW_S)))
+                return -1;
+            cartpole_configuration_t c = cartpole_configuration();
+            printf("[edge] calibration=%s length=%" PRId64 " um; VEL_MAX=%" PRId64
+                   " ACC_MAX=%" PRId64 " WDT_MS=%" PRId64 " X_MARGIN_UM=%" PRId64 "\n",
+                   c.calibration_state == CARTPOLE_CALIBRATION_READY ? "ready"
+                   : c.calibration_state == CARTPOLE_CALIBRATION_REFERENCE_REQUIRED
+                       ? "reference-required"
+                       : "not-ready",
+                   c.track_length_um, c.velocity_limit_mm_s, c.acceleration_limit_mm_s2,
+                   c.watchdog_timeout_ms, c.track_margin_um);
+            return 0;
         }
         char operation[32];
         snprintf(operation, sizeof operation, "CONFIG %s", req->name);
-        return console_transaction_result(operation,
-                                          cartpole_configure(req->name, req->value, 1.0));
+        cartpole_setting_t setting;
+        if (cartpole_setting_from_name(req->name, &setting) != 0) {
+            fprintf(stderr, "[edge] unsupported setting %s\n", req->name);
+            return -1;
+        }
+        int rc =
+            console_transaction_result(operation, cartpole_configure(setting, req->value, 1.0));
+        if (rc == 0)
+            printf("[edge] %s = %ld\n", cartpole_setting_name(setting), req->value);
+        return rc;
     }
     case CONSOLE_CMD_RESET: {
         if (query_mode_for_command() != 0)
             return -1;
         int known;
-        cartpole_snapshot_t snapshot = cartpole_snapshot();
+        cartpole_session_t snapshot = cartpole_session();
         known = snapshot.is_mode_received;
-        fw_mode_t m = snapshot.reported_mode;
-        if (known && m == FW_DISABLED) {
+        cartpole_mode_t m = snapshot.reported_mode;
+        if (known && m == CARTPOLE_MODE_DISABLED) {
             printf("[edge] already DISABLED\n");
             return 0;
         }
-        if (m != FW_FAULT) {
-            fprintf(stderr, "[edge] RESET only clears FAULT (current %s)\n", proto_mode_name(m));
+        if (m != CARTPOLE_MODE_FAULT) {
+            fprintf(stderr, "[edge] RESET only clears FAULT (current %s)\n", cartpole_mode_name(m));
             return -1;
         }
         if (console_transaction_result("RESET", cartpole_reset(2.0)) != 0)
@@ -304,203 +376,91 @@ static void print_help(void)
            "  help | quit\n");
 }
 
-/* 处理一行输入。返回 1 表示退出控制台。 */
-static int handle_line(const char *line, int *holding, double *held_vel)
+typedef struct {
+    int holding;
+    double velocity;
+} console_hold;
+static int console_tick(double elapsed, cartpole_tick_action_t *action, void *context)
 {
-    console_req_t req;
-    if (console_parse(line, &req) != 0) {
-        printf("? %s\n", req.err);
-        return 0;
+    console_hold *hold = context;
+    int rc = read_line_tick(elapsed, action, NULL);
+    if (rc || action->kind == CARTPOLE_TICK_FINISH)
+        return rc;
+    if (hold->holding) {
+        action->kind = CARTPOLE_TICK_VELOCITY;
+        action->velocity_mm_s = hold->velocity;
     }
-    switch (req.cmd) {
-    case CONSOLE_CMD_QUIT:
-        return 1;
-    case CONSOLE_CMD_HELP:
-        print_help();
-        return 0;
-    case CONSOLE_CMD_NONE:
-        return 0;
-    case CONSOLE_CMD_VEL:
-        /* 保持前先等 STATE 流就位、模式已知（与一次性 vel 子命令同语义）：
-         * tick_hold 对未知模式会立即释放保持，首条命令必须先 QUERY 同步 */
-        if (console_transaction_result("STATE", cartpole_wait_state(CFG_STATE_TIMEOUT_S)) != 0) {
-            return 0;
-        }
-        if (query_mode_for_command() != 0) {
-            printf("[edge] WARNING: no MODE reply, ignoring vel\n");
-            return 0;
-        }
-        *holding = 1;
-        *held_vel = req.vel_mm_s;
-        return 0;
-    case CONSOLE_CMD_CALIB:
-    case CONSOLE_CMD_MARK_LEFT:
-    case CONSOLE_CMD_MARK_RIGHT:
-    case CONSOLE_CMD_ENABLE:
-    case CONSOLE_CMD_CENTER:
-    case CONSOLE_CMD_RESET:
-    case CONSOLE_CMD_CONFIG:
-        /* 模式变更类命令期间不保持速度，避免标定/使能/清障后意外续动 */
-        *holding = 0;
-        console_exec(&req);
-        return 0;
-    default: /* QUERY / STATE 只读，不打断保持 */
-        console_exec(&req);
-        return 0;
-    }
+    return 0;
 }
-
-/* 保持心跳：检查模式与 STATE 新鲜度并重发目标速度（喂固件看门狗）。
- * 语义不依赖输入节奏：每处理完一行输入、每个 select 超时各调用一次。 */
-static void tick_hold(int *holding, double held_vel)
-{
-    if (!*holding) {
-        return;
-    }
-    int known;
-    cartpole_snapshot_t snapshot = cartpole_snapshot();
-    known = snapshot.is_mode_received;
-    fw_mode_t m = snapshot.reported_mode;
-    double age = cartpole_state_age_s(snapshot);
-    if (!known || m != FW_READY) {
-        *holding = 0;
-        printf("[edge] hold released (firmware in %s)\n",
-               known ? proto_mode_name(m) : "unknown mode");
-    } else if (!(snapshot.measurement_validity_bits & CARTPOLE_MEASUREMENT_CART_VALID) ||
-               age < 0.0 || age > CFG_STATE_TIMEOUT_S) {
-        *holding = 0;
-        cartpole_send_vel(0.0);
-        printf("[edge] hold released: cart measurement unavailable; zero requested\n");
-    } else {
-        if (cartpole_send_vel(held_vel) != 0) {
-            *holding = 0;
-            cartpole_request_stop();
-        }
-    }
-}
-
 int console_run(void)
 {
-    char line[CONSOLE_LINE_MAX];
-    size_t len = 0;
-    int holding = 0;
-    double held_vel = 0.0;
-
+    console_hold hold = {0};
+    memset(&input, 0, sizeof input);
     print_help();
-    printf("[edge] console ready (quit/Ctrl+D to exit)\n");
-    for (;;) {
-        fd_set rf;
-        FD_ZERO(&rf);
-        FD_SET(STDIN_FILENO, &rf);
-        struct timeval tv = {0, 20 * 1000};
-        int r = select(STDIN_FILENO + 1, &rf, NULL, NULL, &tv);
-        if (r < 0) {
-            if (errno == EINTR) {
-                r = 0; /* 信号打断：走下面的停止与保持检查 */
-            } else {
-                fprintf(stderr, "[edge] select: %s\n", strerror(errno));
-                break;
-            }
-        }
-        if (r > 0) {
-            char chunk[64];
-            ssize_t got = read(STDIN_FILENO, chunk, sizeof(chunk));
-            if (got < 0 && errno == EINTR) {
-                got = 0;
-            }
-            if (got < 0) {
-                fprintf(stderr, "[edge] read: %s\n", strerror(errno));
-                break;
-            }
-            if (got == 0) { /* Ctrl+D */
-                break;
-            }
-            for (ssize_t k = 0; k < got; k++) {
-                char c = chunk[k];
-                if (c == '\n') {
-                    line[len] = '\0';
-                    if (handle_line(line, &holding, &held_vel)) {
-                        goto out;
-                    }
-                    len = 0;
-                    tick_hold(&holding, held_vel);
-                } else if (len + 1 < sizeof(line)) {
-                    line[len++] = c;
-                } /* 超长输入截断，与协议接收器同策略 */
-            }
-        }
-
-        int pumped = cartpole_pump();
-        if (pumped < 0)
-            return -1;
-        if (pumped == 0)
-            tick_hold(&holding, held_vel);
-
-        if (cartpole_stop_requested()) {
+    puts("[edge] console ready (quit/Ctrl+D to exit)");
+    while (!cartpole_stop_requested()) {
+        cartpole_result_t result = cartpole_run_loop(.020, 0, console_tick, &hold);
+        if (result == CARTPOLE_CANCELLED)
+            return 0;
+        if (result != CARTPOLE_OK)
+            return console_transaction_result("console", result);
+        if (input.eof)
             break;
-        }
-    }
-out:
-    return 0; /* 停机由 main 的会话退出路径统一发送 */
-}
-
-int console_goto_center(double timeout_s)
-{
-    double end = cartpole_host_monotonic_s() + timeout_s;
-    if (console_transaction_result(
-            "QUERY", cartpole_sync_mode(fmax(0., end - cartpole_host_monotonic_s()))) != 0)
-        return -1;
-    while (!cartpole_stop_requested() && cartpole_host_monotonic_s() < end) {
-        int p = cartpole_pump();
-        if (p < 0)
+        if (!input.ready)
+            continue;
+        console_req_t req;
+        int parsed = input.overflow ? -1 : console_parse(input.line, &req);
+        if (input.overflow)
+            puts("? line too long");
+        else if (parsed)
+            printf("? %s\n", req.err);
+        consume_line();
+        if (parsed)
+            continue;
+        if (req.cmd == CONSOLE_CMD_QUIT)
             break;
-        if (p > 0) {
-            nap_ms(1);
+        if (req.cmd == CONSOLE_CMD_NONE)
+            continue;
+        if (req.cmd == CONSOLE_CMD_HELP) {
+            print_help();
             continue;
         }
-        cartpole_snapshot_t snapshot = cartpole_snapshot();
-        if (!snapshot.is_mode_received || snapshot.reported_mode != FW_READY ||
-            !(snapshot.measurement_validity_bits & CARTPOLE_MEASUREMENT_CART_VALID) ||
-            cartpole_state_age_s(snapshot) < 0 ||
-            cartpole_state_age_s(snapshot) > CFG_STATE_TIMEOUT_S)
-            break;
-        if (snapshot.x_um > -5000 && snapshot.x_um < 5000) {
-            if (cartpole_send_vel(0.) != 0)
-                return -1;
-            /* 持续零速并等待小车速度回报，不能把请求发送等同停稳。 */
-            uint64_t seq = snapshot.received_state_count;
-            while (!cartpole_stop_requested() && cartpole_host_monotonic_s() < end) {
-                if (cartpole_pump() < 0)
-                    return -1;
-                snapshot = cartpole_snapshot();
-                if (snapshot.reported_mode != FW_READY ||
-                    !(snapshot.measurement_validity_bits & CARTPOLE_MEASUREMENT_CART_VALID))
-                    return -1;
-                if (snapshot.received_state_count != seq && snapshot.vx_mm_s == 0)
-                    return 0;
-                if (cartpole_send_vel(0.) != 0)
-                    return -1;
-                nap_ms(5);
+        if (req.cmd == CONSOLE_CMD_VEL) {
+            if (query_mode_for_command() ||
+                console_transaction_result("STATE",
+                                           cartpole_wait_measurement(CFG_STATE_TIMEOUT_S))) {
+                hold.holding = 0;
+                continue;
             }
-            return -1;
+            hold.holding = 1;
+            hold.velocity = req.vel_mm_s;
+            continue;
         }
-        if (cartpole_send_vel(snapshot.x_um > 0 ? -CFG_CENTER_VEL_MMS : CFG_CENTER_VEL_MMS) != 0)
-            break;
-        nap_ms(5);
+        if (req.cmd != CONSOLE_CMD_QUERY && req.cmd != CONSOLE_CMD_STATE)
+            hold.holding = 0;
+        (void)console_exec(&req);
     }
-    (void)cartpole_send_vel(0.);
-    return -1;
+    return 0;
 }
-
+int console_goto_center(double timeout_s)
+{
+    return console_transaction_result("center", cartpole_move_to_center(timeout_s));
+}
 void console_print_state(void)
 {
-    cartpole_snapshot_t snapshot = cartpole_snapshot();
-    if (snapshot.last_state_received_host_monotonic_s < 0) {
+    cartpole_measurement_t m = cartpole_measurement();
+    if (m.received_host_monotonic_s < 0) {
         puts("[edge] no STATE received");
         return;
     }
-    printf("STATE flags=%u x=%lld um theta=%lld urad vx=%lld mm/s omega=%lld mrad/s age=%.1f ms\n",
-           snapshot.measurement_validity_bits, (long long)snapshot.x_um,
-           (long long)snapshot.theta_urad, (long long)snapshot.vx_mm_s,
-           (long long)snapshot.vth_mrad_s, cartpole_state_age_s(snapshot) * 1000.);
+    if (m.cart_valid)
+        printf("[edge] cart x=%.6f m velocity=%.6f m/s\n", m.cart_position_m, m.cart_velocity_m_s);
+    else
+        puts("[edge] cart measurement unavailable");
+    if (m.pole_valid)
+        printf("[edge] pole angle=%.6f rad velocity=%.6f rad/s\n", m.pole_angle_rad,
+               m.pole_angular_velocity_rad_s);
+    else
+        puts("[edge] pole measurement unavailable");
+    printf("[edge] measurement age=%.1f ms\n", cartpole_measurement_age_s(m) * 1000);
 }

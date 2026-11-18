@@ -115,6 +115,23 @@ def package(directory):
 
 @unittest.skipUnless(BINARY, "需 make test-integration 构建 PTY 测试应用，或设置 EDGE_TEST_BINARY")
 class CommandTests(unittest.TestCase):
+    def test_console_preserves_multiple_commands_from_one_stdin_write(self):
+        with Firmware() as fw:
+            result=subprocess.run([BINARY,"--port",fw.path,"console"],input="query\nstate\nquery\nquit\n",
+                                  capture_output=True,text=True,timeout=5)
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertEqual(fw.commands[:fw.commands.index("VEL 0")].count("QUERY"),3)
+            self.assertIn("cart x=",result.stdout)
+            self.assertIn("DISABLE",fw.commands)
+
+    def test_console_rejects_overlong_line_without_losing_next_command(self):
+        with Firmware() as fw:
+            result=subprocess.run([BINARY,"--port",fw.path,"console"],input="vel 10"+" "*300+"\nquery\nquit\n",
+                                  capture_output=True,text=True,timeout=5)
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertEqual(fw.commands[:fw.commands.index("VEL 0")].count("QUERY"),2)
+            self.assertFalse(any(c.startswith("VEL ") and float(c.split()[1])!=0 for c in fw.commands))
+
     def test_backend_required_and_missing_model_no_fallback(self):
         with tempfile.TemporaryDirectory() as tmp, Firmware() as fw:
             manifest=package(tmp)

@@ -39,6 +39,8 @@ add_executable(cartpole_edge
     uart.c
     proto.c
     cartpole.c
+    cartpole_controller.c
+    cartpole_motion.c
     console.c
     policy.c
     cpu_policy.c
