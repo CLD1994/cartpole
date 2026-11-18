@@ -6,8 +6,8 @@
  *   - 停机请求（信号处理器调用 rig_request_stop）经这里传播，
  *     所有等待与保持循环统一可中断。
  */
-#ifndef EDGE_RIG_H
-#define EDGE_RIG_H
+#ifndef EDGE_CARTPOLE_H
+#define EDGE_CARTPOLE_H
 
 #include <stdint.h>
 
@@ -66,4 +66,4 @@ void rig_window_reset(void);  /* 清零窗口计数器 */
 long rig_state_count(void);   /* 窗口内 STATE 行数 */
 long rig_unknown_count(void); /* 窗口内无法解析行数 */
 
-#endif /* EDGE_RIG_H */
+#endif /* EDGE_CARTPOLE_H */

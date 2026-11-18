@@ -13,7 +13,7 @@
 #include <unistd.h>
 
 #include "config.h"
-#include "rig.h"
+#include "cartpole.h"
 
 #define CONSOLE_LINE_MAX 128
 #define DUMP_WINDOW_S 0.5 /* CONFIG? dump 的应答收集窗口 */

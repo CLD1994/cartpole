@@ -5,7 +5,7 @@
 #include "console.h"
 #include "policy.h"
 #include "proto.h"
-#include "rig.h"
+#include "cartpole.h"
 
 #include <math.h>
 #include <signal.h>

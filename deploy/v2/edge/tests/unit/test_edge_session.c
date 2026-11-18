@@ -1,4 +1,4 @@
-#include "rig.h"
+#include "cartpole.h"
 #include "uart.h"
 #include <assert.h>
 #include <stdio.h>

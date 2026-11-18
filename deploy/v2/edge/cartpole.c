@@ -1,5 +1,5 @@
 /* 串口会话：明确区分有效测量、模式、请求回执及传输错误。 */
-#include "rig.h"
+#include "cartpole.h"
 #include "uart.h"
 #include <math.h>
 #include <signal.h>

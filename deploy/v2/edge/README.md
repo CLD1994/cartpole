@@ -79,7 +79,7 @@ make -C deploy/v2/edge test-integration PYTHON=/path/to/python
 | `main.c` | CLI、预检、控制循环及退出 |
 | `control.c` | 控制门控、速度换算与周期推进 |
 | `package.c` / `prepare_package.py` | 模型包读取与从正式模型目录派生 |
-| `rig.c` | 协议会话、回执、状态、参数及停止确认 |
+| `cartpole.c` | 协议会话、回执、状态、参数及停止确认 |
 | `proto.c` / `uart.c` | 严格行解析、串口读写与有限写等待 |
 | `policy.c` / `npu/` | NPU 生命周期与原始动作推理 |
 
