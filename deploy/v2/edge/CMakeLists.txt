@@ -38,6 +38,8 @@ add_executable(cartpole_edge
     rig.c
     console.c
     policy.c
+    control.c
+    package.c
 )
 
 target_include_directories(cartpole_edge PRIVATE

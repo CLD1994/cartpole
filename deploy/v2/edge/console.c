@@ -181,7 +181,7 @@ static int wait_enter(void)
 /* 发命令并等 OK/ERR 回执（回执名经控制台回显核对）。 */
 static int send_and_await(const char *cmd)
 {
-    if (rig_send_simple(cmd) != 0) {
+    if (rig_pump() != 0 || rig_send_simple(cmd) != 0) {
         return -1;
     }
     if (rig_wait_reply(1.0) != 0) {
@@ -195,11 +195,6 @@ static int send_and_await(const char *cmd)
  * 返回 0 表示模式已知，-1 表示 QUERY 超时。 */
 static int ensure_mode_known(void)
 {
-    int known;
-    rig_mode(&known, NULL);
-    if (known) {
-        return 0;
-    }
     return rig_sync_mode(1.0) == 0 ? 0 : -1;
 }
 
@@ -207,8 +202,7 @@ int console_exec(const console_req_t *req)
 {
     switch (req->cmd) {
     case CONSOLE_CMD_CALIB: {
-        /* 同步失败时保持原行为：前置检查跳过，由固件对 MARK 的拒绝兜底 */
-        (void)ensure_mode_known();
+        if (ensure_mode_known() != 0) return -1;
         int known;
         fw_mode_t m = rig_mode(&known, NULL);
         if (known && m != FW_DISABLED) {
@@ -234,10 +228,7 @@ int console_exec(const console_req_t *req)
             fprintf(stderr, "[edge] MARK RIGHT rejected (L invalid? no left mark?)\n");
             return -1;
         }
-        if (rig_send_simple("ENABLE") != 0) {
-            return -1;
-        }
-        if (rig_wait_mode(FW_READY, 2.0) != 0) {
+        if (rig_enable(2.0) != 0) {
             fprintf(stderr, "[edge] ENABLE failed (see MODE events)\n");
             return -1;
         }
@@ -249,7 +240,7 @@ int console_exec(const console_req_t *req)
     case CONSOLE_CMD_MARK_RIGHT:
         return send_and_await("MARK RIGHT");
     case CONSOLE_CMD_ENABLE:
-        return send_and_await("ENABLE");
+        return rig_enable(2.0);
     case CONSOLE_CMD_CENTER:
         if (rig_goto_center(15.0) != 0) {
             fprintf(stderr, "[edge] move-to-center failed\n");
@@ -277,15 +268,12 @@ int console_exec(const console_req_t *req)
             }
             double t0 = rig_now_s();
             while (rig_now_s() - t0 < DUMP_WINDOW_S) {
-                rig_pump();
+                if (rig_pump() < 0) return -1;
                 nap_ms(5);
             }
             return 0;
         }
-        if (rig_send_config(req->name, req->value) != 0) {
-            return -1;
-        }
-        return rig_wait_reply(1.0) == 0 ? 0 : -1;
+        return rig_configure(req->name, req->value, 1.0);
     case CONSOLE_CMD_RESET: {
         if (ensure_mode_known() != 0) {
             fprintf(stderr, "[edge] no MODE reply (QUERY timed out)\n");
@@ -395,12 +383,12 @@ static void tick_hold(int *holding, double held_vel)
         *holding = 0;
         printf("[edge] hold released (firmware in %s)\n",
                known ? proto_mode_name(m) : "unknown mode");
-    } else if (age < 0.0 || age > CFG_STATE_TIMEOUT_S) {
+    } else if (!(rig_valid_flags() & 1) || age < 0.0 || age > CFG_STATE_TIMEOUT_S) {
         *holding = 0;
         rig_send_vel(0.0);
-        printf("[edge] WARNING: STATE stream stale, motor stopped\n");
+        printf("[edge] hold released: cart measurement unavailable; zero requested\n");
     } else {
-        rig_send_vel(held_vel);
+        if (rig_send_vel(held_vel) != 0) { *holding=0; rig_request_stop(); }
     }
 }
 
@@ -455,8 +443,9 @@ int console_run(void)
             }
         }
 
-        rig_pump();
-        tick_hold(&holding, held_vel);
+        int pumped = rig_pump();
+        if (pumped < 0) return -1;
+        if (pumped == 0) tick_hold(&holding, held_vel);
 
         if (rig_stop_requested()) {
             break;

@@ -1,326 +1,519 @@
-/* 台位会话实现：行为从 main.c 原地迁入，语义不变。
- * 协议契约见 docs/deployment/protocol.md。
- */
-
+/* 串口会话：明确区分有效测量、模式、请求回执及传输错误。 */
 #include "rig.h"
-
+#include "uart.h"
+#include <math.h>
 #include <signal.h>
 #include <stdio.h>
+#include <string.h>
 #include <time.h>
 
-#include "uart.h"
-
-const struct fw_param CFG_FW_PARAMS[CFG_FW_PARAM_COUNT] = {
-    {"VEL_MAX", 1000},
-    {"ACC_MAX", 5000},
-    {"WDT_MS", 100},
-    {"WDT_DEC", 5000},
-    /* 设备标定由固件 NVS 管理；会话启动不得覆盖。 */
-};
-
-/* ---- 会话状态 ---- */
 static volatile sig_atomic_t g_stop;
-static uart_t g_uart;
+static uart_t g_uart = {.fd = -1};
 static proto_rx_t g_rx;
-
-/* 遥测快照（STATE 行更新，各形态消费最新值） */
+static int g_io_error, g_fault_seen;
+static int g_need_frame_boundary;
 static int64_t g_x_um, g_theta_urad, g_vx_mm_s, g_vth_mrad_s;
-static double g_state_t = -1.0; /* 最近 STATE 时刻 [s, monotonic] */
-static long g_state_count;   /* 窗口统计（rig_window_reset 清零） */
-static long g_unknown_count;
-
-/* 控制面：最后已知固件模式（MODE 事件与 QUERY 应答维护） */
+static unsigned g_flags;
+static uint64_t g_state_seq, g_mode_seq;
+static double g_state_t = -1.;
+static long g_state_count, g_unknown_count;
 static fw_mode_t g_mode = FW_DISABLED;
-static fw_reason_t g_mode_reason = FW_REASON_NONE;
+static fw_reason_t g_reason = FW_REASON_NONE;
 static int g_mode_known;
+static char g_wait_name[16];
+static int g_reply_seen, g_reply_err;
+static int64_t g_reply_value;
+struct cached_value {
+    char name[16];
+    int64_t value;
+};
+static struct cached_value g_values[24];
+static size_t g_value_count;
+static void (*g_update_hook)(void *);
+static void *g_update_context;
 
-/* 最近一条 OK/ERR 应答（CONFIG 回执等待用） */
-static int g_reply_err;
-static unsigned g_reply_seq;
-
-double rig_now_s(void)
+void rig_set_update_hook(void (*hook)(void *), void *context)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
+    g_update_hook = hook;
+    g_update_context = context;
 }
-
-void rig_request_stop(void)
+double rig_state_received_at_s(void)
 {
-    g_stop = 1;
-}
-
-int rig_stop_requested(void)
-{
-    return g_stop != 0;
+    return g_state_t;
 }
 
 static void nap_ms(int ms)
 {
-    struct timespec ts = {0, (long)ms * 1000 * 1000};
-    nanosleep(&ts, NULL);
+    struct timespec t = {0, (long)ms * 1000000};
+    nanosleep(&t, NULL);
+}
+double rig_now_s(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + t.tv_nsec * 1e-9;
+}
+void rig_request_stop(void)
+{
+    g_stop = 1;
+}
+int rig_stop_requested(void)
+{
+    return g_stop != 0;
+}
+int rig_io_error(void)
+{
+    return g_io_error;
+}
+int rig_fault_seen(void)
+{
+    return g_fault_seen;
+}
+int rig_valid_flags(void)
+{
+    return (int)g_flags;
+}
+uint64_t rig_state_sequence(void)
+{
+    return g_state_seq;
 }
 
-static int send_line(const char *buf, size_t n)
+static int send_line(const char *s, size_t n)
 {
-    return uart_write_all(&g_uart, (const uint8_t *)buf, n);
-}
-
-int rig_send_vel(double v_mm_s)
-{
-    char buf[64];
-    size_t n = proto_format_vel(buf, v_mm_s);
-    return n == 0 ? -1 : send_line(buf, n);
-}
-
-int rig_send_simple(const char *cmd)
-{
-    char buf[64];
-    size_t n = proto_format_simple(buf, cmd);
-    return n == 0 ? -1 : send_line(buf, n);
-}
-
-int rig_send_config(const char *name, long value)
-{
-    char buf[64];
-    size_t n = proto_format_config(buf, name, value);
-    return n == 0 ? -1 : send_line(buf, n);
-}
-
-int rig_open(const char *port, int baud)
-{
-    if (uart_open(&g_uart, port, baud) != 0) {
+    /* 之前可能只有命令前缀进入内核，必须先结束旧行，不能直接拼接停止命令。 */
+    if (g_need_frame_boundary) {
+        if (uart_write_all(&g_uart, (const uint8_t *)"\n", 1) != 0)
+            return -1;
+        g_need_frame_boundary = 0;
+    }
+    if (!n || uart_write_all(&g_uart, (const uint8_t *)s, n) != 0) {
+        g_io_error = 1;
+        g_need_frame_boundary = 1;
         return -1;
     }
-    proto_rx_init(&g_rx);
     return 0;
 }
-
+int rig_try_send_vel(double v, double deadline_s)
+{
+    char line[64];
+    size_t n = proto_format_vel(line, v);
+    if (!n || !isfinite(deadline_s) || g_stop || g_io_error || !g_mode_known ||
+        g_mode != FW_READY || g_reason != FW_REASON_NONE || !(g_flags & 1))
+        return -1;
+    double now = rig_now_s();
+    if (now >= deadline_s)
+        return 1;
+    if (g_state_t < 0 || now - g_state_t > CFG_STATE_TIMEOUT_S)
+        return -1;
+    int result = uart_try_write_all(&g_uart, (const uint8_t *)line, n);
+    if (result < 0) {
+        g_io_error = 1;
+        g_need_frame_boundary = 1;
+        return -1;
+    }
+    if (result == 0 && rig_now_s() >= deadline_s)
+        return 2; /* 已完整写入，不能撤销；调用方终止控制并执行停止流程。 */
+    return result;
+}
+static void await_name(const char *name)
+{
+    snprintf(g_wait_name, sizeof g_wait_name, "%s", name);
+    g_reply_seen = 0;
+    g_reply_err = 0;
+    g_reply_value = 0;
+}
+int rig_send_vel(double v)
+{
+    char s[64];
+    /* 零速请求允许在未知模式或失效测量后用于停止；非零请求必须有新鲜小车测量。 */
+    if (v != 0. && (g_stop || g_io_error || !g_mode_known || g_mode != FW_READY ||
+                    g_reason != FW_REASON_NONE || !(g_flags & 1) || rig_state_age_s() < 0 ||
+                    rig_state_age_s() > CFG_STATE_TIMEOUT_S))
+        return -1;
+    return send_line(s, proto_format_vel(s, v));
+}
+int rig_send_simple(const char *cmd)
+{
+    char s[64];
+    if (!strcmp(cmd, "MARK LEFT"))
+        await_name("MARK_LEFT");
+    else if (!strcmp(cmd, "MARK RIGHT"))
+        await_name("MARK_RIGHT");
+    else if (!strcmp(cmd, "ENABLE"))
+        await_name("ENABLE");
+    else if (!strcmp(cmd, "RESET"))
+        await_name("RESET");
+    else if (!strcmp(cmd, "DISABLE"))
+        await_name("DISABLE");
+    return send_line(s, proto_format_simple(s, cmd));
+}
+int rig_send_config(const char *name, long value)
+{
+    char s[64];
+    await_name(name);
+    return send_line(s, proto_format_config(s, name, value));
+}
+int rig_open(const char *port, int baud)
+{
+    if (g_uart.fd >= 0)
+        uart_close(&g_uart);
+    g_stop = 0;
+    g_io_error = 0;
+    g_need_frame_boundary = 0;
+    g_fault_seen = 0;
+    g_flags = 0;
+    g_state_seq = g_mode_seq = 0;
+    g_state_t = -1.;
+    g_state_count = g_unknown_count = 0;
+    g_mode = FW_DISABLED;
+    g_reason = FW_REASON_NONE;
+    g_mode_known = 0;
+    g_x_um = g_theta_urad = g_vx_mm_s = g_vth_mrad_s = 0;
+    g_value_count = 0;
+    g_update_hook = NULL;
+    g_update_context = NULL;
+    await_name("");
+    proto_rx_init(&g_rx);
+    return uart_open(&g_uart, port, baud);
+}
 void rig_close(void)
 {
     uart_close(&g_uart);
 }
-
-/* ---- 行分发 ---- */
+static void cache_value(const char *name, int64_t value)
+{
+    size_t i = 0;
+    for (; i < g_value_count; i++)
+        if (!strcmp(g_values[i].name, name))
+            break;
+    if (i == g_value_count) {
+        if (i >= sizeof g_values / sizeof g_values[0])
+            return;
+        g_value_count++;
+    }
+    snprintf(g_values[i].name, sizeof g_values[i].name, "%s", name);
+    g_values[i].value = value;
+}
+int rig_get_config(const char *name, int64_t *value, double timeout_s)
+{
+    (void)timeout_s; /* 只读最近一次 refresh/configure 的回执缓存，不触发隐式I/O。 */
+    for (size_t i = 0; i < g_value_count; i++)
+        if (!strcmp(name, g_values[i].name)) {
+            if (value)
+                *value = g_values[i].value;
+            return 0;
+        }
+    return -1;
+}
 static void handle_line(const char *line, size_t len, void *user)
 {
     (void)len;
     (void)user;
     proto_msg_t m;
     if (proto_parse_line(line, &m) == PROTO_UNKNOWN) {
-        g_unknown_count++; /* 窗口统计用（state --secs）；解析层仍静默丢弃 */
+        g_unknown_count++;
+        if (!strncmp(line, "STATE", 5) || !strncmp(line, "MODE", 4) || !strcmp(line, "!OVERLONG"))
+            g_io_error = 2;
         return;
     }
     switch (m.type) {
     case PROTO_STATE:
+        g_flags = m.valid_flags;
         g_x_um = m.x_um;
         g_theta_urad = m.theta_urad;
         g_vx_mm_s = m.vx_mm_s;
         g_vth_mrad_s = m.vth_mrad_s;
         g_state_t = rig_now_s();
+        g_state_seq++;
         g_state_count++;
         break;
-    case PROTO_MODE: {
-        fw_mode_t prev = g_mode;
-        g_mode = m.mode;
-        g_mode_reason = m.reason;
-        g_mode_known = 1;
-        if (m.mode != prev || m.mode == FW_FAULT) {
+    case PROTO_MODE:
+        if (!g_mode_known || g_mode != m.mode || g_reason != m.reason)
             printf("[edge] MODE %s %s\n", proto_mode_name(m.mode), proto_reason_name(m.reason));
-        }
+        g_mode = m.mode;
+        g_reason = m.reason;
+        g_mode_known = 1;
+        g_mode_seq++;
+        if (m.mode == FW_FAULT)
+            g_fault_seen = 1;
         break;
-    }
     case PROTO_OK:
-        g_reply_err = 0;
-        g_reply_seq++;
-        printf("[edge] config OK %s = %ld\n", m.param, (long)m.value);
-        break;
     case PROTO_ERR:
-        g_reply_err = 1;
-        g_reply_seq++;
-        printf("[edge] config ERR %s (state rejects CONFIG?)\n", m.param);
+        if (m.type == PROTO_OK)
+            cache_value(m.param, m.value);
+        if (!g_reply_seen && g_wait_name[0] && !strcmp(g_wait_name, m.param)) {
+            g_reply_seen = 1;
+            g_reply_err = m.type == PROTO_ERR;
+            g_reply_value = m.value;
+        }
+        if (m.type == PROTO_OK)
+            printf("[edge] OK %s %lld\n", m.param, (long long)m.value);
+        else
+            printf("[edge] ERR %s\n", m.param);
+        break;
+    case PROTO_STEP_LOSS:
+        printf("[edge] STEP_LOSS event=%lld run=%lld device_us=%lld (record only)\n",
+               (long long)m.event_id, (long long)m.run_id, (long long)m.device_us);
         break;
     default:
         break;
     }
+    if (g_update_hook && (m.type == PROTO_STATE || m.type == PROTO_MODE || m.type == PROTO_OK))
+        g_update_hook(g_update_context);
 }
-
-void rig_pump(void)
+static int pump(int cleanup)
 {
-    uint8_t chunk[512];
-    for (;;) {
-        int n = uart_read(&g_uart, chunk, sizeof(chunk));
-        if (n <= 0) {
-            return;
+    uint8_t buf[512];
+    for (size_t bytes = 0; bytes < 4096;) {
+        int n = uart_read(&g_uart, buf, sizeof buf);
+        if (n < 0) {
+            g_io_error = 1;
+            return -1;
         }
-        proto_rx_feed(&g_rx, chunk, (size_t)n, handle_line, NULL);
+        if (n == 0)
+            return !cleanup && g_io_error ? -1 : 0;
+        bytes += (size_t)n;
+        proto_rx_feed(&g_rx, buf, (size_t)n, handle_line, NULL);
+        if (!cleanup && g_io_error)
+            return -1;
     }
+    return 1;
 }
-
-/* ---- 等待与运动流程 ---- */
-
+int rig_pump(void)
+{
+    return pump(0);
+}
+/* 发送控制面请求前读到空边界，避免用之前积压的回执满足新请求。 */
+static int drain(double deadline)
+{
+    int r;
+    do {
+        r = rig_pump();
+        if (r <= 0)
+            return r;
+        if (rig_now_s() >= deadline)
+            return -1;
+    } while (!g_stop);
+    return -1;
+}
 int rig_sync_mode(double timeout_s)
 {
-    if (rig_send_simple("QUERY") != 0) {
+    double end = rig_now_s() + timeout_s;
+    if (drain(end) != 0)
         return -1;
+    uint64_t seq = g_mode_seq;
+    if (rig_send_simple("QUERY") != 0)
+        return -1;
+    while (!g_stop && rig_now_s() < end) {
+        if (rig_pump() < 0)
+            return -1;
+        if (g_mode_seq != seq)
+            return 0;
+        nap_ms(1);
     }
-    double t0 = rig_now_s();
-    while (!g_mode_known && rig_now_s() - t0 < timeout_s) {
-        rig_pump();
-        nap_ms(5);
-    }
-    return g_mode_known ? 0 : -1;
+    return -1;
 }
-
 int rig_wait_state(double timeout_s)
 {
-    double t0 = rig_now_s();
-    while (g_state_t < 0.0 && rig_now_s() - t0 < timeout_s) {
-        rig_pump();
-        nap_ms(2);
-    }
-    return g_state_t >= 0.0 ? 0 : -1;
-}
-
-int rig_push_params(void)
-{
-    char buf[64];
-    for (int i = 0; i < CFG_FW_PARAM_COUNT; i++) {
-        size_t n = proto_format_config(buf, CFG_FW_PARAMS[i].name, CFG_FW_PARAMS[i].value);
-        if (send_line(buf, n) != 0) {
+    uint64_t seq = g_state_seq;
+    double end = rig_now_s() + timeout_s;
+    while (!g_stop && rig_now_s() < end) {
+        if (rig_pump() < 0)
             return -1;
-        }
-        nap_ms(10); /* 固件逐条回执，间隔 10 ms 防淹没 */
-        rig_pump();
-    }
-    return 0;
-}
-
-int rig_wait_mode(fw_mode_t target, double timeout_s)
-{
-    double t0 = rig_now_s();
-    while (!g_stop && rig_now_s() - t0 < timeout_s) {
-        rig_pump();
-        if (g_mode_known) {
-            if (g_mode == target) {
-                return 0;
-            }
-            if (g_mode == FW_FAULT && target != FW_FAULT) {
-                return -1; /* 等待目标模式期间故障 */
-            }
-        }
-        nap_ms(5);
-    }
-    return -1;
-}
-
-/* 标定 ENABLE 后把小车从端点移回行程中点（协议操作流程）。 */
-int rig_goto_center(double timeout_s)
-{
-    double t0 = rig_now_s();
-    int warned = 0;
-    while (!g_stop && rig_now_s() - t0 < timeout_s) {
-        rig_pump();
-        if (g_state_t < 0.0 || rig_now_s() - g_state_t > CFG_STATE_TIMEOUT_S) {
-            rig_send_vel(0.0);
-            continue;
-        }
-        if (!g_mode_known || g_mode != FW_READY) {
-            return -1;
-        }
-        double x_m = (double)g_x_um * 1e-6;
-        if (x_m < 0.005 && x_m > -0.005) {
-            rig_send_vel(0.0);
+        if (g_state_seq != seq)
             return 0;
-        }
-        double v = (x_m > 0.0 ? -1.0 : 1.0) * CFG_CENTER_VEL_MMS;
-        if ((x_m > CFG_TRACK_LIMIT_M || x_m < -CFG_TRACK_LIMIT_M) && !warned) {
-            warned = 1;
-            printf("[edge] WARNING: cart beyond soft limit (%.3f m), moving inward\n", x_m);
-        }
-        rig_send_vel(v);
-        nap_ms(5);
+        nap_ms(1);
     }
-    rig_send_vel(0.0);
     return -1;
 }
-
 int rig_wait_reply(double timeout_s)
 {
-    unsigned seq0 = g_reply_seq;
-    double t0 = rig_now_s();
-    while (g_reply_seq == seq0 && rig_now_s() - t0 < timeout_s) {
-        rig_pump();
+    double end = rig_now_s() + timeout_s;
+    while (!g_stop && rig_now_s() < end) {
+        if (rig_pump() < 0)
+            return -1;
+        if (g_reply_seen)
+            return g_reply_err ? 1 : 0;
+        nap_ms(1);
+    }
+    return -1;
+}
+int rig_configure(const char *name, long value, double timeout_s)
+{
+    double end = rig_now_s() + timeout_s;
+    if (drain(end) != 0 || rig_send_config(name, value) != 0)
+        return -1;
+    if (rig_wait_reply(end - rig_now_s()) != 0 || g_reply_value != value)
+        return -1;
+    return 0;
+}
+int rig_refresh_metadata(double timeout_s)
+{
+    static const char *required[] = {"CAL_STATE", "CAL_LENGTH_UM", "CAL_SAVED", "CAL_STORAGE",
+                                     "VEL_MAX",   "ACC_MAX",       "WDT_MS",    "X_MARGIN_UM"};
+    double end = rig_now_s() + timeout_s;
+    if (drain(end) != 0)
+        return -1;
+    g_value_count = 0;
+    if (rig_send_simple("CALIB?") != 0 || rig_send_simple("CONFIG?") != 0)
+        return -1;
+    while (!g_stop && rig_now_s() < end) {
+        if (rig_pump() < 0)
+            return -1;
+        size_t i;
+        for (i = 0; i < sizeof required / sizeof required[0]; i++)
+            if (rig_get_config(required[i], NULL, 0) != 0)
+                break;
+        if (i == sizeof required / sizeof required[0])
+            return 0;
+        nap_ms(1);
+    }
+    return -1;
+}
+int rig_wait_mode(fw_mode_t target, double timeout_s)
+{
+    uint64_t seq = g_mode_seq;
+    double end = rig_now_s() + timeout_s;
+    while (!g_stop && rig_now_s() < end) {
+        if (rig_pump() < 0)
+            return -1;
+        if (g_reply_seen && g_reply_err)
+            return -1;
+        if (g_mode_seq != seq) {
+            if (g_mode == target && g_reason == FW_REASON_NONE)
+                return 0;
+            if (g_mode == FW_FAULT)
+                return -1;
+        }
+        nap_ms(1);
+    }
+    return -1;
+}
+int rig_enable(double timeout_s)
+{
+    if (drain(rig_now_s() + timeout_s) != 0 || rig_send_simple("ENABLE") != 0)
+        return -1;
+    return rig_wait_mode(FW_READY, timeout_s);
+}
+int rig_stop_and_confirm(double timeout_s)
+{
+    double end = rig_now_s() + timeout_s;
+    /* 清理读边界不受停止标记或此前协议错误锁存阻挡。旧MODE不能证明本次停止。 */
+    int drained;
+    do {
+        drained = pump(1);
+    } while (drained == 1 && rig_now_s() < end);
+    if (drained != 0)
+        return -1;
+    uint64_t mode_seq = g_mode_seq, state_seq = g_state_seq;
+    double next_send = 0.;
+    int zero_observed = 0;
+    while (rig_now_s() < end) {
+        if (rig_now_s() >= next_send) {
+            (void)rig_send_vel(0.);
+            if (zero_observed)
+                (void)rig_send_simple("DISABLE");
+            (void)rig_send_simple("QUERY");
+            next_send = rig_now_s() + .02;
+        }
+        if (pump(1) < 0)
+            return -1;
+        if (g_mode_seq != mode_seq) {
+            if (g_mode == FW_DISABLED && g_reason == FW_REASON_NONE)
+                return 0;
+            if (g_mode == FW_FAULT)
+                return 1;
+        }
+        if (g_state_seq != state_seq && (g_flags & 1) && g_vx_mm_s == 0 && !zero_observed) {
+            zero_observed = 1;
+            next_send = 0.;
+        }
+        nap_ms(1);
+    }
+    return -1;
+}
+int rig_goto_center(double timeout_s)
+{
+    double end = rig_now_s() + timeout_s;
+    if (rig_sync_mode(1.) != 0)
+        return -1;
+    while (!g_stop && rig_now_s() < end) {
+        int p = rig_pump();
+        if (p < 0)
+            break;
+        if (p > 0) {
+            nap_ms(1);
+            continue;
+        }
+        if (!g_mode_known || g_mode != FW_READY || !(g_flags & 1) || rig_state_age_s() < 0 ||
+            rig_state_age_s() > CFG_STATE_TIMEOUT_S)
+            break;
+        if (g_x_um > -5000 && g_x_um < 5000) {
+            if (rig_send_vel(0.) != 0)
+                return -1;
+            /* 持续零速并等待小车速度回报，不能把请求发送等同停稳。 */
+            uint64_t seq = g_state_seq;
+            while (!g_stop && rig_now_s() < end) {
+                if (rig_pump() < 0)
+                    return -1;
+                if (g_mode != FW_READY || !(g_flags & 1))
+                    return -1;
+                if (g_state_seq != seq && g_vx_mm_s == 0)
+                    return 0;
+                if (rig_send_vel(0.) != 0)
+                    return -1;
+                nap_ms(5);
+            }
+            return -1;
+        }
+        if (rig_send_vel(g_x_um > 0 ? -CFG_CENTER_VEL_MMS : CFG_CENTER_VEL_MMS) != 0)
+            break;
         nap_ms(5);
     }
-    return g_reply_seq != seq0 ? g_reply_err : -1;
+    (void)rig_send_vel(0.);
+    return -1;
 }
-
-/* ---- 快照访问 ---- */
-
 fw_mode_t rig_mode(int *known, fw_reason_t *reason)
 {
-    if (known != NULL) {
+    if (known)
         *known = g_mode_known;
-    }
-    if (reason != NULL) {
-        *reason = g_mode_reason;
-    }
+    if (reason)
+        *reason = g_reason;
     return g_mode;
 }
-
-void rig_telemetry(int64_t *x_um, int64_t *theta_urad, int64_t *vx_mm_s,
-                   int64_t *vth_mrad_s)
+void rig_telemetry(int64_t *x, int64_t *th, int64_t *vx, int64_t *w)
 {
-    if (x_um != NULL) {
-        *x_um = g_x_um;
-    }
-    if (theta_urad != NULL) {
-        *theta_urad = g_theta_urad;
-    }
-    if (vx_mm_s != NULL) {
-        *vx_mm_s = g_vx_mm_s;
-    }
-    if (vth_mrad_s != NULL) {
-        *vth_mrad_s = g_vth_mrad_s;
-    }
+    if (x)
+        *x = g_x_um;
+    if (th)
+        *th = g_theta_urad;
+    if (vx)
+        *vx = g_vx_mm_s;
+    if (w)
+        *w = g_vth_mrad_s;
 }
-
 double rig_state_age_s(void)
 {
-    return g_state_t < 0.0 ? -1.0 : rig_now_s() - g_state_t;
+    return g_state_t < 0 ? -1. : rig_now_s() - g_state_t;
 }
-
 void rig_print_state(void)
 {
-    int64_t x, th, vx, vth;
-    rig_telemetry(&x, &th, &vx, &vth);
-    int known;
-    fw_mode_t m = rig_mode(&known, NULL);
-    double age = rig_state_age_s();
-    if (age < 0.0) {
-        printf("no STATE received yet\n");
+    if (g_state_t < 0) {
+        puts("[edge] no STATE received");
         return;
     }
-    /* 原始整数保留（协议口径），并附人类可读换算（µm→mm、µrad→°） */
-    printf("x=%+lld um (x = %+.2f mm)  theta=%+lld urad (theta = %+.2f deg)"
-           "  vx=%+lld mm/s  vth=%+lld mrad/s  age=%.0f ms  mode=%s\n",
-           (long long)x, x / 1000.0, (long long)th, th / 17453.3,
-           (long long)vx, (long long)vth, age * 1000.0,
-           known ? proto_mode_name(m) : "unknown");
+    printf("STATE flags=%u x=%lld um theta=%lld urad vx=%lld mm/s omega=%lld mrad/s age=%.1f ms\n",
+           g_flags, (long long)g_x_um, (long long)g_theta_urad, (long long)g_vx_mm_s,
+           (long long)g_vth_mrad_s, rig_state_age_s() * 1000.);
 }
-
 void rig_window_reset(void)
 {
-    g_state_count = 0;
-    g_unknown_count = 0;
+    g_state_count = g_unknown_count = 0;
 }
-
 long rig_state_count(void)
 {
     return g_state_count;
 }
-
 long rig_unknown_count(void)
 {
     return g_unknown_count;

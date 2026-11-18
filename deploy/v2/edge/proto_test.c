@@ -24,20 +24,19 @@ static void cb(const char *line, size_t len, void *user)
 static void test_state_valid(void)
 {
     proto_msg_t m;
-    assert(proto_parse_line("STATE -265000 -3141593 -1500 -10000", &m) == PROTO_STATE);
-    assert(m.x_um == -265000 && m.theta_urad == -3141593 && m.vx_mm_s == -1500 && m.vth_mrad_s == -10000);
-    assert(proto_parse_line("STATE 0 0 0 0", &m) == PROTO_STATE);
+    assert(proto_parse_line("STATE 3 -265000 -3141592 -1500 -10000", &m) == PROTO_STATE);
+    assert(m.x_um == -265000 && m.theta_urad == -3141592 && m.vx_mm_s == -1500 && m.vth_mrad_s == -10000);
+    assert(proto_parse_line("STATE 3 0 0 0 0", &m) == PROTO_STATE);
     assert(m.x_um == 0 && m.theta_urad == 0 && m.vx_mm_s == 0 && m.vth_mrad_s == 0);
-    /* 多空格是合法分隔（parse_int/parse_word 均跳过前导空格） */
-    assert(proto_parse_line("STATE  123  456 78 9", &m) == PROTO_STATE);
-    assert(m.x_um == 123 && m.vth_mrad_s == 9);
+    /* 正式 STATE 必须使用单空格分隔。 */
+    assert(proto_parse_line("STATE  3 123 456 78 9", &m) == PROTO_UNKNOWN);
 }
 
 static void test_state_invalid(void)
 {
     proto_msg_t m;
     assert(proto_parse_line("STATE 1 2 3", &m) == PROTO_UNKNOWN);        /* 缺字段 */
-    assert(proto_parse_line("STATE 1 2 3 4 5", &m) == PROTO_UNKNOWN);    /* 多余字段 */
+    assert(proto_parse_line("STATE 3 1 2 3 4 5", &m) == PROTO_UNKNOWN);    /* 多余字段 */
     assert(proto_parse_line("STATE 1 2 x 4", &m) == PROTO_UNKNOWN);      /* 非数字 */
     assert(proto_parse_line("STATE", &m) == PROTO_UNKNOWN);              /* 只有头 */
 }
