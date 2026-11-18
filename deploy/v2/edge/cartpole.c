@@ -32,12 +32,12 @@ static size_t g_value_count;
 static void (*g_update_hook)(void *);
 static void *g_update_context;
 
-void rig_set_update_hook(void (*hook)(void *), void *context)
+void cartpole_set_update_hook(void (*hook)(void *), void *context)
 {
     g_update_hook = hook;
     g_update_context = context;
 }
-double rig_state_received_at_s(void)
+double cartpole_state_received_at_s(void)
 {
     return g_state_t;
 }
@@ -47,33 +47,33 @@ static void nap_ms(int ms)
     struct timespec t = {0, (long)ms * 1000000};
     nanosleep(&t, NULL);
 }
-double rig_now_s(void)
+double cartpole_now_s(void)
 {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
     return t.tv_sec + t.tv_nsec * 1e-9;
 }
-void rig_request_stop(void)
+void cartpole_request_stop(void)
 {
     g_stop = 1;
 }
-int rig_stop_requested(void)
+int cartpole_stop_requested(void)
 {
     return g_stop != 0;
 }
-int rig_io_error(void)
+int cartpole_io_error(void)
 {
     return g_io_error;
 }
-int rig_fault_seen(void)
+int cartpole_fault_seen(void)
 {
     return g_fault_seen;
 }
-int rig_valid_flags(void)
+int cartpole_valid_flags(void)
 {
     return (int)g_flags;
 }
-uint64_t rig_state_sequence(void)
+uint64_t cartpole_state_sequence(void)
 {
     return g_state_seq;
 }
@@ -93,14 +93,14 @@ static int send_line(const char *s, size_t n)
     }
     return 0;
 }
-int rig_try_send_vel(double v, double deadline_s)
+int cartpole_try_send_vel(double v, double deadline_s)
 {
     char line[64];
     size_t n = proto_format_vel(line, v);
     if (!n || !isfinite(deadline_s) || g_stop || g_io_error || !g_mode_known ||
         g_mode != FW_READY || g_reason != FW_REASON_NONE || !(g_flags & 1))
         return -1;
-    double now = rig_now_s();
+    double now = cartpole_now_s();
     if (now >= deadline_s)
         return 1;
     if (g_state_t < 0 || now - g_state_t > CFG_STATE_TIMEOUT_S)
@@ -111,7 +111,7 @@ int rig_try_send_vel(double v, double deadline_s)
         g_need_frame_boundary = 1;
         return -1;
     }
-    if (result == 0 && rig_now_s() >= deadline_s)
+    if (result == 0 && cartpole_now_s() >= deadline_s)
         return 2; /* 已完整写入，不能撤销；调用方终止控制并执行停止流程。 */
     return result;
 }
@@ -122,17 +122,17 @@ static void await_name(const char *name)
     g_reply_err = 0;
     g_reply_value = 0;
 }
-int rig_send_vel(double v)
+int cartpole_send_vel(double v)
 {
     char s[64];
     /* 零速请求允许在未知模式或失效测量后用于停止；非零请求必须有新鲜小车测量。 */
     if (v != 0. && (g_stop || g_io_error || !g_mode_known || g_mode != FW_READY ||
-                    g_reason != FW_REASON_NONE || !(g_flags & 1) || rig_state_age_s() < 0 ||
-                    rig_state_age_s() > CFG_STATE_TIMEOUT_S))
+                    g_reason != FW_REASON_NONE || !(g_flags & 1) || cartpole_state_age_s() < 0 ||
+                    cartpole_state_age_s() > CFG_STATE_TIMEOUT_S))
         return -1;
     return send_line(s, proto_format_vel(s, v));
 }
-int rig_send_simple(const char *cmd)
+int cartpole_send_simple(const char *cmd)
 {
     char s[64];
     if (!strcmp(cmd, "MARK LEFT"))
@@ -147,13 +147,13 @@ int rig_send_simple(const char *cmd)
         await_name("DISABLE");
     return send_line(s, proto_format_simple(s, cmd));
 }
-int rig_send_config(const char *name, long value)
+int cartpole_send_config(const char *name, long value)
 {
     char s[64];
     await_name(name);
     return send_line(s, proto_format_config(s, name, value));
 }
-int rig_open(const char *port, int baud)
+int cartpole_open(const char *port, int baud)
 {
     if (g_uart.fd >= 0)
         uart_close(&g_uart);
@@ -176,7 +176,7 @@ int rig_open(const char *port, int baud)
     proto_rx_init(&g_rx);
     return uart_open(&g_uart, port, baud);
 }
-void rig_close(void)
+void cartpole_close(void)
 {
     uart_close(&g_uart);
 }
@@ -194,7 +194,7 @@ static void cache_value(const char *name, int64_t value)
     snprintf(g_values[i].name, sizeof g_values[i].name, "%s", name);
     g_values[i].value = value;
 }
-int rig_get_config(const char *name, int64_t *value, double timeout_s)
+int cartpole_get_config(const char *name, int64_t *value, double timeout_s)
 {
     (void)timeout_s; /* 只读最近一次 refresh/configure 的回执缓存，不触发隐式I/O。 */
     for (size_t i = 0; i < g_value_count; i++)
@@ -223,7 +223,7 @@ static void handle_line(const char *line, size_t len, void *user)
         g_theta_urad = m.theta_urad;
         g_vx_mm_s = m.vx_mm_s;
         g_vth_mrad_s = m.vth_mrad_s;
-        g_state_t = rig_now_s();
+        g_state_t = cartpole_now_s();
         g_state_seq++;
         g_state_count++;
         break;
@@ -279,7 +279,7 @@ static int pump(int cleanup)
     }
     return 1;
 }
-int rig_pump(void)
+int cartpole_pump(void)
 {
     return pump(0);
 }
@@ -288,24 +288,24 @@ static int drain(double deadline)
 {
     int r;
     do {
-        r = rig_pump();
+        r = cartpole_pump();
         if (r <= 0)
             return r;
-        if (rig_now_s() >= deadline)
+        if (cartpole_now_s() >= deadline)
             return -1;
     } while (!g_stop);
     return -1;
 }
-int rig_sync_mode(double timeout_s)
+int cartpole_sync_mode(double timeout_s)
 {
-    double end = rig_now_s() + timeout_s;
+    double end = cartpole_now_s() + timeout_s;
     if (drain(end) != 0)
         return -1;
     uint64_t seq = g_mode_seq;
-    if (rig_send_simple("QUERY") != 0)
+    if (cartpole_send_simple("QUERY") != 0)
         return -1;
-    while (!g_stop && rig_now_s() < end) {
-        if (rig_pump() < 0)
+    while (!g_stop && cartpole_now_s() < end) {
+        if (cartpole_pump() < 0)
             return -1;
         if (g_mode_seq != seq)
             return 0;
@@ -313,12 +313,12 @@ int rig_sync_mode(double timeout_s)
     }
     return -1;
 }
-int rig_wait_state(double timeout_s)
+int cartpole_wait_state(double timeout_s)
 {
     uint64_t seq = g_state_seq;
-    double end = rig_now_s() + timeout_s;
-    while (!g_stop && rig_now_s() < end) {
-        if (rig_pump() < 0)
+    double end = cartpole_now_s() + timeout_s;
+    while (!g_stop && cartpole_now_s() < end) {
+        if (cartpole_pump() < 0)
             return -1;
         if (g_state_seq != seq)
             return 0;
@@ -326,11 +326,11 @@ int rig_wait_state(double timeout_s)
     }
     return -1;
 }
-int rig_wait_reply(double timeout_s)
+int cartpole_wait_reply(double timeout_s)
 {
-    double end = rig_now_s() + timeout_s;
-    while (!g_stop && rig_now_s() < end) {
-        if (rig_pump() < 0)
+    double end = cartpole_now_s() + timeout_s;
+    while (!g_stop && cartpole_now_s() < end) {
+        if (cartpole_pump() < 0)
             return -1;
         if (g_reply_seen)
             return g_reply_err ? 1 : 0;
@@ -338,31 +338,31 @@ int rig_wait_reply(double timeout_s)
     }
     return -1;
 }
-int rig_configure(const char *name, long value, double timeout_s)
+int cartpole_configure(const char *name, long value, double timeout_s)
 {
-    double end = rig_now_s() + timeout_s;
-    if (drain(end) != 0 || rig_send_config(name, value) != 0)
+    double end = cartpole_now_s() + timeout_s;
+    if (drain(end) != 0 || cartpole_send_config(name, value) != 0)
         return -1;
-    if (rig_wait_reply(end - rig_now_s()) != 0 || g_reply_value != value)
+    if (cartpole_wait_reply(end - cartpole_now_s()) != 0 || g_reply_value != value)
         return -1;
     return 0;
 }
-int rig_refresh_metadata(double timeout_s)
+int cartpole_refresh_metadata(double timeout_s)
 {
     static const char *required[] = {"CAL_STATE", "CAL_LENGTH_UM", "CAL_SAVED", "CAL_STORAGE",
                                      "VEL_MAX",   "ACC_MAX",       "WDT_MS",    "X_MARGIN_UM"};
-    double end = rig_now_s() + timeout_s;
+    double end = cartpole_now_s() + timeout_s;
     if (drain(end) != 0)
         return -1;
     g_value_count = 0;
-    if (rig_send_simple("CALIB?") != 0 || rig_send_simple("CONFIG?") != 0)
+    if (cartpole_send_simple("CALIB?") != 0 || cartpole_send_simple("CONFIG?") != 0)
         return -1;
-    while (!g_stop && rig_now_s() < end) {
-        if (rig_pump() < 0)
+    while (!g_stop && cartpole_now_s() < end) {
+        if (cartpole_pump() < 0)
             return -1;
         size_t i;
         for (i = 0; i < sizeof required / sizeof required[0]; i++)
-            if (rig_get_config(required[i], NULL, 0) != 0)
+            if (cartpole_get_config(required[i], NULL, 0) != 0)
                 break;
         if (i == sizeof required / sizeof required[0])
             return 0;
@@ -370,12 +370,12 @@ int rig_refresh_metadata(double timeout_s)
     }
     return -1;
 }
-int rig_wait_mode(fw_mode_t target, double timeout_s)
+int cartpole_wait_mode(fw_mode_t target, double timeout_s)
 {
     uint64_t seq = g_mode_seq;
-    double end = rig_now_s() + timeout_s;
-    while (!g_stop && rig_now_s() < end) {
-        if (rig_pump() < 0)
+    double end = cartpole_now_s() + timeout_s;
+    while (!g_stop && cartpole_now_s() < end) {
+        if (cartpole_pump() < 0)
             return -1;
         if (g_reply_seen && g_reply_err)
             return -1;
@@ -389,32 +389,32 @@ int rig_wait_mode(fw_mode_t target, double timeout_s)
     }
     return -1;
 }
-int rig_enable(double timeout_s)
+int cartpole_enable(double timeout_s)
 {
-    if (drain(rig_now_s() + timeout_s) != 0 || rig_send_simple("ENABLE") != 0)
+    if (drain(cartpole_now_s() + timeout_s) != 0 || cartpole_send_simple("ENABLE") != 0)
         return -1;
-    return rig_wait_mode(FW_READY, timeout_s);
+    return cartpole_wait_mode(FW_READY, timeout_s);
 }
-int rig_stop_and_confirm(double timeout_s)
+int cartpole_stop_and_confirm(double timeout_s)
 {
-    double end = rig_now_s() + timeout_s;
+    double end = cartpole_now_s() + timeout_s;
     /* 清理读边界不受停止标记或此前协议错误锁存阻挡。旧MODE不能证明本次停止。 */
     int drained;
     do {
         drained = pump(1);
-    } while (drained == 1 && rig_now_s() < end);
+    } while (drained == 1 && cartpole_now_s() < end);
     if (drained != 0)
         return -1;
     uint64_t mode_seq = g_mode_seq, state_seq = g_state_seq;
     double next_send = 0.;
     int zero_observed = 0;
-    while (rig_now_s() < end) {
-        if (rig_now_s() >= next_send) {
-            (void)rig_send_vel(0.);
+    while (cartpole_now_s() < end) {
+        if (cartpole_now_s() >= next_send) {
+            (void)cartpole_send_vel(0.);
             if (zero_observed)
-                (void)rig_send_simple("DISABLE");
-            (void)rig_send_simple("QUERY");
-            next_send = rig_now_s() + .02;
+                (void)cartpole_send_simple("DISABLE");
+            (void)cartpole_send_simple("QUERY");
+            next_send = cartpole_now_s() + .02;
         }
         if (pump(1) < 0)
             return -1;
@@ -432,48 +432,48 @@ int rig_stop_and_confirm(double timeout_s)
     }
     return -1;
 }
-int rig_goto_center(double timeout_s)
+int cartpole_goto_center(double timeout_s)
 {
-    double end = rig_now_s() + timeout_s;
-    if (rig_sync_mode(1.) != 0)
+    double end = cartpole_now_s() + timeout_s;
+    if (cartpole_sync_mode(1.) != 0)
         return -1;
-    while (!g_stop && rig_now_s() < end) {
-        int p = rig_pump();
+    while (!g_stop && cartpole_now_s() < end) {
+        int p = cartpole_pump();
         if (p < 0)
             break;
         if (p > 0) {
             nap_ms(1);
             continue;
         }
-        if (!g_mode_known || g_mode != FW_READY || !(g_flags & 1) || rig_state_age_s() < 0 ||
-            rig_state_age_s() > CFG_STATE_TIMEOUT_S)
+        if (!g_mode_known || g_mode != FW_READY || !(g_flags & 1) || cartpole_state_age_s() < 0 ||
+            cartpole_state_age_s() > CFG_STATE_TIMEOUT_S)
             break;
         if (g_x_um > -5000 && g_x_um < 5000) {
-            if (rig_send_vel(0.) != 0)
+            if (cartpole_send_vel(0.) != 0)
                 return -1;
             /* 持续零速并等待小车速度回报，不能把请求发送等同停稳。 */
             uint64_t seq = g_state_seq;
-            while (!g_stop && rig_now_s() < end) {
-                if (rig_pump() < 0)
+            while (!g_stop && cartpole_now_s() < end) {
+                if (cartpole_pump() < 0)
                     return -1;
                 if (g_mode != FW_READY || !(g_flags & 1))
                     return -1;
                 if (g_state_seq != seq && g_vx_mm_s == 0)
                     return 0;
-                if (rig_send_vel(0.) != 0)
+                if (cartpole_send_vel(0.) != 0)
                     return -1;
                 nap_ms(5);
             }
             return -1;
         }
-        if (rig_send_vel(g_x_um > 0 ? -CFG_CENTER_VEL_MMS : CFG_CENTER_VEL_MMS) != 0)
+        if (cartpole_send_vel(g_x_um > 0 ? -CFG_CENTER_VEL_MMS : CFG_CENTER_VEL_MMS) != 0)
             break;
         nap_ms(5);
     }
-    (void)rig_send_vel(0.);
+    (void)cartpole_send_vel(0.);
     return -1;
 }
-fw_mode_t rig_mode(int *known, fw_reason_t *reason)
+fw_mode_t cartpole_mode(int *known, fw_reason_t *reason)
 {
     if (known)
         *known = g_mode_known;
@@ -481,7 +481,7 @@ fw_mode_t rig_mode(int *known, fw_reason_t *reason)
         *reason = g_reason;
     return g_mode;
 }
-void rig_telemetry(int64_t *x, int64_t *th, int64_t *vx, int64_t *w)
+void cartpole_telemetry(int64_t *x, int64_t *th, int64_t *vx, int64_t *w)
 {
     if (x)
         *x = g_x_um;
@@ -492,11 +492,11 @@ void rig_telemetry(int64_t *x, int64_t *th, int64_t *vx, int64_t *w)
     if (w)
         *w = g_vth_mrad_s;
 }
-double rig_state_age_s(void)
+double cartpole_state_age_s(void)
 {
-    return g_state_t < 0 ? -1. : rig_now_s() - g_state_t;
+    return g_state_t < 0 ? -1. : cartpole_now_s() - g_state_t;
 }
-void rig_print_state(void)
+void cartpole_print_state(void)
 {
     if (g_state_t < 0) {
         puts("[edge] no STATE received");
@@ -504,17 +504,17 @@ void rig_print_state(void)
     }
     printf("STATE flags=%u x=%lld um theta=%lld urad vx=%lld mm/s omega=%lld mrad/s age=%.1f ms\n",
            g_flags, (long long)g_x_um, (long long)g_theta_urad, (long long)g_vx_mm_s,
-           (long long)g_vth_mrad_s, rig_state_age_s() * 1000.);
+           (long long)g_vth_mrad_s, cartpole_state_age_s() * 1000.);
 }
-void rig_window_reset(void)
+void cartpole_window_reset(void)
 {
     g_state_count = g_unknown_count = 0;
 }
-long rig_state_count(void)
+long cartpole_state_count(void)
 {
     return g_state_count;
 }
-long rig_unknown_count(void)
+long cartpole_unknown_count(void)
 {
     return g_unknown_count;
 }

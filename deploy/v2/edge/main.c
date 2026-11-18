@@ -19,7 +19,7 @@ static void print_usage(const char *prog);
 static void on_signal(int sig)
 {
     (void)sig;
-    rig_request_stop();
+    cartpole_request_stop();
 }
 
 static void nap_ms(int ms)
@@ -43,14 +43,14 @@ static control_input current_input(int pump_result)
 {
     int known;
     fw_reason_t reason;
-    fw_mode_t mode=rig_mode(&known,&reason);
+    fw_mode_t mode=cartpole_mode(&known,&reason);
     int64_t theta;
-    rig_telemetry(NULL,&theta,NULL,NULL);
+    cartpole_telemetry(NULL,&theta,NULL,NULL);
     control_input in={0};
-    in.ready=known && mode==FW_READY && reason==FW_REASON_NONE && !rig_fault_seen();
-    in.flags=rig_valid_flags(); in.age_s=rig_state_age_s();
+    in.ready=known && mode==FW_READY && reason==FW_REASON_NONE && !cartpole_fault_seen();
+    in.flags=cartpole_valid_flags(); in.age_s=cartpole_state_age_s();
     in.theta_rad=(double)theta*1e-6;
-    in.backlog=pump_result>0; in.io_error=pump_result<0 || rig_io_error();
+    in.backlog=pump_result>0; in.io_error=pump_result<0 || cartpole_io_error();
     return in;
 }
 
@@ -61,7 +61,7 @@ static int active_metadata_matches(const edge_package *package, int64_t length, 
                               (int64_t)package->acceleration_mm_s2,100,margin};
     for (size_t i=0;i<sizeof(expected)/sizeof(expected[0]);i++) {
         int64_t value;
-        if (rig_get_config(names[i],&value,0)!=0 || value!=expected[i]) return 0;
+        if (cartpole_get_config(names[i],&value,0)!=0 || value!=expected[i]) return 0;
     }
     return 1;
 }
@@ -77,12 +77,12 @@ static void observe_update(void *context)
     control_runtime *runtime=context;
     control_input in=current_input(0);
     if (!active_metadata_matches(runtime->package,runtime->length,runtime->margin)) in.io_error=1;
-    (void)control_observe(&runtime->gate,&in,rig_state_received_at_s());
+    (void)control_observe(&runtime->gate,&in,cartpole_state_received_at_s());
 }
 
 static int control_end(int result)
 {
-    rig_set_update_hook(NULL,NULL);
+    cartpole_set_update_hook(NULL,NULL);
     return result;
 }
 
@@ -90,16 +90,16 @@ static int control_loop(const edge_package *package, int64_t length, int64_t mar
 {
     const double period=1.0/package->control_hz;
     const double track_limit_m=(length*.5-margin)*1e-6;
-    double next=rig_now_s();
+    double next=cartpole_now_s();
     control_runtime runtime={.package=package,.length=length,.margin=margin};
-    runtime.gate.has_time=1; runtime.gate.last_observed_at=rig_state_received_at_s();
-    rig_set_update_hook(observe_update,&runtime);
+    runtime.gate.has_time=1; runtime.gate.last_observed_at=cartpole_state_received_at_s();
+    cartpole_set_update_hook(observe_update,&runtime);
     uint64_t consumed=0;
     printf("[edge] %.0f Hz; scale %d mm/s; limit %d mm/s; angle pause 20/resume 18 deg\n",
            package->control_hz,package->action_scale_mm_s,package->velocity_limit_mm_s);
-    while (!rig_stop_requested()) {
+    while (!cartpole_stop_requested()) {
         sleep_to(next);
-        int pumped=rig_pump();
+        int pumped=cartpole_pump();
         control_input in=current_input(pumped);
         if (!active_metadata_matches(package,length,margin)) return control_end(-1);
         control_decision decision=control_check(&runtime.gate,&in);
@@ -107,13 +107,13 @@ static int control_loop(const edge_package *package, int64_t length, int64_t mar
             fprintf(stderr,"[edge] control stopped: mode, measurement or transport unavailable\n");
             return control_end(-1);
         }
-        uint64_t seq=rig_state_sequence();
+        uint64_t seq=cartpole_state_sequence();
         if (decision==CONTROL_DRIVE && seq!=consumed) {
             int64_t x,theta,vx,w;
-            rig_telemetry(&x,&theta,&vx,&w);
+            cartpole_telemetry(&x,&theta,&vx,&w);
             float obs[4]={(float)(x*1e-6),(float)(package->angle_sign*theta*1e-6),
                           (float)(vx*1e-3),(float)(package->angle_sign*w*1e-3)};
-            double sample_at=rig_state_received_at_s();
+            double sample_at=cartpole_state_received_at_s();
             unsigned long long generation=runtime.gate.generation;
             float action;
             consumed=seq;
@@ -121,23 +121,23 @@ static int control_loop(const edge_package *package, int64_t length, int64_t mar
                 fprintf(stderr,"[edge] inference failed\n"); return control_end(-1);
             }
             /* 推理期间发生的模式/测量变化优先于动作；过期候选不补发。 */
-            pumped=rig_pump(); in=current_input(pumped);
+            pumped=cartpole_pump(); in=current_input(pumped);
             if (!active_metadata_matches(package,length,margin)) return control_end(-1);
             decision=control_check(&runtime.gate,&in);
             if (decision==CONTROL_STOP) return control_end(-1);
-            if (decision==CONTROL_DRIVE && generation==runtime.gate.generation && !rig_stop_requested() && rig_now_s()-sample_at<=.020) {
-                rig_telemetry(&x,NULL,NULL,NULL);
+            if (decision==CONTROL_DRIVE && generation==runtime.gate.generation && !cartpole_stop_requested() && cartpole_now_s()-sample_at<=.020) {
+                cartpole_telemetry(&x,NULL,NULL,NULL);
                 double velocity=control_velocity(action,package->action_scale_mm_s,
                                                  package->velocity_limit_mm_s,x*1e-6,track_limit_m);
                 if (!isfinite(velocity)) return control_end(-1);
-                int sent=rig_try_send_vel(velocity,sample_at+.020);
+                int sent=cartpole_try_send_vel(velocity,sample_at+.020);
                 if (sent<0 || sent==2) {
                     fprintf(stderr,"[edge] %s\n",sent==2 ? "write completed after candidate deadline" : "velocity write failed");
                     return control_end(-1);
                 }
             }
         }
-        next=control_next_tick(next,rig_now_s(),period);
+        next=control_next_tick(next,cartpole_now_s(),period);
     }
     return control_end(0);
 }
@@ -163,20 +163,20 @@ static int run_policy(int argc, char **argv, int first)
     if (!model[0]) { fprintf(stderr,"[edge] package has no %s model; no fallback\n",backend_name); return 1; }
     if (policy_init(backend,model)!=0) return 1;
     fprintf(stderr,"[edge] backend=%s\n",backend_name);
-    if (rig_sync_mode(1.0)!=0 || rig_refresh_metadata(1.0)!=0 || rig_wait_state(1.0)!=0) {
+    if (cartpole_sync_mode(1.0)!=0 || cartpole_refresh_metadata(1.0)!=0 || cartpole_wait_state(1.0)!=0) {
         fprintf(stderr,"[edge] preflight readback unavailable\n"); return 1;
     }
     int64_t cal,length,saved,storage,velocity,acceleration,wdt,margin;
-    if (rig_get_config("CAL_STATE",&cal,1)!=0 || rig_get_config("CAL_LENGTH_UM",&length,1)!=0 ||
-        rig_get_config("CAL_SAVED",&saved,1)!=0 || rig_get_config("CAL_STORAGE",&storage,1)!=0 ||
-        rig_get_config("VEL_MAX",&velocity,1)!=0 || rig_get_config("ACC_MAX",&acceleration,1)!=0 ||
-        rig_get_config("WDT_MS",&wdt,1)!=0 || rig_get_config("X_MARGIN_UM",&margin,1)!=0) return 1;
+    if (cartpole_get_config("CAL_STATE",&cal,1)!=0 || cartpole_get_config("CAL_LENGTH_UM",&length,1)!=0 ||
+        cartpole_get_config("CAL_SAVED",&saved,1)!=0 || cartpole_get_config("CAL_STORAGE",&storage,1)!=0 ||
+        cartpole_get_config("VEL_MAX",&velocity,1)!=0 || cartpole_get_config("ACC_MAX",&acceleration,1)!=0 ||
+        cartpole_get_config("WDT_MS",&wdt,1)!=0 || cartpole_get_config("X_MARGIN_UM",&margin,1)!=0) return 1;
     if (cal!=2 || saved!=1 || storage!=0 || length<100000 || length>1000000 || margin<0 || margin>=length/2 ||
         velocity!=package.velocity_limit_mm_s || acceleration!=package.acceleration_mm_s2 || wdt!=100) {
         fprintf(stderr,"[edge] preflight: calibration/config mismatch; requires VEL_MAX=%d ACC_MAX=%d WDT_MS=100\n",
                 package.velocity_limit_mm_s,package.acceleration_mm_s2); return 1;
     }
-    control_input in=current_input(rig_pump());
+    control_input in=current_input(cartpole_pump());
     if (!in.ready || in.flags!=3 || in.age_s<0 || in.age_s>.020 || in.io_error || in.backlog) {
         fprintf(stderr,"[edge] preflight requires READY NONE and fresh valid STATE\n"); return 1;
     }
@@ -189,12 +189,12 @@ static int run_policy(int argc, char **argv, int first)
 
 static int run_console(void)
 {
-    if (rig_sync_mode(1.0) != 0) {
+    if (cartpole_sync_mode(1.0) != 0) {
         fprintf(stderr, "[edge] no MODE reply (QUERY timed out) - firmware not running?\n");
         return 1;
     }
     int known;
-    fw_mode_t mode = rig_mode(&known, NULL);
+    fw_mode_t mode = cartpole_mode(&known, NULL);
     printf("[edge] firmware mode: %s\n", proto_mode_name(mode));
 
     g_motion_session=1;
@@ -205,11 +205,11 @@ static int run_console(void)
 
 static int oneshot_state(void)
 {
-    if (rig_wait_state(1.0) != 0) {
+    if (cartpole_wait_state(1.0) != 0) {
         fprintf(stderr, "[edge] no STATE stream\n");
         return 1;
     }
-    rig_print_state();
+    cartpole_print_state();
     return 0;
 }
 
@@ -217,33 +217,33 @@ static int oneshot_state(void)
  * 只统计主机采集到的有效快照，不宣称覆盖每个设备样本或验证设备采样频率。 */
 static int oneshot_state_window(double secs)
 {
-    if (rig_wait_state(1.0) != 0) {
+    if (cartpole_wait_state(1.0) != 0) {
         fprintf(stderr, "[edge] no STATE stream\n");
         return 1;
     }
-    rig_window_reset();
+    cartpole_window_reset();
     int64_t x, th, vx, vth;
     int64_t xmin = INT64_MAX, xmax = INT64_MIN;
     int64_t thmin = INT64_MAX, thmax = INT64_MIN;
-    double t0 = rig_now_s();
-    while (!rig_stop_requested() && rig_now_s() - t0 < secs) {
-        if (rig_pump()<0) return 1;
-        rig_telemetry(&x, &th, &vx, &vth);
-        if (rig_valid_flags() & 1) {
+    double t0 = cartpole_now_s();
+    while (!cartpole_stop_requested() && cartpole_now_s() - t0 < secs) {
+        if (cartpole_pump()<0) return 1;
+        cartpole_telemetry(&x, &th, &vx, &vth);
+        if (cartpole_valid_flags() & 1) {
             if (x < xmin) xmin=x;
             if (x > xmax) xmax=x;
         }
-        if (rig_valid_flags() & 2) {
+        if (cartpole_valid_flags() & 2) {
             if (th < thmin) thmin=th;
             if (th > thmax) thmax=th;
         }
         nap_ms(20);
     }
-    double dt = rig_now_s() - t0;
-    double rate = dt > 0.0 ? (double)rig_state_count() / dt : 0.0;
-    long unknown = rig_unknown_count();
+    double dt = cartpole_now_s() - t0;
+    double rate = dt > 0.0 ? (double)cartpole_state_count() / dt : 0.0;
+    long unknown = cartpole_unknown_count();
     printf("[edge] window %.1f s: %ld STATE lines -> %.1f Hz (observed)\n",
-           dt, rig_state_count(), rate);
+           dt, cartpole_state_count(), rate);
     printf("[edge] unknown lines: %ld (require 0)\n", unknown);
     if (xmin!=INT64_MAX) printf("[edge] sampled x range [%lld, %lld] um  (x = %.2f .. %.2f mm)\n",
            (long long)xmin, (long long)xmax, xmin / 1000.0, xmax / 1000.0);
@@ -251,47 +251,47 @@ static int oneshot_state_window(double secs)
     if (thmin!=INT64_MAX) printf("[edge] sampled theta range [%lld, %lld] urad  (theta = %.2f .. %.2f deg)\n",
            (long long)thmin, (long long)thmax, thmin / 17453.3, thmax / 17453.3);
     else puts("[edge] pole samples unavailable");
-    return (rig_state_count()>0 && unknown == 0) ? 0 : 1;
+    return (cartpole_state_count()>0 && unknown == 0) ? 0 : 1;
 }
 
 /* 看门狗断流验证（与 host 工具 wdt-test 同流程）：以 200 mm/s 持续喂狗
  * 1 s，随后停止发送观察 1 s——固件看门狗应减速停车但模式保持 READY。 */
 static int oneshot_wdt_test(void)
 {
-    if (rig_sync_mode(1.0) != 0) {
+    if (cartpole_sync_mode(1.0) != 0) {
         fprintf(stderr, "[edge] no MODE reply (QUERY timed out)\n");
         return 1;
     }
     int known;
     fw_reason_t reason;
-    fw_mode_t mode = rig_mode(&known, &reason);
+    fw_mode_t mode = cartpole_mode(&known, &reason);
     if (!known || mode != FW_READY) {
         fprintf(stderr, "[edge] wdt-test requires READY (current %s)\n",
                 known ? proto_mode_name(mode) : "unknown");
         return 1;
     }
-    if (rig_wait_state(CFG_STATE_TIMEOUT_S) != 0) {
+    if (cartpole_wait_state(CFG_STATE_TIMEOUT_S) != 0) {
         fprintf(stderr, "[edge] no STATE stream\n");
         return 1;
     }
     g_motion_session=1;
-    double t0 = rig_now_s();
-    while (!rig_stop_requested() && rig_now_s() - t0 < 1.0) {
-        if (rig_send_vel(200.0)!=0) return 1;
-        rig_pump();
+    double t0 = cartpole_now_s();
+    while (!cartpole_stop_requested() && cartpole_now_s() - t0 < 1.0) {
+        if (cartpole_send_vel(200.0)!=0) return 1;
+        cartpole_pump();
         nap_ms(5);
     }
     printf("[edge] feeding stopped, observing 1 s ...\n");
-    t0 = rig_now_s();
-    while (!rig_stop_requested() && rig_now_s() - t0 < 1.0) {
-        rig_pump();
+    t0 = cartpole_now_s();
+    while (!cartpole_stop_requested() && cartpole_now_s() - t0 < 1.0) {
+        cartpole_pump();
         nap_ms(20);
     }
-    if (rig_sync_mode(1.0) != 0) {
+    if (cartpole_sync_mode(1.0) != 0) {
         fprintf(stderr, "[edge] QUERY timed out after watchdog window\n");
         return 1;
     }
-    mode = rig_mode(&known, &reason);
+    mode = cartpole_mode(&known, &reason);
     printf("[edge] QUERY -> %s %s (expect READY NONE: watchdog is a transient guard)\n",
            known ? proto_mode_name(mode) : "unknown",
            known ? proto_reason_name(reason) : "-");
@@ -300,12 +300,12 @@ static int oneshot_wdt_test(void)
 
 static int oneshot_vel(double v_mm_s, double hold_s)
 {
-    if (rig_sync_mode(1.0) != 0) {
+    if (cartpole_sync_mode(1.0) != 0) {
         fprintf(stderr, "[edge] no MODE reply (QUERY timed out) - firmware not running?\n");
         return 1;
     }
     int known;
-    fw_mode_t mode = rig_mode(&known, NULL);
+    fw_mode_t mode = cartpole_mode(&known, NULL);
     if (!known || mode != FW_READY) {
         fprintf(stderr, "[edge] VEL requires READY (current %s)\n",
                 known ? proto_mode_name(mode) : "unknown");
@@ -313,35 +313,35 @@ static int oneshot_vel(double v_mm_s, double hold_s)
     }
     /* 保持前先等到 STATE 流就位：从未收到与已过期是不同状态，不能把
      * 起始竞态当成流过期立即中止。 */
-    if (rig_wait_state(CFG_STATE_TIMEOUT_S) != 0) {
+    if (cartpole_wait_state(CFG_STATE_TIMEOUT_S) != 0) {
         fprintf(stderr, "[edge] no STATE stream\n");
         return 1;
     }
     g_motion_session=1;
-    if (!(rig_valid_flags() & 1) || rig_send_vel(v_mm_s) != 0) {
+    if (!(cartpole_valid_flags() & 1) || cartpole_send_vel(v_mm_s) != 0) {
         fprintf(stderr, "[edge] invalid velocity value\n");
         return 1;
     }
-    double t0 = rig_now_s();
+    double t0 = cartpole_now_s();
     int rc = 0;
-    while (!rig_stop_requested() && rig_now_s() - t0 < hold_s) {
-        rig_pump();
-        mode = rig_mode(&known, NULL);
-        if (!known || mode != FW_READY || rig_fault_seen() || rig_io_error() || !(rig_valid_flags() & 1)) {
+    while (!cartpole_stop_requested() && cartpole_now_s() - t0 < hold_s) {
+        cartpole_pump();
+        mode = cartpole_mode(&known, NULL);
+        if (!known || mode != FW_READY || cartpole_fault_seen() || cartpole_io_error() || !(cartpole_valid_flags() & 1)) {
             fprintf(stderr, "[edge] firmware left READY during hold\n");
             rc = 1;
             break;
         }
-        double age = rig_state_age_s();
+        double age = cartpole_state_age_s();
         if (age < 0.0 || age > CFG_STATE_TIMEOUT_S) {
             fprintf(stderr, "[edge] WARNING: STATE stream stale during hold\n");
             rc = 1;
             break;
         }
-        if (rig_send_vel(v_mm_s)!=0) { rc=1; break; } /* 喂固件看门狗 */
+        if (cartpole_send_vel(v_mm_s)!=0) { rc=1; break; } /* 喂固件看门狗 */
         nap_ms(20);
     }
-    if (rig_send_vel(0.0)!=0) rc=1;
+    if (cartpole_send_vel(0.0)!=0) rc=1;
     return rc;
 }
 
@@ -529,7 +529,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    if (rig_open(port, CFG_BAUD) != 0) {
+    if (cartpole_open(port, CFG_BAUD) != 0) {
         fprintf(stderr, "[edge] cannot open %s\n", port);
         return 1;
     }
@@ -539,11 +539,11 @@ int main(int argc, char **argv)
     /* 会话形态（run/console）退出即停机；一次性命令不干预电机状态，
      * 其中 vel 自身管理起停。 */
     if (g_motion_session) {
-        int stopped=rig_stop_and_confirm(2.0);
+        int stopped=cartpole_stop_and_confirm(2.0);
         if (stopped==0) printf("[edge] stop: DISABLED confirmed\n");
         else { fprintf(stderr,"[edge] stop: %s\n",stopped==1 ? "FAULT retained; DISABLED not confirmed" : "DISABLED not confirmed"); rc=1; }
     }
     policy_deinit(); /* 未初始化时是幂等空操作 */
-    rig_close();
+    cartpole_close();
     return rc;
 }
