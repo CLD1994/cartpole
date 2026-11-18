@@ -19,7 +19,7 @@ set(CMAKE_SKIP_RPATH ON) # 板上库经 LD_LIBRARY_PATH/默认路径解析，产
 
 # SVP ACL 运行时（CV610 SDK）：svp_acl_init / svp_acl_rt_set_device 等运行时
 # 入口不在推理库内，libcartpole_npu.a 的全部未解析符号都来自它。
-# libsvp_acl.so 自身只登记 libc.so，附加库必须显式链接，否则出现未定义符号。
+# SDK 可提供交叉链接用 stub；板端使用匹配运行库。附加库随 SDK 版本配置。
 set(SVP_ACL_ROOT "" CACHE PATH "SVP ACL 目录，包含 include/acl")
 set(SVP_ACL_LIBRARY_DIR "" CACHE PATH "与目标 ABI 配套的 SVP ACL 库目录")
 set(SVP_ACL_EXTRA_LIBRARIES "" CACHE STRING "目标 SDK 要求的附加链接库")
@@ -46,6 +46,7 @@ target_include_directories(cartpole_edge PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/npu/include
     ${SVP_ACL_ROOT}/include
 )
+target_link_directories(cartpole_edge PRIVATE "${SVP_ACL_LIBRARY_DIR}")
 target_link_libraries(cartpole_edge PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/npu/lib/libcartpole_npu.a
     ${SVP_ACL_LIBRARY}

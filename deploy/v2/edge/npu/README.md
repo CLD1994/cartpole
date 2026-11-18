@@ -28,9 +28,15 @@
 `svp_acl_init` / `svp_acl_rt_set_device` 等运行时符号不在本库内，由 CV610 SDK
 的 `svp_acl` 库提供（头文件为 `<acl/svp_acl.h>`，错误码类型 `svp_acl_error`，
 0 表示成功；与 `policy.c` 主机侧最小声明逐项核验一致）。`libsvp_acl.so` 自身
-只登记 `libc.so`，链接时必须显式带入附加库，否则出现未定义符号：完整集合为
-`svp_acl` + `ss_mpi_sysmem` + `protobuf-c` + `securec` + `ot_osal` + `ot_irq`
-+ `ot_sys` + `ot_base`。
+只登记 `libc.so`，需显式链接其依赖。已验证 Tools_V1.0.1 的 musl ARM
+`stub` 目录配合工具链 sysroot 可完成链接：`svp_acl`、`ss_mpi_sysmem`、
+`protobuf-c`、`securec`。这些 vendor stub 是交叉链接接口，不是测试替身；
+不能将它们复制上板替换运行库。板端仍使用其配套 SDK 运行库。
+
+`build.sh` 默认上述集合，可通过 `SVP_ACL_EXTRA_LIBRARIES`（分号分隔）覆盖。
+其他 SDK 交接包可能还需要 `ot_osal;ot_irq;ot_sys;ot_base`，应以其符号依赖为准，
+不强制所有 SDK 都链接八个库。成功交叉链接仅验证构建侧符号与 ARM ABI；
+板端还需核对动态库版本、musl 时间函数 ABI、驱动及实际模型加载。
 
 交叉工具链（`arm-v01c02-linux-musleabi-gcc`，GCC 10.3 musl 1.2.3，Cortex-A7
 softfp）与 SDK 头文件、musl ARM 库由 CV610 侧项目的交叉编译交接包提供。
