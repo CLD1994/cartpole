@@ -1,4 +1,4 @@
-#include "cartpole_internal.h"
+#include "cartpole_control.h"
 #include "control.h"
 #include <math.h>
 #include <stddef.h>
@@ -8,6 +8,10 @@ typedef struct {
     control_gate gate;
     cartpole_result_t stop_reason;
     const cartpole_controller_options_t *options;
+    cartpole_infer_t infer;
+    void *infer_context;
+    cartpole_measurement_t inference_measurement;
+    float normalized_action;
 } controller_t;
 static int configuration_matches(cartpole_t *c, const cartpole_configuration_t *expected)
 {
@@ -92,36 +96,20 @@ static cartpole_result_t stopped_reason(controller_t *controller, const control_
     cartpole_result_t reason = gate_reason(controller->cartpole, input, snapshot);
     return reason == CARTPOLE_OK ? CARTPOLE_SESSION_UNAVAILABLE : reason;
 }
-static cartpole_result_t finish_controller(cartpole_t *c, cartpole_result_t result)
+static int evaluate_policy(void *context)
 {
-    cartpole_set_control_observer(c, NULL, NULL);
-    cartpole_loop_end(c);
-    return result;
+    controller_t *c = context;
+    return c->infer(&c->inference_measurement, &c->normalized_action, c->infer_context);
 }
-cartpole_result_t cartpole_run_controller(cartpole_t *c,
-                                          const cartpole_controller_options_t *options,
-                                          cartpole_infer_t infer, void *context)
+static cartpole_result_t run_controller(cartpole_t *c, void *context)
 {
-    if (!options || !infer || !isfinite(options->control_hz) ||
-        (options->control_hz != 400 && options->control_hz != 500) ||
-        !isfinite(options->action_scale_mm_s) || options->action_scale_mm_s <= 0 ||
-        !isfinite(options->velocity_limit_mm_s) || options->velocity_limit_mm_s <= 0 ||
-        !options->expected_configuration.complete ||
-        options->expected_configuration.track_length_um <= 0 ||
-        options->expected_configuration.track_margin_um < 0 ||
-        options->expected_configuration.track_margin_um >=
-            options->expected_configuration.track_length_um * .5)
-        return CARTPOLE_INVALID_ARGUMENT;
-    if (cartpole_loop_begin(c) != 0)
-        return CARTPOLE_CALLBACK_ERROR;
+    controller_t *state = context;
+    const cartpole_controller_options_t *options = state->options;
     if (!cartpole_get_session_state(c).connection_open) {
-        cartpole_loop_end(c);
         return CARTPOLE_SESSION_UNAVAILABLE;
     }
-    controller_t controller = {.cartpole = c, .options = options};
-    controller.gate.has_time = 1;
-    controller.gate.last_observed_at = cartpole_get_latest_measurement(c).received_host_monotonic_s;
-    cartpole_set_control_observer(c, observe_control, &controller);
+    state->gate.has_time = 1;
+    state->gate.last_observed_at = cartpole_get_latest_measurement(c).received_host_monotonic_s;
     double next = cartpole_get_monotonic_time_s(c), period = 1. / options->control_hz;
     double track_limit = (options->expected_configuration.track_length_um * .5 -
                           options->expected_configuration.track_margin_um) *
@@ -133,53 +121,68 @@ cartpole_result_t cartpole_run_controller(cartpole_t *c,
             break;
         int received = cartpole_receive(c);
         if (received < 0)
-            return finish_controller(c, cartpole_get_stream_result(c));
+            return cartpole_get_stream_result(c);
         control_snapshot_t snapshot = current_state(c);
         control_input input = control_state(c, &snapshot, received);
         if (!configuration_matches(c, &options->expected_configuration))
-            return finish_controller(c, CARTPOLE_CONFIGURATION_CHANGED);
-        control_decision decision = control_check(&controller.gate, &input);
+            return CARTPOLE_CONFIGURATION_CHANGED;
+        control_decision decision = control_check(&state->gate, &input);
         if (decision == CONTROL_STOP)
-            return finish_controller(c, stopped_reason(&controller, &input, &snapshot));
+            return stopped_reason(state, &input, &snapshot);
         cartpole_measurement_t measurement = cartpole_get_latest_measurement(c);
         if (decision == CONTROL_DRIVE && measurement.measurement_id != consumed) {
-            float normalized_action = NAN;
+            state->normalized_action = NAN;
+            state->inference_measurement = measurement;
             consumed = measurement.measurement_id;
-            unsigned long long generation = controller.gate.generation;
-            if (cartpole_callback_enter(c) != 0)
-                return finish_controller(c, CARTPOLE_CALLBACK_ERROR);
-            int inferred = infer(&measurement, &normalized_action, context);
-            int violation = cartpole_callback_leave(c);
-            if (inferred || violation || !isfinite(normalized_action))
-                return finish_controller(c, CARTPOLE_CALLBACK_ERROR);
+            unsigned long long generation = state->gate.generation;
+            if (cartpole_evaluate_measurement(c, evaluate_policy, state) != CARTPOLE_OK ||
+                !isfinite(state->normalized_action))
+                return CARTPOLE_CALLBACK_ERROR;
             received = cartpole_receive(c);
             if (received < 0)
-                return finish_controller(c, cartpole_get_stream_result(c));
+                return cartpole_get_stream_result(c);
             snapshot = current_state(c);
             input = control_state(c, &snapshot, received);
             if (!configuration_matches(c, &options->expected_configuration))
-                return finish_controller(c, CARTPOLE_CONFIGURATION_CHANGED);
-            decision = control_check(&controller.gate, &input);
+                return CARTPOLE_CONFIGURATION_CHANGED;
+            decision = control_check(&state->gate, &input);
             if (decision == CONTROL_STOP)
-                return finish_controller(c, stopped_reason(&controller, &input, &snapshot));
-            if (decision == CONTROL_DRIVE && generation == controller.gate.generation &&
+                return stopped_reason(state, &input, &snapshot);
+            if (decision == CONTROL_DRIVE && generation == state->gate.generation &&
                 !cartpole_is_stop_requested(c) && cartpole_calculate_measurement_age_s(c, measurement) <= .020) {
                 double velocity = control_calculate_velocity(
-                    normalized_action, options->action_scale_mm_s, options->velocity_limit_mm_s,
+                    state->normalized_action, options->action_scale_mm_s, options->velocity_limit_mm_s,
                     snapshot.measurement.cart_position_m, track_limit);
                 if (!isfinite(velocity))
-                    return finish_controller(c, CARTPOLE_CALLBACK_ERROR);
+                    return CARTPOLE_CALLBACK_ERROR;
                 cartpole_send_result_t sent = cartpole_send_velocity(
                     c, velocity, measurement.received_host_monotonic_s + .020, 1);
                 if (sent == CARTPOLE_SEND_LATE)
-                    return finish_controller(c, CARTPOLE_TIMEOUT);
+                    return CARTPOLE_TIMEOUT;
                 if (sent == CARTPOLE_SEND_ERROR)
-                    return finish_controller(c, cartpole_get_stream_result(c) == CARTPOLE_OK
+                    return cartpole_get_stream_result(c) == CARTPOLE_OK
                                                     ? CARTPOLE_SESSION_UNAVAILABLE
-                                                    : cartpole_get_stream_result(c));
+                                                    : cartpole_get_stream_result(c);
             }
         }
         next = control_calculate_next_tick(next, cartpole_get_monotonic_time_s(c), period);
     }
-    return finish_controller(c, CARTPOLE_CANCELLED);
+    return CARTPOLE_CANCELLED;
+}
+
+cartpole_result_t cartpole_run_controller(cartpole_t *c,
+    const cartpole_controller_options_t *options, cartpole_infer_t infer, void *context)
+{
+    if (!options || !infer || !isfinite(options->control_hz) ||
+        (options->control_hz != 400 && options->control_hz != 500) ||
+        !isfinite(options->action_scale_mm_s) || options->action_scale_mm_s <= 0 ||
+        !isfinite(options->velocity_limit_mm_s) || options->velocity_limit_mm_s <= 0 ||
+        !options->expected_configuration.complete ||
+        options->expected_configuration.track_length_um <= 0 ||
+        options->expected_configuration.track_margin_um < 0 ||
+        options->expected_configuration.track_margin_um >=
+            options->expected_configuration.track_length_um * .5)
+        return CARTPOLE_INVALID_ARGUMENT;
+    controller_t state = {.cartpole = c, .options = options, .infer = infer, .infer_context = context};
+    return cartpole_execute_operation(c, run_controller, observe_control, &state);
 }

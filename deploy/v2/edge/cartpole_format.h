@@ -2,8 +2,44 @@
 #define EDGE_CARTPOLE_FORMAT_H
 #include "cartpole.h"
 
+/* Stable display tokens shared by formatters and their callers. */
+#define CARTPOLE_TEXT_OK "OK"
+#define CARTPOLE_TEXT_CANCELLED "CANCELLED"
+#define CARTPOLE_TEXT_TIMEOUT "TIMEOUT"
+#define CARTPOLE_TEXT_TRANSPORT_ERROR "TRANSPORT_ERROR"
+#define CARTPOLE_TEXT_PROTOCOL_ERROR "PROTOCOL_ERROR"
+#define CARTPOLE_TEXT_REJECTED "REJECTED"
+#define CARTPOLE_TEXT_FAULT "FAULT"
+#define CARTPOLE_TEXT_REPLY_MISMATCH "REPLY_MISMATCH"
+#define CARTPOLE_TEXT_INVALID_ARGUMENT "INVALID_ARGUMENT"
+#define CARTPOLE_TEXT_CALLBACK_ERROR "CALLBACK_ERROR"
+#define CARTPOLE_TEXT_MEASUREMENT_UNAVAILABLE "MEASUREMENT_UNAVAILABLE"
+#define CARTPOLE_TEXT_SESSION_UNAVAILABLE "SESSION_UNAVAILABLE"
+#define CARTPOLE_TEXT_CONTROL_DEADLINE "CONTROL_DEADLINE"
+#define CARTPOLE_TEXT_CONFIGURATION_CHANGED "CONFIGURATION_CHANGED"
+#define CARTPOLE_TEXT_UNKNOWN_RESULT "UNKNOWN_RESULT"
+#define CARTPOLE_TEXT_READY "READY"
+#define CARTPOLE_TEXT_DISABLED "DISABLED"
+#define CARTPOLE_TEXT_UNKNOWN "UNKNOWN"
+#define CARTPOLE_TEXT_NONE "NONE"
+#define CARTPOLE_TEXT_STEP_LOSS "STEP_LOSS"
+#define CARTPOLE_TEXT_AS5600 "AS5600"
+#define CARTPOLE_TEXT_MT6835 "MT6835"
+
 /* 枚举的展示文本；未知值返回稳定的 UNKNOWN 文本，不进行设备访问。 */
 const char *cartpole_mode_to_string(cartpole_mode_t);
 const char *cartpole_reason_to_string(cartpole_reason_t);
 const char *cartpole_result_to_string(cartpole_result_t);
+#define CARTPOLE_TEXT_VEL_MAX "VEL_MAX"
+#define CARTPOLE_TEXT_ACC_MAX "ACC_MAX"
+#define CARTPOLE_TEXT_WDT_MS "WDT_MS"
+#define CARTPOLE_TEXT_X_MARGIN_UM "X_MARGIN_UM"
+#define CARTPOLE_TEXT_POLE_ZERO_URAD "POLE_ZERO_URAD"
+#define CARTPOLE_TEXT_POLE_INV "POLE_INV"
+#define CARTPOLE_TEXT_X_INV "X_INV"
+#define CARTPOLE_TEXT_STEP_LOSS_UM "STEP_LOSS_UM"
+
+/* 配置名称用于 CLI 展示/输入及协议映射。非法枚举返回NULL，解析失败返回-1且不改输出。 */
+const char *cartpole_setting_to_string(cartpole_setting_t);
+int cartpole_parse_setting(const char *, cartpole_setting_t *);
 #endif

@@ -18,6 +18,9 @@ import time
 import tty
 import unittest
 
+sys.path.insert(0, str(Path(__file__).parents[2]))
+from cli_report import parse_state_output, ModeEvent, StepLossEvent
+
 BINARY = os.environ.get("EDGE_TEST_BINARY")
 if __name__ == "__main__":
     BINARY = str(Path(sys.argv.pop(1)).resolve())
@@ -129,19 +132,27 @@ class CommandTests(unittest.TestCase):
             result=subprocess.run([BINARY,"--port",fw.path,"console"],input="vel 10"+" "*300+"\nquery\nquit\n",
                                   capture_output=True,text=True,timeout=5)
             self.assertEqual(result.returncode,0,result.stderr)
+            self.assertIn("? line too long", result.stdout)
             self.assertEqual(fw.commands[:fw.commands.index("VEL 0")].count("QUERY"),2)
             self.assertFalse(any(c.startswith("VEL ") and float(c.split()[1])!=0 for c in fw.commands))
 
-    def test_backend_required_and_missing_model_no_fallback(self):
+    def test_backend_must_be_explicit_and_supported(self):
+        for backend in (None, "bad"):
+            with self.subTest(backend=backend), tempfile.TemporaryDirectory() as tmp, Firmware() as fw:
+                args = ["run", "--package", package(tmp)]
+                if backend is not None:
+                    args += ["--backend", backend]
+                result = fw.run(*args)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("run requires --backend cpu|npu", result.stderr)
+                self.assertEqual(fw.commands, [])
+
+    def test_missing_cpu_model_does_not_fall_back_to_npu(self):
         with tempfile.TemporaryDirectory() as tmp, Firmware() as fw:
-            manifest=package(tmp)
-            for args in [("run","--package",manifest),
-                         ("run","--backend","bad","--package",manifest),
-                         ("run","--backend","cpu","--package",manifest)]:
-                result=fw.run(*args)
-                self.assertNotEqual(result.returncode,0)
-                self.assertFalse(any(c.startswith("VEL ") for c in fw.commands))
-            self.assertIn("no cpu model; no fallback",result.stderr)
+            result = fw.run("run", "--backend", "cpu", "--package", package(tmp))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("no cpu model; no fallback", result.stderr)
+            self.assertEqual(fw.commands, [])
 
     def start_run(self, fw, tmp):
         process = subprocess.Popen([BINARY, "--port", fw.path, "run", "--backend", "npu", "--package", package(tmp)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -264,24 +275,53 @@ class CommandTests(unittest.TestCase):
         with Firmware() as fw:
             result = fw.run("state", "--secs", "0.06")
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("STATE lines", result.stdout)
+            report = parse_state_output(result.stdout).report
+            self.assertGreater(report.received_state_count, 0)
+            self.assertGreater(report.observed_hz, 0)
+            self.assertEqual(report.unknown_line_count, 0)
+            self.assertEqual(report.cart_range_um, (123, 123))
+            self.assertEqual(report.pole_range_urad, (0, 0))
             self.assertNotIn("usage:", result.stderr)
+
+    def test_state_sampling_accepts_real_async_mode_and_step_loss_events(self):
+        with Firmware() as fw:
+            process = subprocess.Popen([BINARY, '--port', fw.path, 'state', '--secs', '0.3'],
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            self.addCleanup(lambda: self.finish(process))
+            # 在采样区间重复送达，避免用启动时序猜测 UART 是否已打开。
+            for _ in range(5):
+                time.sleep(.03)
+                fw.injections.put('MODE READY NONE\nEVENT STEP_LOSS 12 34 5678')
+            stdout, stderr = process.communicate(timeout=3)
+            self.assertEqual(process.returncode, 0, stderr)
+            parsed = parse_state_output(stdout)
+            self.assertIn(ModeEvent('READY', 'NONE'), parsed.events)
+            self.assertIn(StepLossEvent(12, 34, 5678), parsed.events)
+            self.assertGreater(parsed.report.received_state_count, 0)
+            self.assertEqual(parsed.report.cart_range_um, (123, 123))
+            self.assertFalse(any(command.startswith('VEL ') for command in fw.commands))
 
     def test_state_pole_invalid_not_displayed_as_valid_zero_angle(self):
         with Firmware(flags=1) as fw:
             result = fw.run("state", "--secs", "0.06")
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("123", result.stdout)
+            report = parse_state_output(result.stdout).report
+            self.assertEqual(report.cart_range_um, (123, 123))
+            self.assertIsNone(report.pole_range_urad)
             self.assertIn("pole samples unavailable", result.stdout)
             self.assertNotIn("sampled theta range", result.stdout)
 
     def test_state_without_stream_fails(self):
         with Firmware(stream=False) as fw:
-            self.assertNotEqual(fw.run("state", "--secs", "0.01").returncode, 0)
+            result = fw.run("state", "--secs", "0.01")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("STATE: TIMEOUT", result.stderr)
+            self.assertFalse(any(c.startswith("VEL ") for c in fw.commands))
 
     def test_invalid_command_does_not_open_port(self):
         result = subprocess.run([BINARY, "--port", "/definitely/not/a/device", "bogus"], capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
+        self.assertIn("usage:", result.stderr)
         self.assertNotIn("cannot open", result.stderr)
 
     def test_vel_exit_confirms_disabled(self):
@@ -291,11 +331,16 @@ class CommandTests(unittest.TestCase):
             self.assertIn("VEL 0", fw.commands)
             self.assertIn("DISABLE", fw.commands)
             self.assertEqual(fw.mode, "DISABLED")
+            moving = [i for i, c in enumerate(fw.commands) if c.startswith("VEL ") and float(c.split()[1]) != 0]
+            self.assertTrue(moving)
+            zero = fw.commands.index("VEL 0", moving[-1] + 1)
+            self.assertLess(zero, fw.commands.index("DISABLE"))
 
     def test_vel_exit_missing_disabled_is_failure(self):
         with Firmware(acknowledge_stop=False) as fw:
             result = fw.run("vel", "10", "--hold", "0.03")
             self.assertNotEqual(result.returncode, 0)
+            self.assertIn("DISABLED not confirmed", result.stderr)
             self.assertIn("DISABLE", fw.commands)
 
     def test_run_mismatch_emits_no_velocity_or_configuration(self):

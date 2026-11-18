@@ -1,6 +1,7 @@
-#include "cartpole_internal.h"
+#include "cartpole_control_internal.h"
 #include "config.h"
 #include <math.h>
+#include <stddef.h>
 
 typedef struct {
     cartpole_t *cartpole;
@@ -33,10 +34,11 @@ static int hold_tick(double elapsed, cartpole_tick_action_t *action, void *conte
     action->velocity_mm_s = hold->velocity;
     return 0;
 }
-cartpole_result_t cartpole_hold_velocity(cartpole_t *c, double velocity, double duration)
+typedef struct { double velocity, duration; } hold_request_t;
+static cartpole_result_t hold_velocity(cartpole_t *c, void *context)
 {
-    if (!isfinite(velocity) || fabs(velocity) > 1.0e9 || !isfinite(duration) || duration <= 0)
-        return CARTPOLE_INVALID_ARGUMENT;
+    const hold_request_t *request = context;
+    double velocity = request->velocity, duration = request->duration;
     cartpole_result_t preflight = cartpole_query_mode(c, 1.);
     if (preflight != CARTPOLE_OK)
         return preflight;
@@ -44,7 +46,7 @@ cartpole_result_t cartpole_hold_velocity(cartpole_t *c, double velocity, double 
     if (preflight != CARTPOLE_OK)
         return preflight;
     hold_t hold = {.cartpole = c, .velocity = velocity};
-    cartpole_result_t result = cartpole_run_loop(c, .020, duration, hold_tick, &hold);
+    cartpole_result_t result = cartpole_control_run_schedule(c, .020, duration, hold_tick, &hold);
     if (cartpole_send_velocity(c, 0., cartpole_get_monotonic_time_s(c) + .020, 0) !=
             CARTPOLE_SEND_COMPLETE &&
         result == CARTPOLE_OK)
@@ -54,16 +56,12 @@ cartpole_result_t cartpole_hold_velocity(cartpole_t *c, double velocity, double 
         result = hold.rejected;
     return result;
 }
-cartpole_result_t cartpole_move_to_center(cartpole_t *c, double timeout_s)
+static cartpole_result_t move_to_center(cartpole_t *c, void *context)
 {
-    if (!isfinite(timeout_s) || timeout_s <= 0)
-        return CARTPOLE_INVALID_ARGUMENT;
-    if (cartpole_loop_begin(c) != 0)
-        return CARTPOLE_CALLBACK_ERROR;
+    double timeout_s = *(double *)context;
     double end = cartpole_get_monotonic_time_s(c) + timeout_s;
     cartpole_result_t result = cartpole_query_mode(c, timeout_s);
     if (result != CARTPOLE_OK) {
-        cartpole_loop_end(c);
         return result;
     }
     int zero_sent = 0;
@@ -116,6 +114,19 @@ cartpole_result_t cartpole_move_to_center(cartpole_t *c, double timeout_s)
         result = CARTPOLE_CANCELLED;
     if (result != CARTPOLE_OK)
         (void)cartpole_send_velocity(c, 0., cartpole_get_monotonic_time_s(c) + .020, 0);
-    cartpole_loop_end(c);
     return result;
+}
+
+cartpole_result_t cartpole_move_to_center(cartpole_t *c, double timeout_s)
+{
+    if (!isfinite(timeout_s) || timeout_s <= 0) return CARTPOLE_INVALID_ARGUMENT;
+    return cartpole_execute_operation(c, move_to_center, NULL, &timeout_s);
+}
+
+cartpole_result_t cartpole_hold_velocity(cartpole_t *c, double velocity, double duration)
+{
+    if (!isfinite(velocity) || fabs(velocity) > 1.0e9 || !isfinite(duration) || duration <= 0)
+        return CARTPOLE_INVALID_ARGUMENT;
+    hold_request_t request = {velocity, duration};
+    return cartpole_execute_operation(c, hold_velocity, NULL, &request);
 }

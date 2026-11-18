@@ -15,8 +15,8 @@
 #include <unistd.h>
 
 #include "cartpole.h"
+#include "cartpole_control.h"
 #include "config.h"
-#include "serial_cartpole.h"
 
 #define CONSOLE_LINE_MAX 128
 #define DUMP_WINDOW_S 0.5 /* CONFIG? dump 的应答收集窗口 */
@@ -327,14 +327,14 @@ int console_exec(cartpole_t *c, const console_req_t *req)
         char operation[32];
         snprintf(operation, sizeof operation, "CONFIG %s", req->name);
         cartpole_setting_t setting;
-        if (serial_cartpole_parse_setting(req->name, &setting) != 0) {
+        if (cartpole_parse_setting(req->name, &setting) != 0) {
             fprintf(stderr, "[edge] unsupported setting %s\n", req->name);
             return -1;
         }
         int rc =
             console_transaction_result(operation, cartpole_configure(c, setting, req->value, 1.0));
         if (rc == 0)
-            printf("[edge] %s = %ld\n", serial_cartpole_setting_to_string(setting), req->value);
+            printf("[edge] %s = %ld\n", cartpole_setting_to_string(setting), req->value);
         return rc;
     }
     case CONSOLE_CMD_RESET: {

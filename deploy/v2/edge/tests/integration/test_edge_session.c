@@ -1,6 +1,10 @@
-#include "cartpole_internal.h"
+/* 最小集成边界：公开 cartpole 业务接口 -> serial_cartpole -> proto。
+ * UART 字节流和时钟为替身，不使用真实串口。适配器专属读写场景通过
+ * 公开 cartpole_device_t 契约执行，控制器/事务场景通过业务 API 执行。 */
+#include "cartpole.h"
+#include "cartpole_control.h"
 #include "serial_cartpole.h"
-#include "uart.h"
+#include "../support/fake_uart.h"
 #include <assert.h>
 #include <math.h>
 #include <stdio.h>
@@ -13,10 +17,15 @@ _Static_assert(sizeof(((serial_cartpole_statistics_t *)0)->unknown_received_line
                "unknown count stays 64-bit");
 static cartpole_t *device;
 static serial_cartpole_t *serial;
-static cartpole_runtime_t runtime;
-static char input[16384];
-static size_t used;
-static int reads, broken, write_fail;
+static cartpole_clock_t test_clock;
+static fake_uart_t *transport;
+#define used (transport->pending)
+#define reads (transport->reads)
+#define broken (transport->read_error)
+static int write_fail;
+static int respond(fake_uart_t *, const uint8_t *, size_t);
+static int write_command(fake_uart_t *, const uint8_t *, size_t);
+static void before_read(fake_uart_t *);
 static const char *query_reply, *enable_reply, *disable_reply, *config_reply, *mark_reply,
     *reset_reply;
 static int zero_state = 1;
@@ -52,15 +61,20 @@ static void close_test(void)
 static int open_test(void)
 {
     close_test();
-    cartpole_clock_t clock = {fake_now, fake_sleep, NULL};
-    assert(cartpole_runtime_init(&runtime, &clock) == 0);
-    serial = serial_cartpole_open("fake", 460800, &runtime);
+    fake_uart_reset();
+    transport = fake_uart_port(0);
+    transport->write = write_command;
+    transport->before_read = before_read;
+    write_fail = 0;
+    query_reply = enable_reply = disable_reply = config_reply = mark_reply = reset_reply = NULL;
+    test_clock = (cartpole_clock_t){fake_now, fake_sleep, NULL};
+    serial = serial_cartpole_open("fake", 460800, &test_clock);
     if (!serial)
         return -1;
-    device = cartpole_create(serial_cartpole_get_device(serial), &runtime);
+    device = cartpole_create(serial_cartpole_get_device(serial), &test_clock);
     return device ? 0 : -1;
 }
-int uart_try_write_all(uart_t *u, const uint8_t *data, size_t n)
+static int write_command(fake_uart_t *u, const uint8_t *data, size_t n)
 {
     (void)u;
     (void)data;
@@ -78,44 +92,11 @@ int uart_try_write_all(uart_t *u, const uint8_t *data, size_t n)
     clock_s += write_delay;
     if (n >= 4 && !memcmp(data, "VEL ", 4))
         clock_s += velocity_write_delay;
-    return try_result ? try_result : uart_write_all(u, data, n);
+    return try_result ? try_result : respond(u, data, n);
 }
-static void queue(const char *s)
-{
-    size_t n = strlen(s);
-    assert(used + n < sizeof input);
-    memcpy(input + used, s, n);
-    used += n;
-}
-int uart_open(uart_t *u, const char *p, int b)
-{
-    (void)p;
-    (void)b;
-    u->fd = 1;
-    used = 0;
-    reads = 0;
-    broken = 0;
-    write_fail = 0;
-    query_reply = enable_reply = disable_reply = config_reply = mark_reply = reset_reply = NULL;
-    return 0;
-}
-void uart_close(uart_t *u) { u->fd = -1; }
-int uart_read(uart_t *u, uint8_t *d, size_t n)
-{
-    (void)u;
-    reads++;
-    if (used)
-        clock_s += read_delay;
-    if (broken)
-        return -1;
-    if (n > used)
-        n = used;
-    memcpy(d, input, n);
-    memmove(input, input + n, used - n);
-    used -= n;
-    return (int)n;
-}
-int uart_write_all(uart_t *u, const uint8_t *d, size_t n)
+static void queue(const char *s) { fake_uart_queue(transport, s); }
+static void before_read(fake_uart_t *p) { if (p->pending) clock_s += read_delay; }
+static int respond(fake_uart_t *u, const uint8_t *d, size_t n)
 {
     (void)u;
     if (write_fail)
@@ -159,11 +140,18 @@ int uart_write_all(uart_t *u, const uint8_t *d, size_t n)
 }
 static cartpole_send_result_t send_velocity(double v)
 {
-    return cartpole_send_velocity(device, v, cartpole_get_monotonic_time_s(device) + .020, 0);
+    cartpole_device_t d = serial_cartpole_get_device(serial);
+    return d.ops->send_velocity(d.context, v, cartpole_get_monotonic_time_s(device) + .020, 0);
 }
 static cartpole_send_result_t try_velocity(double v, double end)
 {
-    return cartpole_send_velocity(device, v, end, 1);
+    cartpole_device_t d = serial_cartpole_get_device(serial);
+    return d.ops->send_velocity(d.context, v, end, 1);
+}
+static cartpole_receive_result_t receive(void)
+{
+    cartpole_device_t d = serial_cartpole_get_device(serial);
+    return d.ops->receive(d.context);
 }
 static void open_ready(void)
 {
@@ -171,7 +159,7 @@ static void open_ready(void)
     query_reply = "MODE READY NONE\n";
     assert(cartpole_query_mode(device, .02) == 0);
     queue("STATE 3 1 2 3 4\n");
-    assert(cartpole_receive(device) == 0);
+    assert(receive() == 0);
 }
 static unsigned measurement_flags(void)
 {
@@ -204,7 +192,7 @@ static void business_event(const cartpole_event_t *event, void *context)
     }
     if (bad_callback) {
         assert(cartpole_enable(device, .01) == CARTPOLE_CALLBACK_ERROR);
-        assert(cartpole_create(serial_cartpole_get_device(serial), &runtime) == NULL);
+        assert(cartpole_create(serial_cartpole_get_device(serial), &test_clock) == NULL);
         cartpole_destroy(device);
         assert(cartpole_get_session_state(device).connection_open);
         assert(cartpole_subscribe(device, NULL, NULL) == CARTPOLE_CALLBACK_ERROR);
@@ -322,14 +310,14 @@ static void test_business_controller(void)
     assert(nonzero_writes == writes);
     open_ready();
     queue("STATE 3 0 0 0 0\n");
-    assert(cartpole_receive(device) == 0);
+    assert(receive() == 0);
     zero_state = 0;
     assert(cartpole_move_to_center(device, .02) ==
            CARTPOLE_TIMEOUT); /* old zero sample is not stop proof */
     zero_state = 1;
     open_ready();
     queue("STATE 3 10000 0 0 0\n");
-    assert(cartpole_receive(device) == 0);
+    assert(receive() == 0);
     velocity_write_delay = .008;
     assert(cartpole_move_to_center(device, .006) == CARTPOLE_TIMEOUT);
     velocity_write_delay = 0;
@@ -380,7 +368,7 @@ int main(void)
     assert(cartpole_enable(device, .02) == CARTPOLE_REJECTED);
     /* 无效小车不能变成零值有效测量。 */
     queue("STATE 2 0 20 0 2\n");
-    assert(cartpole_receive(device) == 0);
+    assert(receive() == 0);
     assert(measurement_flags() == 2);
     assert(send_velocity(10) == -1);
     assert(send_velocity(0) == 0);
@@ -413,15 +401,23 @@ int main(void)
     assert(cartpole_get_session_state(device).has_stream_failure_latch ==
            session_before.has_stream_failure_latch);
     assert(cq == config_queries && ca == calib_queries);
-    /* pump有界且故障不能视为无数据。 */
+    /* 有界接收返回积压；后续调用继续消费且不丢失测量。 */
     open_ready();
     for (int i = 0; i < 600; i++)
         queue("STATE 3 0 0 0 0\n");
     reads = 0;
-    assert(cartpole_receive(device) == 1 && reads == 8 && used > 0);
+    assert(receive() == CARTPOLE_RECEIVE_BACKLOG && reads > 0 && used > 0);
+    for (unsigned attempts = 0; used && attempts < 600; attempts++) {
+        size_t pending = used;
+        cartpole_receive_result_t result = receive();
+        assert(result != CARTPOLE_RECEIVE_ERROR && used < pending);
+    }
+    assert(used == 0);
+    assert(receive() == CARTPOLE_RECEIVE_EMPTY);
+    assert(cartpole_get_latest_measurement(device).measurement_id == 601);
     open_ready();
     broken = 1;
-    assert(cartpole_receive(device) == -1 &&
+    assert(receive() == -1 &&
            cartpole_get_session_state(device).has_stream_failure_latch);
     /* 信号之后仍确认退出，FAULT不冒充DISABLED。 */
     open_ready();
@@ -438,7 +434,7 @@ int main(void)
     assert(cartpole_stop_and_confirm(device, .003) == -1);
     open_ready();
     queue("STATE 3 invalid\n");
-    assert(cartpole_receive(device) == -1);
+    assert(receive() == -1);
     open_ready();
     query_reply = NULL;
     queue("MODE DISABLED NONE\n");
@@ -448,7 +444,7 @@ int main(void)
     /* 一次pump中FAULT后READY仍保留故障历史。 */
     open_ready();
     queue("MODE FAULT MT6835\nMODE READY NONE\n");
-    assert(cartpole_receive(device) == 0);
+    assert(receive() == 0);
     assert(cartpole_get_session_state(device).has_received_fault_mode);
     open_ready();
     double received_at = cartpole_get_latest_measurement(device).received_host_monotonic_s;
@@ -458,7 +454,7 @@ int main(void)
     queue("STATE 1 0 0 0 0\nSTATE 3 0 0 0 0\nMODE DISABLED NONE\nMODE READY "
           "NONE\nOK ACC_MAX "
           "10000\n");
-    assert(cartpole_receive(device) == 0 && hook_calls == 5);
+    assert(receive() == 0 && hook_calls == 5);
     assert(observed_flags[0] == 1 && observed_flags[1] == 3);
     assert(before.measurement_id + 2 == cartpole_get_latest_measurement(device).measurement_id);
     assert(before.received_host_monotonic_s == received_at);

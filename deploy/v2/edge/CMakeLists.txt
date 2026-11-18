@@ -40,7 +40,7 @@ add_executable(cartpole_edge
     proto.c
     cartpole.c
     cartpole_format.c
-    cartpole_runtime.c
+    cartpole_clock.c
     cartpole_schedule.c
     serial_cartpole.c
     cartpole_controller.c

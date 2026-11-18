@@ -80,10 +80,11 @@ make -C deploy/v2/edge test-integration PYTHON=/path/to/python
 | `control.c` | 控制门控、速度换算与周期推进 |
 | `package.c` / `prepare_package.py` | 模型包读取与从正式模型目录派生 |
 | `cartpole_format.c` / `cartpole_format.h` | 枚举展示转换（`*_to_string`），与设备事务分离 |
-| `cartpole.c` / `cartpole.h` | 倒立摆业务会话、只读查询、类型化事件与业务事务入口 |
+| `cartpole.c` / `cartpole.h` | 基本设备会话生命周期、查询、类型化事件与设备事务 |
 | `cartpole_device.h` | 业务定义的设备能力，由实际设备适配器实现 |
 | `serial_cartpole.c` / `serial_cartpole.h` | 串口实例、固件协议事务、接收缓存与通信统计 |
-| `cartpole_schedule.c` / `cartpole_runtime.c` | 有界业务调度与可注入的单调时钟/取消环境 |
+| `cartpole_schedule.c` / `cartpole_control.h` | 上层有界业务调度与控制操作接口 |
+| `cartpole_clock.c` / `cartpole_clock.h` | 可共享的纯单调时钟与绝对等待服务 |
 | `cartpole_controller.c` | 正式控制调度、推理前后门控与动作提交 |
 | `cartpole_motion.c` | 定时速度保持、回中等完整维护操作 |
 | `console.c` | 维护命令解析、交互输入和人类可读显示 |
@@ -96,11 +97,28 @@ make -C deploy/v2/edge test-integration PYTHON=/path/to/python
 
 ## 倒立摆业务接口
 
-`cartpole.h` 只描述倒立摆的测量、设备状态、配置与业务操作。端口和波特率属于 `serial_cartpole` 适配器的构造参数；控制器和维护业务不依赖 UART 或固件协议。
+`cartpole.h` 只描述倒立摆的测量、设备状态、配置与基本设备操作。端口和波特率属于 `serial_cartpole` 适配器的构造参数；控制器和维护业务不依赖 UART 或固件协议。
 
-装配入口先初始化一个 `cartpole_runtime_t`，再用它打开串口适配器，将 `serial_cartpole_get_device()` 返回的设备能力注入 `cartpole_create()`。业务会话借用设备和运行环境，不拥有二者；释放顺序是完成停止确认、`cartpole_destroy()`、`serial_cartpole_close()`。每个会话独占一个运行环境，重复绑定被拒绝，避免共享取消或重入状态。适配器与业务必须使用同一时钟，注入不匹配的运行环境会构造失败。
+装配入口初始化 `cartpole_clock_t`，用它打开串口适配器，将
+`serial_cartpole_get_device()` 返回的抽象设备能力注入 `cartpole_create()`。
+生命周期函数声明在 `cartpole.h`；会话借用设备与时钟，不负责选择或构造串口。
+释放顺序是有界停止确认、`cartpole_destroy()`、`serial_cartpole_close()`。
+一个设备只能绑定一个会话，但多个设备/会话可以共享同一时钟。
 
-`cartpole_device_ops_t` 是业务定义的能力表，包括读取最近测量/状态/配置、逐事件接收、执行设备事务、提交带期限的速度目标与确认停车。实际适配器及测试替身实现这个契约；控制器无需链接串口或协议实现。`cartpole_clock_t` 可替换单调时钟与绝对等待，默认使用平台 `CLOCK_MONOTONIC`。
+`cartpole_device_ops_t` 是基本设备层定义的实现契约，由串口适配器或测试替身实现。
+上层控制、推理和维护操作的入口在 `cartpole_control.h`，实现仅通过 `cartpole.h`
+的公开基本能力使用设备，不访问内部结构或适配器函数表。
+
+时钟仅提供单调读时和绝对等待，不包含取消、回调或独占状态。
+这些可变状态由每个 `cartpole_t` 私有持有。
+外部取消经 `cartpole_set_cancellation_source()` 注入查询回调；信号处理器只修改
+应用自己的信号标志，不写设备模块内部字段。适配器绑定对应会话的取消查询，
+销毁时同步解绑；一个会话取消不会污染共享时钟上的另一个会话。
+
+`cartpole_execute_operation()` 给上层操作提供同步独占作用域及逐事件观察，
+返回时自动解绑临时观察器并解除独占，操作完成不等于停车。
+`cartpole_evaluate_measurement()` 约束应用计算回调只能读取状态或请求取消，
+违规不会被回调忽略返回值而掩盖。控制时序和门控仍属于上层控制模块。
 
 查询按职责分开：
 
@@ -131,3 +149,13 @@ make -C deploy/v2/edge test-integration PYTHON=/path/to/python
 每次打开适配器创建新的缓存、统计和故障锁存；关闭后该实例不可再访问。销毁业务会话解除它的事件观察器，但不关闭借用的适配器。调用方保留的旧值只是一份旧副本，不代表当前设备状态。
 
 公开命名区分职责：缓存查询用 `get_*`，年龄计算用 `cartpole_calculate_measurement_age_s()`，取消谓词用 `cartpole_is_stop_requested()`。单调时钟查询为 `cartpole_get_monotonic_time_s()`；展示层显式包含 `cartpole_format.h` 使用枚举的 `*_to_string()`。串口配置词汇由 `serial_cartpole_setting_to_string()` / `serial_cartpole_parse_setting()` 转换，不属于业务会话接口。
+
+### 文本结果的只读解析
+
+协议层的 `proto_parse_command()` 校验完整 LF 结尾命令并提取命令类型、参数和值，
+失败不修改输出，不发送命令。它与设备业务接口分离，可用于线路记录分析。
+`cli_report.py` 的 `parse_state_window_summary()` 校验四行 STATE 摘要，
+`parse_state_output()` 校验包含已定义 MODE/STEP_LOSS 事件的完整输出。
+二者返回类型化结果，不把任意未知文本当作可忽略日志。
+制包单位错误通过 `parse_firmware_unit_error()` 提取错误代码与字段。
+其余面向人的诊断说明并非统一机器结果协议，不应依赖整段措辞判断运行成功。

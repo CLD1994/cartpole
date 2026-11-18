@@ -13,25 +13,54 @@ from pathlib import Path
 import re
 import shutil
 import sys
+from typing import NamedTuple
+
+
+# 公开错误代码，供调用方和测试判别失败原因。
+ERROR_UNSUPPORTED_FREQUENCY = 'unsupported_frequency'
+ERROR_INVALID_SHA256 = 'invalid_sha256'
+ERROR_INVALID_NPU_SHA256 = 'invalid_npu_sha256'
+ERROR_MODEL_SHAPE_REQUIRES_FLOAT32_1X4_TO_1X1 = 'model_shape_requires_float32_1x4_to_1x1'
+ERROR_OM_MISSING_OR_EMPTY = 'om_missing_or_empty'
+
+ERROR_FIRMWARE_UNIT_PRECISION = 'firmware_unit_precision'
+ERROR_FIRMWARE_UNIT_RANGE = 'firmware_unit_range'
+ERROR_INVALID_FIRMWARE_UNIT_ERROR = 'invalid_firmware_unit_error'
+
+
+class FirmwareUnitError(NamedTuple):
+    code: str
+    field: str
+
+
+def parse_firmware_unit_error(message: str) -> FirmwareUnitError:
+    """解析 render_manifest 的 code:field 错误；不接受其他错误或未知字段。"""
+    if not isinstance(message, str):
+        raise ValueError(ERROR_INVALID_FIRMWARE_UNIT_ERROR)
+    code, separator, field = message.partition(':')
+    if (separator != ':' or code not in (ERROR_FIRMWARE_UNIT_PRECISION, ERROR_FIRMWARE_UNIT_RANGE)
+            or field not in ('action_scale_m_s', 'training_acceleration_m_s2')):
+        raise ValueError(ERROR_INVALID_FIRMWARE_UNIT_ERROR)
+    return FirmwareUnitError(code, field)
 
 
 def render_manifest(manifest, digest, npu_digest=None):
     def milli(key):
         value = manifest[key] * 1000
         if not math.isfinite(value) or value <= 0 or not math.isclose(value, round(value), rel_tol=0, abs_tol=1e-8):
-            raise ValueError('firmware_unit_precision:' + key)
+            raise ValueError(ERROR_FIRMWARE_UNIT_PRECISION + ':' + key)
         if value > 2147483647:
-            raise ValueError('firmware_unit_range:' + key)
+            raise ValueError(ERROR_FIRMWARE_UNIT_RANGE + ':' + key)
         return round(value)
     speed = milli('action_scale_m_s')
     acceleration = milli('training_acceleration_m_s2')
     hz = manifest['training_control_hz']
     if type(hz) is not int or hz not in (400, 500):
-        raise ValueError('unsupported_frequency')
+        raise ValueError(ERROR_UNSUPPORTED_FREQUENCY)
     if not isinstance(digest, str) or re.fullmatch('[0-9a-f]{64}', digest) is None:
-        raise ValueError('invalid_sha256')
+        raise ValueError(ERROR_INVALID_SHA256)
     if npu_digest is not None and re.fullmatch('[0-9a-f]{64}', npu_digest) is None:
-        raise ValueError('invalid_npu_sha256')
+        raise ValueError(ERROR_INVALID_NPU_SHA256)
     return json.dumps({
         'schema_version': 2,
         'model_cpu': 'policy.fp32',
@@ -65,12 +94,12 @@ def prepare(model_directory, om, destination):
             or shape(graph.graph.output[0]) != [1, 1]
             or inputs[0].type.tensor_type.elem_type != onnx.TensorProto.FLOAT
             or graph.graph.output[0].type.tensor_type.elem_type != onnx.TensorProto.FLOAT):
-        raise ValueError('model_shape_requires_float32_1x4_to_1x1')
+        raise ValueError(ERROR_MODEL_SHAPE_REQUIRES_FLOAT32_1X4_TO_1X1)
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from cpu_export import export_cpu
     cpu_data = export_cpu(graph)
     if om is not None and (not om.is_file() or om.stat().st_size == 0):
-        raise ValueError('om_missing_or_empty')
+        raise ValueError(ERROR_OM_MISSING_OR_EMPTY)
     destination.mkdir(parents=False, exist_ok=False)
     try:
         (destination / 'policy.fp32').write_bytes(cpu_data)

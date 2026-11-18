@@ -303,3 +303,65 @@ const char *proto_reason_name(fw_reason_t r)
         return "?";
     }
 }
+
+/* 此解析器独立检查语法，不通过重新格式化来证明格式化器自身正确。 */
+static bool parse_command_integer(const char *text, long *value)
+{
+    const char *digits = *text == '-' ? text + 1 : text;
+    if (*digits < '0' || *digits > '9' ||
+        (*digits == '0' && (digits[1] != '\n' || digits != text)))
+        return false;
+    const char *end = digits;
+    while (*end >= '0' && *end <= '9')
+        end++;
+    if (*end != '\n' || end[1] != '\0')
+        return false;
+    errno = 0;
+    char *parsed_end;
+    long result = strtol(text, &parsed_end, 10);
+    if (errno == ERANGE || parsed_end != end)
+        return false;
+    *value = result;
+    return true;
+}
+bool proto_parse_command(const char *line, proto_command_t *out)
+{
+    if (!line || !out || strlen(line) >= 64)
+        return false;
+    proto_command_t parsed = {0};
+    if (strncmp(line, "VEL ", 4) == 0) {
+        parsed.kind = PROTO_COMMAND_VELOCITY;
+        if (!parse_command_integer(line + 4, &parsed.value) ||
+            parsed.value < -1000000000L || parsed.value > 1000000000L)
+            return false;
+    } else if (strncmp(line, "CONFIG ", 7) == 0) {
+        parsed.kind = PROTO_COMMAND_CONFIGURE;
+        const char *name = line + 7, *end = name;
+        while ((*end >= 'A' && *end <= 'Z') || (*end >= '0' && *end <= '9') || *end == '_')
+            end++;
+        size_t length = (size_t)(end - name);
+        if (!length || length >= sizeof parsed.parameter || *end != ' ' ||
+            !parse_command_integer(end + 1, &parsed.value))
+            return false;
+        memcpy(parsed.parameter, name, length);
+    } else {
+        static const struct { const char *line; proto_command_kind_t kind; } simple[] = {
+            {"QUERY\n", PROTO_COMMAND_QUERY}, {"CALIB?\n", PROTO_COMMAND_CALIBRATION_QUERY},
+            {"CONFIG?\n", PROTO_COMMAND_CONFIGURATION_QUERY}, {"ENABLE\n", PROTO_COMMAND_ENABLE},
+            {"DISABLE\n", PROTO_COMMAND_DISABLE}, {"RESET\n", PROTO_COMMAND_RESET},
+            {"MARK LEFT\n", PROTO_COMMAND_MARK_LEFT}, {"MARK RIGHT\n", PROTO_COMMAND_MARK_RIGHT}
+        };
+        bool found = false;
+        for (size_t i = 0; i < sizeof simple / sizeof *simple; i++) {
+            if (strcmp(line, simple[i].line) == 0) {
+                parsed.kind = simple[i].kind;
+                found = true;
+                break;
+            }
+        }
+        if (!found)
+            return false;
+    }
+    *out = parsed;
+    return true;
+}

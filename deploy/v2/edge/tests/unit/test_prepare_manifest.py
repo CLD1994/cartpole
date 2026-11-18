@@ -26,14 +26,34 @@ class PackageTest(unittest.TestCase):
         self.assertEqual(data['model_npu'], 'policy.om')
         self.assertEqual(data['sha256_npu'], 'b'*64)
 
-    def test_reject_nonintegral_firmware_units(self):
-        with self.assertRaises(ValueError):
-            m.render_manifest({'training_control_hz': 400, 'action_scale_m_s': .9,
-                               'training_acceleration_m_s2': 10.00001}, 'a' * 64)
+    def test_firmware_unit_errors_identify_code_and_field(self):
+        for field in ('action_scale_m_s', 'training_acceleration_m_s2'):
+            for value, code in ((.00001, m.ERROR_FIRMWARE_UNIT_PRECISION),
+                                (3000000, m.ERROR_FIRMWARE_UNIT_RANGE)):
+                with self.subTest(field=field, value=value):
+                    manifest = dict(training_control_hz=400, action_scale_m_s=.9,
+                                    training_acceleration_m_s2=10)
+                    manifest[field] = value
+                    with self.assertRaises(ValueError) as caught:
+                        m.render_manifest(manifest, 'a'*64)
+                    error = m.parse_firmware_unit_error(str(caught.exception))
+                    self.assertEqual(error.code, code)
+                    self.assertEqual(error.field, field)
+
+    def test_unit_error_parser_rejects_other_errors_and_malformed_fields(self):
+        for message in (None, '', m.ERROR_INVALID_SHA256,
+                        m.ERROR_FIRMWARE_UNIT_PRECISION + ':unknown',
+                        m.ERROR_FIRMWARE_UNIT_RANGE + ':action_scale_m_s:extra',
+                        m.ERROR_FIRMWARE_UNIT_RANGE + ':action_scale_m_s\n'):
+            with self.subTest(message=message):
+                with self.assertRaises(ValueError) as caught:
+                    m.parse_firmware_unit_error(message)
+                self.assertEqual(str(caught.exception), m.ERROR_INVALID_FIRMWARE_UNIT_ERROR)
 
     def test_reject_invalid_hash(self):
-        with self.assertRaises(ValueError):
+        with self.assertRaises(ValueError) as caught:
             m.render_manifest({'training_control_hz': 400, 'action_scale_m_s': .9,
                                'training_acceleration_m_s2': 10}, 'oops')
+        self.assertEqual(str(caught.exception), m.ERROR_INVALID_SHA256)
 
 if __name__ == '__main__': unittest.main()

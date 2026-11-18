@@ -1,5 +1,6 @@
 /* 串口设备适配器：拥有传输与协议状态，通过业务能力接口提供设备行为。 */
 #include "serial_cartpole.h"
+#include "cartpole_format.h"
 #include "config.h"
 #include "proto.h"
 #include "uart.h"
@@ -7,40 +8,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-const char *serial_cartpole_setting_to_string(cartpole_setting_t setting)
-{
-    switch (setting) {
-    case CARTPOLE_SETTING_VELOCITY_LIMIT:
-        return "VEL_MAX";
-    case CARTPOLE_SETTING_ACCELERATION_LIMIT:
-        return "ACC_MAX";
-    case CARTPOLE_SETTING_WATCHDOG_TIMEOUT:
-        return "WDT_MS";
-    case CARTPOLE_SETTING_TRACK_MARGIN:
-        return "X_MARGIN_UM";
-    case CARTPOLE_SETTING_POLE_ZERO:
-        return "POLE_ZERO_URAD";
-    case CARTPOLE_SETTING_POLE_INVERT:
-        return "POLE_INV";
-    case CARTPOLE_SETTING_CART_INVERT:
-        return "X_INV";
-    case CARTPOLE_SETTING_STEP_LOSS_THRESHOLD:
-        return "STEP_LOSS_UM";
-    }
-    return NULL;
-}
-int serial_cartpole_parse_setting(const char *name, cartpole_setting_t *setting)
-{
-    if (!name || !setting)
-        return -1;
-    for (int i = CARTPOLE_SETTING_VELOCITY_LIMIT; i <= CARTPOLE_SETTING_STEP_LOSS_THRESHOLD; i++) {
-        if (!strcmp(name, serial_cartpole_setting_to_string((cartpole_setting_t)i))) {
-            *setting = (cartpole_setting_t)i;
-            return 0;
-        }
-    }
-    return -1;
-}
 
 enum { CARTPOLE_MEASUREMENT_CART_VALID = 1u, CARTPOLE_MEASUREMENT_POLE_VALID = 2u };
 typedef struct {
@@ -58,7 +25,9 @@ struct cached_value {
     int64_t value;
 };
 struct serial_cartpole {
-    cartpole_runtime_t *runtime;
+    const cartpole_clock_t *clock;
+    cartpole_cancellation_probe_t cancellation;
+    void *cancellation_context;
     uart_t uart;
     proto_rx_t rx;
     serial_snapshot_t snapshot;
@@ -74,7 +43,15 @@ struct serial_cartpole {
     void *event_context;
     int session_event_pending, delivering, configuration_changed;
 };
-static double adapter_now(serial_cartpole_t *s) { return cartpole_runtime_get_monotonic_time_s(s->runtime); }
+static int adapter_cancelled(serial_cartpole_t *s)
+{ return s->cancellation && s->cancellation(s->cancellation_context); }
+static void bind_cancellation(void *context, cartpole_cancellation_probe_t probe, void *source)
+{
+    serial_cartpole_t *s = context;
+    s->cancellation = probe;
+    s->cancellation_context = source;
+}
+static double adapter_now(serial_cartpole_t *s) { return cartpole_clock_get_monotonic_time_s(s->clock); }
 static double state_age(serial_cartpole_t *s)
 {
     return s->snapshot.last_state_received_host_monotonic_s < 0
@@ -83,7 +60,7 @@ static double state_age(serial_cartpole_t *s)
 }
 static void nap_ms(serial_cartpole_t *s, int ms)
 {
-    cartpole_runtime_sleep_until(s->runtime, adapter_now(s) + ms * .001);
+    cartpole_clock_sleep_until(s->clock, adapter_now(s) + ms * .001);
 }
 static void flush_session_event(serial_cartpole_t *s);
 static void stream_failed(serial_cartpole_t *s, cartpole_result_t result)
@@ -162,7 +139,7 @@ static int configuration_parameter(const char *name)
 }
 static cartpole_result_t adapter_checkpoint(serial_cartpole_t *s, double end, int cleanup)
 {
-    if (!cleanup && cartpole_runtime_is_cancelled(s->runtime))
+    if (!cleanup && adapter_cancelled(s))
         return CARTPOLE_CANCELLED;
     if (adapter_now(s) >= end)
         return CARTPOLE_TIMEOUT;
@@ -216,7 +193,7 @@ static cartpole_send_result_t adapter_try_send_vel(serial_cartpole_t *s, double 
 {
     char line[64];
     size_t n = proto_format_vel(line, v);
-    if (!n || !isfinite(deadline_host_monotonic_s) || cartpole_runtime_is_cancelled(s->runtime) ||
+    if (!n || !isfinite(deadline_host_monotonic_s) || adapter_cancelled(s) ||
         s->snapshot.has_stream_failure_latch || !s->snapshot.is_mode_received ||
         s->snapshot.reported_mode != FW_READY ||
         s->snapshot.reported_mode_reason != FW_REASON_NONE ||
@@ -254,7 +231,7 @@ static cartpole_send_result_t adapter_send_vel_until(serial_cartpole_t *s, doubl
         return CARTPOLE_SEND_ERROR;
     /* 零速清理可在错误/取消后执行；非零维护发送失败会锁住后续非零发送。 */
     if (v != 0. &&
-        (cartpole_runtime_is_cancelled(s->runtime) || s->snapshot.has_stream_failure_latch ||
+        (adapter_cancelled(s) || s->snapshot.has_stream_failure_latch ||
          !s->snapshot.is_mode_received || s->snapshot.reported_mode != FW_READY ||
          s->snapshot.reported_mode_reason != FW_REASON_NONE ||
          !(s->snapshot.measurement_validity_bits & CARTPOLE_MEASUREMENT_CART_VALID) ||
@@ -456,7 +433,7 @@ static cartpole_result_t adapter_configure(serial_cartpole_t *s, cartpole_settin
 {
     double end;
     TX_TRY(adapter_deadline(s, timeout_s, &end));
-    const char *name = serial_cartpole_setting_to_string(setting);
+    const char *name = cartpole_setting_to_string(setting);
     char line[64];
     if (!name || strlen(name) >= sizeof s->wait_name || !proto_format_config(line, name, value))
         return CARTPOLE_INVALID_ARGUMENT;
@@ -769,6 +746,7 @@ static cartpole_send_result_t port_send_velocity(void *context, double velocity,
                     : adapter_send_vel_until(s, velocity, deadline);
 }
 static const cartpole_device_ops_t operations = {
+    .bind_cancellation = bind_cancellation,
     .get_latest_measurement = port_get_latest_measurement,
     .get_session_state = port_get_session_state,
     .get_configuration = port_get_configuration,
@@ -787,14 +765,14 @@ static const cartpole_device_ops_t operations = {
     .report_failure = port_report_failure,
     .send_velocity = port_send_velocity,
 };
-serial_cartpole_t *serial_cartpole_open(const char *port, int baud, cartpole_runtime_t *runtime)
+serial_cartpole_t *serial_cartpole_open(const char *port, int baud, const cartpole_clock_t *clock)
 {
-    if (!port || !runtime || !runtime->clock.now || !runtime->clock.sleep_until)
+    if (!port || !clock || !clock->now || !clock->sleep_until)
         return NULL;
     serial_cartpole_t *s = calloc(1, sizeof *s);
     if (!s)
         return NULL;
-    s->runtime = runtime;
+    s->clock = clock;
     s->uart.fd = -1;
     s->snapshot.last_state_received_host_monotonic_s = -1.;
     proto_rx_init(&s->rx);
@@ -807,7 +785,7 @@ serial_cartpole_t *serial_cartpole_open(const char *port, int baud, cartpole_run
 }
 cartpole_device_t serial_cartpole_get_device(serial_cartpole_t *s)
 {
-    return (cartpole_device_t){.ops = &operations, .context = s, .runtime = s ? s->runtime : NULL};
+    return (cartpole_device_t){.ops = &operations, .context = s, .clock = s ? s->clock : NULL};
 }
 void serial_cartpole_close(serial_cartpole_t *s)
 {

@@ -3,6 +3,7 @@
 #ifndef EDGE_CARTPOLE_H
 #define EDGE_CARTPOLE_H
 #include <stdint.h>
+#include "cartpole_clock.h"
 typedef enum { CARTPOLE_MODE_DISABLED, CARTPOLE_MODE_READY, CARTPOLE_MODE_FAULT } cartpole_mode_t;
 typedef enum {
     CARTPOLE_REASON_NONE,
@@ -115,37 +116,42 @@ cartpole_result_t cartpole_refresh_configuration(cartpole_t *, double timeout_s)
 /* 清理忽略已请求取消与流失败；FAULT保留故障，不等同DISABLED。
  * UNCONFIRMED不证明设备仍在运动，也不证明已经停下。 */
 cartpole_stop_result_t cartpole_stop_and_confirm(cartpole_t *, double timeout_s);
-/* 循环回调只给业务意图，不能发送、执行事务、修改订阅、重入循环或关闭连接。 */
 typedef enum {
-    CARTPOLE_TICK_OBSERVE,
-    CARTPOLE_TICK_VELOCITY,
-    CARTPOLE_TICK_FINISH
-} cartpole_tick_kind_t;
-typedef struct {
-    cartpole_tick_kind_t kind;
-    double velocity_mm_s;
-} cartpole_tick_action_t;
-typedef int (*cartpole_tick_handler_t)(double elapsed_s, cartpole_tick_action_t *, void *);
-/* duration_s=0持续至FINISH/取消；period_s>0，均须有限。
- * 接收积压时跳过业务tick；错过节拍不补发历史目标。tick返回非0或非法重入
- * 为CALLBACK_ERROR，request_stop为CANCELLED，时长结束/FINISH为OK。
- * 所有循环退出均不等于停车；调用方必须随后stop_and_confirm。
- * 回调同步执行，不能抢占；超时后不再提交该回调产生的运动意图。 */
-cartpole_result_t cartpole_run_loop(cartpole_t *, double period_s, double duration_s,
-                                    cartpole_tick_handler_t, void *);
-typedef struct {
-    /* 支持400/500 Hz；动作倍率与部署限幅单位mm/s。 */
-    double control_hz, action_scale_mm_s, velocity_limit_mm_s;
-    cartpole_configuration_t expected_configuration;
-} cartpole_controller_options_t;
-/* 回调必须写入有限归一化动作且返回0；应用负责观察量排列及角度符号转换。
- * 同tick/event回调一样只读或request_stop，不得执行会话事务。 */
-typedef int (*cartpole_infer_t)(const cartpole_measurement_t *, float *normalized_action, void *);
-cartpole_result_t cartpole_run_controller(cartpole_t *, const cartpole_controller_options_t *,
-                                          cartpole_infer_t, void *);
-/* hold先查询模式/等待测量，duration为之后的保持时长；结束请求零速，
- * 不确认DISABLED。center总timeout包含预检，新零速测量才构成停稳证据。
- * 两者退出后仍由调用方统一stop_and_confirm。 */
-cartpole_result_t cartpole_hold_velocity(cartpole_t *, double velocity_mm_s, double duration_s);
-cartpole_result_t cartpole_move_to_center(cartpole_t *, double timeout_s);
+    CARTPOLE_RECEIVE_ERROR = -1,
+    CARTPOLE_RECEIVE_EMPTY = 0,
+    CARTPOLE_RECEIVE_BACKLOG = 1
+} cartpole_receive_result_t;
+typedef enum {
+    CARTPOLE_SEND_ERROR = -1,
+    CARTPOLE_SEND_COMPLETE = 0,
+    CARTPOLE_SEND_SKIPPED = 1,
+    CARTPOLE_SEND_LATE = 2
+} cartpole_send_result_t;
+
+/* 一个设备仅绑定一个会话；借用设备与时钟，destroy 不关闭设备、不停车。 */
+typedef struct cartpole_device cartpole_device_t;
+cartpole_t *cartpole_create(cartpole_device_t, const cartpole_clock_t *);
+void cartpole_destroy(cartpole_t *);
+typedef int (*cartpole_cancellation_probe_t)(void *);
+/* 取消源由调用者持有，必须活过会话；探针只读且非阻塞，不重入、不销毁会话，不调用任何会话 API。
+ * NULL 解除外部取消源；只能在没有活动操作时修改绑定。 */
+cartpole_result_t cartpole_set_cancellation_source(cartpole_t *, cartpole_cancellation_probe_t, void *);
+/* 接收所有当前可处理报告，逐条通知订阅者；BACKLOG 要求稍后继续接收。 */
+cartpole_receive_result_t cartpole_receive(cartpole_t *);
+/* 绝对期限基于注入时钟；try_once 不等待重试；完整写入不是设备收讫。 */
+cartpole_send_result_t cartpole_send_velocity(cartpole_t *, double velocity_mm_s,
+                                            double deadline_s, int try_once);
+cartpole_result_t cartpole_get_stream_result(cartpole_t *);
+/* 非负有限绝对时间；可被取消中断，回调内禁止阻塞。 */
+cartpole_result_t cartpole_sleep_until(cartpole_t *, double deadline_s);
+typedef cartpole_result_t (*cartpole_operation_t)(cartpole_t *, void *);
+/* 同步独占一个设备操作：禁止操作重入或销毁会话；observer 在显示订阅前
+ * 收到每一条报告，不能修改会话。返回时自动解绑 observer 和解除独占。
+ * body 可以使用基本设备能力；退出不代表停车，调用者仍负责停机确认。 */
+cartpole_result_t cartpole_execute_operation(cartpole_t *, cartpole_operation_t,
+                                            cartpole_event_handler_t observer, void *);
+typedef int (*cartpole_measurement_evaluator_t)(void *);
+/* 同步计算业务结果；只能读取快照或请求取消，不能修改会话/发起设备事务。
+ * 用户返回非零或违反只读约定均返回 CALLBACK_ERROR。 */
+cartpole_result_t cartpole_evaluate_measurement(cartpole_t *, cartpole_measurement_evaluator_t, void *);
 #endif

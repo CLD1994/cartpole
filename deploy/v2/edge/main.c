@@ -1,6 +1,7 @@
 #include "cartpole_format.h"
 /* CV610 应用层：组织模型、用户命令与输出；设备循环由 cartpole 会话负责。 */
 #include "cartpole.h"
+#include "cartpole_control.h"
 #include "cartpole_device.h"
 #include "config.h"
 #include "console.h"
@@ -16,6 +17,8 @@
 static void print_usage(const char *prog);
 static int g_motion_session;
 static volatile sig_atomic_t signal_stop;
+static int cancellation_requested(void *context)
+{ (void)context; return signal_stop != 0; }
 static void on_signal(int sig)
 {
     (void)sig;
@@ -425,17 +428,17 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    cartpole_runtime_t runtime;
-    if (cartpole_runtime_init(&runtime, NULL))
+    cartpole_clock_t clock;
+    if (cartpole_clock_init(&clock, NULL))
         return 1;
-    runtime.external_stop = &signal_stop;
-    serial_cartpole_t *serial = serial_cartpole_open(port, CFG_BAUD, &runtime);
+    serial_cartpole_t *serial = serial_cartpole_open(port, CFG_BAUD, &clock);
     if (!serial) {
         fprintf(stderr, "[edge] cannot open %s\n", port);
         return 1;
     }
 
-    cartpole_t *c = cartpole_create(serial_cartpole_get_device(serial), &runtime);
+    cartpole_t *c = cartpole_create(serial_cartpole_get_device(serial), &clock);
+    if (c) (void)cartpole_set_cancellation_source(c, cancellation_requested, NULL);
     if (!c) {
         serial_cartpole_close(serial);
         return 1;
