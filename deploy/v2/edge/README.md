@@ -102,3 +102,19 @@ make -C deploy/v2/edge test-integration PYTHON=/path/to/python
 典型调用顺序是 `cartpole_open` → `cartpole_sync_mode` / `cartpole_refresh_metadata` → `cartpole_wait_state` → 周期 `cartpole_pump`，然后一次 `cartpole_snapshot()` 复制当前状态供该轮使用。推理后的再次接收必须读取新的快照，不能把推理前的快照当作最新值。`cartpole_cached_value` 仅查询已收到的参数；`cartpole_enable`、`cartpole_reset`、`cartpole_mark`、`cartpole_configure` 各自完成一次请求事务，不需要调用者处理裸协议回执。运动退出使用 `cartpole_stop_and_confirm`，最后 `cartpole_close`。
 
 完整事务用具名结果区分取消、超时、传输失败、协议异常、固件拒绝、FAULT、回执值不符及非法参数。错误在对应阶段产生并直接传递，上层不根据最后一份状态反推原因。CLI 保留操作名称，不把全部失败写成“超时”。超时只说明未在期限内确认，命令可能已经送达甚至执行；不会因此自动重发使能、标定或配置事务。传输失败也不证明设备没有执行，不应据此盲目重试。
+
+快照字段直接说明其来源和生命周期：
+
+| 字段 | 含义与边界 |
+|---|---|
+| `is_serial_open` | 本进程打开了串口；不代表设备在线或通信健康 |
+| `is_mode_received` | 本次会话已解析过 MODE；不是 READY 判断 |
+| `reported_mode` / `reported_mode_reason` | 最后收到的模式与原因；必须结合 `is_mode_received` |
+| `measurement_validity_bits` | 小车/摆杆有效位，使用 `CARTPOLE_MEASUREMENT_CART_VALID` / `CARTPOLE_MEASUREMENT_POLE_VALID`，不直接写数字掩码 |
+| `last_state_received_host_monotonic_s` | 最近 STATE 在本机被解析的单调时刻；未收到为 -1，MODE/OK 不刷新它 |
+| `received_state_count` | 本会话已解析 STATE 的累计数，包括通道无效但格式正确的帧；不是设备采样序号 |
+| `has_received_fault_mode` | 本次会话曾收到 MODE FAULT；后来的 READY 或 RESET 不清除该记录 |
+| `has_stream_failure_latch` | 会话失败锁存，禁止继续非零驱动；仍允许零速与停止确认的清理路径，不仅表示串口 IO 错误 |
+| `received_unknown_line_count` | 无法识别的已接收行累计数，不是测量无效帧数 |
+
+open 建立新会话，close 清除快照与缓存；关闭后保存于调用方的旧快照只是旧值，不代表当前设备状态。`cartpole_state_age_s` 计算 STATE 接收年龄，`cartpole_host_monotonic_s` 提供同一主机时钟。

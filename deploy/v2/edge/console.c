@@ -188,7 +188,7 @@ int console_transaction_result(const char *operation, cartpole_result_t result)
                                        : "");
     return -1;
 }
-static int ensure_mode_known(void)
+static int query_mode_for_command(void)
 {
     return console_transaction_result("QUERY", cartpole_sync_mode(1.0));
 }
@@ -197,12 +197,12 @@ int console_exec(const console_req_t *req)
 {
     switch (req->cmd) {
     case CONSOLE_CMD_CALIB: {
-        if (ensure_mode_known() != 0)
+        if (query_mode_for_command() != 0)
             return -1;
         int known;
         cartpole_snapshot_t snapshot = cartpole_snapshot();
-        known = snapshot.mode_known;
-        fw_mode_t m = snapshot.mode;
+        known = snapshot.is_mode_received;
+        fw_mode_t m = snapshot.reported_mode;
         if (known && m != FW_DISABLED) {
             fprintf(stderr, "[edge] calib requires DISABLED (current %s)\n", proto_mode_name(m));
             return -1;
@@ -212,7 +212,7 @@ int console_exec(const console_req_t *req)
         if (wait_enter() != 0) {
             return -1;
         }
-        if (console_transaction_result("MARK", cartpole_mark(CARTPOLE_LEFT, 1.0)) != 0) {
+        if (console_transaction_result("MARK LEFT", cartpole_mark(CARTPOLE_LEFT, 1.0)) != 0) {
             return -1;
         }
         printf("[edge] push cart to RIGHT end, then press Enter...");
@@ -220,7 +220,7 @@ int console_exec(const console_req_t *req)
         if (wait_enter() != 0) {
             return -1;
         }
-        if (console_transaction_result("MARK", cartpole_mark(CARTPOLE_RIGHT, 1.0)) != 0) {
+        if (console_transaction_result("MARK RIGHT", cartpole_mark(CARTPOLE_RIGHT, 1.0)) != 0) {
             return -1;
         }
         if (console_transaction_result("ENABLE", cartpole_enable(2.0)) != 0) {
@@ -230,9 +230,9 @@ int console_exec(const console_req_t *req)
         return 0;
     }
     case CONSOLE_CMD_MARK_LEFT:
-        return console_transaction_result("MARK", cartpole_mark(CARTPOLE_LEFT, 1.0));
+        return console_transaction_result("MARK LEFT", cartpole_mark(CARTPOLE_LEFT, 1.0));
     case CONSOLE_CMD_MARK_RIGHT:
-        return console_transaction_result("MARK", cartpole_mark(CARTPOLE_RIGHT, 1.0));
+        return console_transaction_result("MARK RIGHT", cartpole_mark(CARTPOLE_RIGHT, 1.0));
     case CONSOLE_CMD_ENABLE:
         return console_transaction_result("ENABLE", cartpole_enable(2.0));
     case CONSOLE_CMD_CENTER:
@@ -248,23 +248,27 @@ int console_exec(const console_req_t *req)
         if (console_transaction_result("QUERY", cartpole_sync_mode(1.0)) != 0) {
             return -1;
         }
-        fw_reason_t reason = cartpole_snapshot().reason;
-        fw_mode_t m = cartpole_snapshot().mode;
+        fw_reason_t reason = cartpole_snapshot().reported_mode_reason;
+        fw_mode_t m = cartpole_snapshot().reported_mode;
         printf("MODE %s %s\n", proto_mode_name(m), proto_reason_name(reason));
         return 0;
     }
-    case CONSOLE_CMD_CONFIG:
+    case CONSOLE_CMD_CONFIG: {
         if (req->dump) {
             return console_transaction_result("metadata", cartpole_refresh_metadata(DUMP_WINDOW_S));
         }
-        return console_transaction_result("CONFIG", cartpole_configure(req->name, req->value, 1.0));
+        char operation[32];
+        snprintf(operation, sizeof operation, "CONFIG %s", req->name);
+        return console_transaction_result(operation,
+                                          cartpole_configure(req->name, req->value, 1.0));
+    }
     case CONSOLE_CMD_RESET: {
-        if (ensure_mode_known() != 0)
+        if (query_mode_for_command() != 0)
             return -1;
         int known;
         cartpole_snapshot_t snapshot = cartpole_snapshot();
-        known = snapshot.mode_known;
-        fw_mode_t m = snapshot.mode;
+        known = snapshot.is_mode_received;
+        fw_mode_t m = snapshot.reported_mode;
         if (known && m == FW_DISABLED) {
             printf("[edge] already DISABLED\n");
             return 0;
@@ -322,7 +326,7 @@ static int handle_line(const char *line, int *holding, double *held_vel)
         if (console_transaction_result("STATE", cartpole_wait_state(CFG_STATE_TIMEOUT_S)) != 0) {
             return 0;
         }
-        if (ensure_mode_known() != 0) {
+        if (query_mode_for_command() != 0) {
             printf("[edge] WARNING: no MODE reply, ignoring vel\n");
             return 0;
         }
@@ -355,14 +359,15 @@ static void tick_hold(int *holding, double held_vel)
     }
     int known;
     cartpole_snapshot_t snapshot = cartpole_snapshot();
-    known = snapshot.mode_known;
-    fw_mode_t m = snapshot.mode;
-    double age = cartpole_snapshot_age(snapshot);
+    known = snapshot.is_mode_received;
+    fw_mode_t m = snapshot.reported_mode;
+    double age = cartpole_state_age_s(snapshot);
     if (!known || m != FW_READY) {
         *holding = 0;
         printf("[edge] hold released (firmware in %s)\n",
                known ? proto_mode_name(m) : "unknown mode");
-    } else if (!(snapshot.valid_flags & 1) || age < 0.0 || age > CFG_STATE_TIMEOUT_S) {
+    } else if (!(snapshot.measurement_validity_bits & CARTPOLE_MEASUREMENT_CART_VALID) ||
+               age < 0.0 || age > CFG_STATE_TIMEOUT_S) {
         *holding = 0;
         cartpole_send_vel(0.0);
         printf("[edge] hold released: cart measurement unavailable; zero requested\n");
@@ -441,11 +446,11 @@ out:
 
 int console_goto_center(double timeout_s)
 {
-    double end = cartpole_now_s() + timeout_s;
-    if (console_transaction_result("QUERY", cartpole_sync_mode(fmax(0., end - cartpole_now_s()))) !=
-        0)
+    double end = cartpole_host_monotonic_s() + timeout_s;
+    if (console_transaction_result(
+            "QUERY", cartpole_sync_mode(fmax(0., end - cartpole_host_monotonic_s()))) != 0)
         return -1;
-    while (!cartpole_stop_requested() && cartpole_now_s() < end) {
+    while (!cartpole_stop_requested() && cartpole_host_monotonic_s() < end) {
         int p = cartpole_pump();
         if (p < 0)
             break;
@@ -454,22 +459,24 @@ int console_goto_center(double timeout_s)
             continue;
         }
         cartpole_snapshot_t snapshot = cartpole_snapshot();
-        if (!snapshot.mode_known || snapshot.mode != FW_READY || !(snapshot.valid_flags & 1) ||
-            cartpole_snapshot_age(snapshot) < 0 ||
-            cartpole_snapshot_age(snapshot) > CFG_STATE_TIMEOUT_S)
+        if (!snapshot.is_mode_received || snapshot.reported_mode != FW_READY ||
+            !(snapshot.measurement_validity_bits & CARTPOLE_MEASUREMENT_CART_VALID) ||
+            cartpole_state_age_s(snapshot) < 0 ||
+            cartpole_state_age_s(snapshot) > CFG_STATE_TIMEOUT_S)
             break;
         if (snapshot.x_um > -5000 && snapshot.x_um < 5000) {
             if (cartpole_send_vel(0.) != 0)
                 return -1;
             /* 持续零速并等待小车速度回报，不能把请求发送等同停稳。 */
-            uint64_t seq = snapshot.state_sequence;
-            while (!cartpole_stop_requested() && cartpole_now_s() < end) {
+            uint64_t seq = snapshot.received_state_count;
+            while (!cartpole_stop_requested() && cartpole_host_monotonic_s() < end) {
                 if (cartpole_pump() < 0)
                     return -1;
                 snapshot = cartpole_snapshot();
-                if (snapshot.mode != FW_READY || !(snapshot.valid_flags & 1))
+                if (snapshot.reported_mode != FW_READY ||
+                    !(snapshot.measurement_validity_bits & CARTPOLE_MEASUREMENT_CART_VALID))
                     return -1;
-                if (snapshot.state_sequence != seq && snapshot.vx_mm_s == 0)
+                if (snapshot.received_state_count != seq && snapshot.vx_mm_s == 0)
                     return 0;
                 if (cartpole_send_vel(0.) != 0)
                     return -1;
@@ -488,12 +495,12 @@ int console_goto_center(double timeout_s)
 void console_print_state(void)
 {
     cartpole_snapshot_t snapshot = cartpole_snapshot();
-    if (snapshot.state_received_at_s < 0) {
+    if (snapshot.last_state_received_host_monotonic_s < 0) {
         puts("[edge] no STATE received");
         return;
     }
     printf("STATE flags=%u x=%lld um theta=%lld urad vx=%lld mm/s omega=%lld mrad/s age=%.1f ms\n",
-           snapshot.valid_flags, (long long)snapshot.x_um, (long long)snapshot.theta_urad,
-           (long long)snapshot.vx_mm_s, (long long)snapshot.vth_mrad_s,
-           cartpole_snapshot_age(snapshot) * 1000.);
+           snapshot.measurement_validity_bits, (long long)snapshot.x_um,
+           (long long)snapshot.theta_urad, (long long)snapshot.vx_mm_s,
+           (long long)snapshot.vth_mrad_s, cartpole_state_age_s(snapshot) * 1000.);
 }

@@ -94,7 +94,7 @@ class Firmware:
                 while not self.injections.empty():
                     self.send(self.injections.get_nowait())
                 if self.stream:
-                    self.send(f"STATE {self.flags} 123 {self.theta} 0 0")
+                    self.send(f"STATE {self.flags} {123 if self.flags & 1 else 0} {self.theta if self.flags & 2 else 0} 0 0")
         except BaseException as exc:
             self.error = exc
 
@@ -234,6 +234,14 @@ class CommandTests(unittest.TestCase):
             self.assertIn("execution unconfirmed", result.stderr)
             self.assertIn("do not automatically retry", result.stderr)
             self.assertEqual(fw.commands.count("ENABLE"), 1)
+
+    def test_velocity_invalid_cart_is_not_mislabeled_as_bad_velocity(self):
+        with Firmware(flags=2) as fw:
+            result = fw.run("vel", "100", "--hold", "0.01")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("cart measurement invalid", result.stderr)
+            self.assertNotIn("invalid velocity", result.stderr)
+            self.assertNotIn("VEL 100", fw.commands)
 
     def test_state_duration_accepts_argument_and_observes_lines(self):
         with Firmware() as fw:

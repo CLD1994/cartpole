@@ -5,6 +5,12 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+_Static_assert(CARTPOLE_MEASUREMENT_CART_VALID == 1u, "cart validity wire bit");
+_Static_assert(CARTPOLE_MEASUREMENT_POLE_VALID == 2u, "pole validity wire bit");
+_Static_assert(sizeof(((cartpole_snapshot_t *)0)->received_state_count) == sizeof(uint64_t),
+               "host STATE count stays 64-bit");
+_Static_assert(sizeof(((cartpole_snapshot_t *)0)->received_unknown_line_count) == sizeof(uint64_t),
+               "host unknown count stays 64-bit");
 static char input[16384];
 static size_t used;
 static int reads, broken, write_fail;
@@ -133,13 +139,13 @@ static cartpole_snapshot_t observed_snapshots[8];
 static void update_hook(proto_msg_type_t event, const cartpole_snapshot_t *snapshot, void *context)
 {
     assert(event == PROTO_STATE || event == PROTO_MODE || event == PROTO_OK);
-    assert(snapshot->state_sequence == cartpole_snapshot().state_sequence);
+    assert(snapshot->received_state_count == cartpole_snapshot().received_state_count);
     assert(context == &hook_calls);
     assert(hook_calls < 8);
     observed_events[hook_calls] = event;
     observed_snapshots[hook_calls] = *snapshot;
-    observed_flags[hook_calls] = snapshot->valid_flags;
-    observed_modes[hook_calls] = snapshot->mode;
+    observed_flags[hook_calls] = snapshot->measurement_validity_bits;
+    observed_modes[hook_calls] = snapshot->reported_mode;
     hook_calls++;
 }
 
@@ -148,25 +154,30 @@ int main(void)
     open_ready();
     query_reply = "MODE FAULT MT6835\n";
     assert(cartpole_sync_mode(.02) == CARTPOLE_OK);
-    assert(cartpole_snapshot().mode == FW_FAULT);
+    assert(cartpole_snapshot().reported_mode == FW_FAULT);
     cartpole_request_stop();
     cartpole_close();
-    assert(!cartpole_snapshot().connected && !cartpole_snapshot().mode_known &&
-           cartpole_snapshot().valid_flags == 0);
+    assert(!cartpole_snapshot().is_serial_open && !cartpole_snapshot().is_mode_received &&
+           cartpole_snapshot().measurement_validity_bits == 0);
     assert(cartpole_open("fake", 460800) == 0);
     assert(!cartpole_stop_requested());
+    assert(cartpole_snapshot().is_serial_open);
+    assert(cartpole_snapshot().received_state_count == 0);
+    assert(cartpole_snapshot().received_unknown_line_count == 0);
+    assert(!cartpole_snapshot().has_received_fault_mode);
+    assert(!cartpole_snapshot().has_stream_failure_latch);
     int known;
-    (known = cartpole_snapshot().mode_known, cartpole_snapshot().mode);
+    (known = cartpole_snapshot().is_mode_received, cartpole_snapshot().reported_mode);
     assert(!known);
-    assert(cartpole_snapshot_age(cartpole_snapshot()) < 0);
-    assert(cartpole_snapshot().valid_flags == 0);
+    assert(cartpole_state_age_s(cartpole_snapshot()) < 0);
+    assert(cartpole_snapshot().measurement_validity_bits == 0);
     /* 事务预算不能在drain/send后重置；过期也不得接受已排队回执。 */
     open_ready();
     enable_reply = "MODE READY NONE\n";
     write_delay = .01;
-    double started = cartpole_now_s();
+    double started = cartpole_host_monotonic_s();
     assert(cartpole_enable(.003) == CARTPOLE_TIMEOUT);
-    assert(cartpole_now_s() - started < .014);
+    assert(cartpole_host_monotonic_s() - started < .014);
     write_delay = 0;
     /* 每次QUERY必须等新响应。 */
     open_ready();
@@ -182,7 +193,7 @@ int main(void)
     /* 无效小车不能变成零值有效测量。 */
     queue("STATE 2 0 20 0 2\n");
     assert(cartpole_pump() == 0);
-    assert(cartpole_snapshot().valid_flags == 2);
+    assert(cartpole_snapshot().measurement_validity_bits == 2);
     assert(cartpole_send_vel(10) == -1);
     assert(cartpole_send_vel(0) == 0);
     /* 不匹配回执不能满足配置，回显不同不能报成功。 */
@@ -203,6 +214,13 @@ int main(void)
     int64_t v;
     assert(cartpole_cached_value("CAL_LENGTH_UM", &v) == 0 && v == 894845);
     assert(cartpole_cached_value("VEL_MAX", &v) == 0 && v == 900);
+    cartpole_snapshot_t before_bad_lookup = cartpole_snapshot();
+    assert(cartpole_cached_value(NULL, &v) == -1);
+    assert(cartpole_cached_value("", &v) == -1);
+    assert(v == 900);
+    assert(cartpole_snapshot().received_state_count == before_bad_lookup.received_state_count);
+    assert(cartpole_snapshot().has_stream_failure_latch ==
+           before_bad_lookup.has_stream_failure_latch);
     assert(cq == config_queries && ca == calib_queries);
     /* pump有界且故障不能视为无数据。 */
     open_ready();
@@ -212,7 +230,7 @@ int main(void)
     assert(cartpole_pump() == 1 && reads == 8 && used > 0);
     open_ready();
     broken = 1;
-    assert(cartpole_pump() == -1 && cartpole_snapshot().io_error);
+    assert(cartpole_pump() == -1 && cartpole_snapshot().has_stream_failure_latch);
     /* 信号之后仍确认退出，FAULT不冒充DISABLED。 */
     open_ready();
     query_reply = NULL;
@@ -239,41 +257,45 @@ int main(void)
     open_ready();
     queue("MODE FAULT MT6835\nMODE READY NONE\n");
     assert(cartpole_pump() == 0);
-    assert(cartpole_snapshot().fault_seen);
+    assert(cartpole_snapshot().has_received_fault_mode);
     open_ready();
-    double received_at = cartpole_snapshot().state_received_at_s;
-    assert(received_at > 0 && received_at <= cartpole_now_s());
+    double received_at = cartpole_snapshot().last_state_received_host_monotonic_s;
+    assert(received_at > 0 && received_at <= cartpole_host_monotonic_s());
     cartpole_snapshot_t before = cartpole_snapshot();
     cartpole_set_observer(update_hook, &hook_calls);
     queue("STATE 1 0 0 0 0\nSTATE 3 0 0 0 0\nMODE DISABLED NONE\nMODE READY NONE\nOK ACC_MAX "
           "10000\n");
     assert(cartpole_pump() == 0 && hook_calls == 5);
     assert(observed_flags[0] == 1 && observed_flags[1] == 3);
-    assert(before.state_sequence + 2 == cartpole_snapshot().state_sequence);
-    assert(before.state_received_at_s == received_at);
+    assert(before.received_state_count + 2 == cartpole_snapshot().received_state_count);
+    assert(before.last_state_received_host_monotonic_s == received_at);
     assert(observed_events[0] == PROTO_STATE && observed_events[2] == PROTO_MODE &&
            observed_events[4] == PROTO_OK);
     for (int i = 2; i < 5; i++) {
-        assert(observed_snapshots[i].state_sequence == observed_snapshots[1].state_sequence);
-        assert(observed_snapshots[i].state_received_at_s ==
-               observed_snapshots[1].state_received_at_s);
+        assert(observed_snapshots[i].received_state_count ==
+               observed_snapshots[1].received_state_count);
+        assert(observed_snapshots[i].last_state_received_host_monotonic_s ==
+               observed_snapshots[1].last_state_received_host_monotonic_s);
     }
     assert(observed_modes[2] == FW_DISABLED && observed_modes[3] == FW_READY);
-    assert(cartpole_snapshot().state_received_at_s >= received_at);
+    assert(cartpole_snapshot().last_state_received_host_monotonic_s >= received_at);
     open_ready();
     assert(hook_calls == 5); /* open clears hook */
     open_ready();
     try_result = 0;
     int old_calls = try_calls;
-    assert(cartpole_try_send_vel(10, cartpole_now_s() - 1.) == 1 && try_calls == old_calls);
-    assert(cartpole_try_send_vel(10, cartpole_now_s() + 1.) == 0);
+    assert(cartpole_try_send_vel(10, cartpole_host_monotonic_s() - 1.) == 1 &&
+           try_calls == old_calls);
+    assert(cartpole_try_send_vel(10, cartpole_host_monotonic_s() + 1.) == 0);
     write_delay = .02;
-    assert(cartpole_try_send_vel(10, cartpole_now_s() + .01) == 2);
+    assert(cartpole_try_send_vel(10, cartpole_host_monotonic_s() + .01) == 2);
     write_delay = 0.;
     try_result = 1;
-    assert(cartpole_try_send_vel(10, cartpole_now_s() + 1.) == 1 && !cartpole_snapshot().io_error);
+    assert(cartpole_try_send_vel(10, cartpole_host_monotonic_s() + 1.) == 1 &&
+           !cartpole_snapshot().has_stream_failure_latch);
     try_result = -2;
-    assert(cartpole_try_send_vel(10, cartpole_now_s() + 1.) == -1 && cartpole_snapshot().io_error);
+    assert(cartpole_try_send_vel(10, cartpole_host_monotonic_s() + 1.) == -1 &&
+           cartpole_snapshot().has_stream_failure_latch);
     try_result = 0;
     int old_newlines = framing_newlines;
     assert(cartpole_send_vel(0) == 0 && framing_newlines == old_newlines + 1);
@@ -296,7 +318,7 @@ int main(void)
     assert(cartpole_mark((cartpole_endpoint_t)99, .02) == CARTPOLE_INVALID_ARGUMENT);
     reset_reply = "MODE DISABLED NONE\n";
     assert(cartpole_reset(.02) == 0);
-    assert(cartpole_snapshot().mode == FW_DISABLED);
+    assert(cartpole_snapshot().reported_mode == FW_DISABLED);
     reset_reply = "ERR RESET\nMODE DISABLED NONE\n";
     assert(cartpole_reset(.02) == CARTPOLE_REJECTED);
     open_ready();
@@ -309,7 +331,7 @@ int main(void)
     open_ready();
     assert(cartpole_configure(NULL, 900, .02) == CARTPOLE_INVALID_ARGUMENT);
     assert(cartpole_configure("BAD\nNAME", 900, .02) == CARTPOLE_INVALID_ARGUMENT);
-    assert(!cartpole_snapshot().io_error);
+    assert(!cartpole_snapshot().has_stream_failure_latch);
     assert(cartpole_sync_mode(0) == CARTPOLE_INVALID_ARGUMENT);
     assert(cartpole_wait_state(-1) == CARTPOLE_INVALID_ARGUMENT);
     broken = 1;
@@ -337,10 +359,11 @@ int main(void)
     reset_reply = "MODE DISABLED NONE\n";
     assert(cartpole_reset(.02) == CARTPOLE_OK); /* historicalFAULT isn't newFAULT */
     open_ready();
-    assert(cartpole_send_vel(NAN) == CARTPOLE_SEND_ERROR && !cartpole_snapshot().io_error);
+    assert(cartpole_send_vel(NAN) == CARTPOLE_SEND_ERROR &&
+           !cartpole_snapshot().has_stream_failure_latch);
     try_result = 1;
     assert(cartpole_send_vel(10) == CARTPOLE_SEND_ERROR);
-    assert(cartpole_snapshot().io_error);
+    assert(cartpole_snapshot().has_stream_failure_latch);
     try_result = 0;
     int before_retry = try_calls;
     assert(cartpole_send_vel(10) == CARTPOLE_SEND_ERROR && try_calls == before_retry);

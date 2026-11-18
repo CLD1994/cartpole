@@ -11,7 +11,7 @@
 static volatile sig_atomic_t g_stop;
 static uart_t g_uart = {.fd = -1};
 static proto_rx_t g_rx;
-static cartpole_snapshot_t g_snapshot = {.state_received_at_s = -1.};
+static cartpole_snapshot_t g_snapshot = {.last_state_received_host_monotonic_s = -1.};
 static int g_need_frame_boundary;
 static uint64_t g_mode_seq, g_fault_seq;
 /* 首个流错误在发生处分类并锁存，独立于展示用snapshot。 */
@@ -37,9 +37,11 @@ cartpole_snapshot_t cartpole_snapshot(void)
 {
     return g_snapshot;
 }
-double cartpole_snapshot_age(cartpole_snapshot_t s)
+double cartpole_state_age_s(cartpole_snapshot_t s)
 {
-    return s.state_received_at_s < 0 ? -1. : cartpole_now_s() - s.state_received_at_s;
+    return s.last_state_received_host_monotonic_s < 0
+               ? -1.
+               : cartpole_host_monotonic_s() - s.last_state_received_host_monotonic_s;
 }
 
 static void nap_ms(int ms)
@@ -47,7 +49,7 @@ static void nap_ms(int ms)
     struct timespec t = {0, (long)ms * 1000000};
     nanosleep(&t, NULL);
 }
-double cartpole_now_s(void)
+double cartpole_host_monotonic_s(void)
 {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
@@ -89,13 +91,13 @@ static void stream_failed(cartpole_result_t result)
 {
     if (g_stream_error == CARTPOLE_OK)
         g_stream_error = result;
-    g_snapshot.io_error = 1;
+    g_snapshot.has_stream_failure_latch = 1;
 }
 static cartpole_result_t checkpoint(double end, int cleanup)
 {
     if (!cleanup && g_stop)
         return CARTPOLE_CANCELLED;
-    if (cartpole_now_s() >= end)
+    if (cartpole_host_monotonic_s() >= end)
         return CARTPOLE_TIMEOUT;
     return CARTPOLE_OK;
 }
@@ -103,7 +105,7 @@ static cartpole_result_t deadline(double timeout, double *end)
 {
     if (!isfinite(timeout) || timeout <= 0.)
         return CARTPOLE_INVALID_ARGUMENT;
-    *end = cartpole_now_s() + timeout;
+    *end = cartpole_host_monotonic_s() + timeout;
     if (!isfinite(*end))
         return CARTPOLE_INVALID_ARGUMENT;
     return CARTPOLE_OK;
@@ -140,19 +142,20 @@ static cartpole_result_t send_line(const char *s, size_t n, double end, int clea
     }
     return write_until((const uint8_t *)s, n, end, cleanup);
 }
-cartpole_send_result_t cartpole_try_send_vel(double v, double deadline_s)
+cartpole_send_result_t cartpole_try_send_vel(double v, double deadline_host_monotonic_s)
 {
     char line[64];
     size_t n = proto_format_vel(line, v);
-    if (!n || !isfinite(deadline_s) || g_stop || g_snapshot.io_error || !g_snapshot.mode_known ||
-        g_snapshot.mode != FW_READY || g_snapshot.reason != FW_REASON_NONE ||
-        !(g_snapshot.valid_flags & 1))
+    if (!n || !isfinite(deadline_host_monotonic_s) || g_stop ||
+        g_snapshot.has_stream_failure_latch || !g_snapshot.is_mode_received ||
+        g_snapshot.reported_mode != FW_READY || g_snapshot.reported_mode_reason != FW_REASON_NONE ||
+        !(g_snapshot.measurement_validity_bits & CARTPOLE_MEASUREMENT_CART_VALID))
         return CARTPOLE_SEND_ERROR;
-    double now = cartpole_now_s();
-    if (now >= deadline_s)
+    double now = cartpole_host_monotonic_s();
+    if (now >= deadline_host_monotonic_s)
         return CARTPOLE_SEND_SKIPPED;
-    if (g_snapshot.state_received_at_s < 0 ||
-        now - g_snapshot.state_received_at_s > CFG_STATE_TIMEOUT_S)
+    if (g_snapshot.last_state_received_host_monotonic_s < 0 ||
+        now - g_snapshot.last_state_received_host_monotonic_s > CFG_STATE_TIMEOUT_S)
         return CARTPOLE_SEND_ERROR;
     int result = uart_try_write_all(&g_uart, (const uint8_t *)line, n);
     if (result < 0) {
@@ -160,7 +163,7 @@ cartpole_send_result_t cartpole_try_send_vel(double v, double deadline_s)
         g_need_frame_boundary = 1;
         return CARTPOLE_SEND_ERROR;
     }
-    if (result == 0 && cartpole_now_s() >= deadline_s)
+    if (result == 0 && cartpole_host_monotonic_s() >= deadline_host_monotonic_s)
         return CARTPOLE_SEND_LATE; /* 已完整写入，不能撤销；调用方终止控制并执行停止流程。 */
     return result == 0 ? CARTPOLE_SEND_COMPLETE : CARTPOLE_SEND_SKIPPED;
 }
@@ -178,12 +181,14 @@ cartpole_send_result_t cartpole_send_vel(double v)
     if (!length)
         return CARTPOLE_SEND_ERROR;
     /* 零速清理可在错误/取消后执行；非零维护发送失败会锁住后续非零发送。 */
-    if (v != 0. && (g_stop || g_snapshot.io_error || !g_snapshot.mode_known ||
-                    g_snapshot.mode != FW_READY || g_snapshot.reason != FW_REASON_NONE ||
-                    !(g_snapshot.valid_flags & 1) || cartpole_snapshot_age(g_snapshot) < 0 ||
-                    cartpole_snapshot_age(g_snapshot) > CFG_STATE_TIMEOUT_S))
+    if (v != 0. && (g_stop || g_snapshot.has_stream_failure_latch || !g_snapshot.is_mode_received ||
+                    g_snapshot.reported_mode != FW_READY ||
+                    g_snapshot.reported_mode_reason != FW_REASON_NONE ||
+                    !(g_snapshot.measurement_validity_bits & CARTPOLE_MEASUREMENT_CART_VALID) ||
+                    cartpole_state_age_s(g_snapshot) < 0 ||
+                    cartpole_state_age_s(g_snapshot) > CFG_STATE_TIMEOUT_S))
         return CARTPOLE_SEND_ERROR;
-    cartpole_result_t result = send_line(line, length, cartpole_now_s() + .020, v == 0.);
+    cartpole_result_t result = send_line(line, length, cartpole_host_monotonic_s() + .020, v == 0.);
     if (result != CARTPOLE_OK && v != 0.)
         stream_failed(result);
     return result == CARTPOLE_OK ? CARTPOLE_SEND_COMPLETE : CARTPOLE_SEND_ERROR;
@@ -214,18 +219,18 @@ int cartpole_open(const char *port, int baud)
     if (g_uart.fd >= 0)
         uart_close(&g_uart);
     g_stop = 0;
-    g_snapshot.io_error = 0;
+    g_snapshot.has_stream_failure_latch = 0;
     g_stream_error = CARTPOLE_OK;
     g_fault_seq = 0;
     g_need_frame_boundary = 0;
-    g_snapshot.fault_seen = 0;
-    g_snapshot.valid_flags = 0;
-    g_snapshot.state_sequence = g_mode_seq = 0;
-    g_snapshot.state_received_at_s = -1.;
-    g_snapshot.state_count = g_snapshot.unknown_count = 0;
-    g_snapshot.mode = FW_DISABLED;
-    g_snapshot.reason = FW_REASON_NONE;
-    g_snapshot.mode_known = 0;
+    g_snapshot.has_received_fault_mode = 0;
+    g_snapshot.measurement_validity_bits = 0;
+    g_snapshot.received_state_count = g_mode_seq = 0;
+    g_snapshot.last_state_received_host_monotonic_s = -1.;
+    g_snapshot.received_unknown_line_count = 0;
+    g_snapshot.reported_mode = FW_DISABLED;
+    g_snapshot.reported_mode_reason = FW_REASON_NONE;
+    g_snapshot.is_mode_received = 0;
     g_snapshot.x_um = g_snapshot.theta_urad = g_snapshot.vx_mm_s = g_snapshot.vth_mrad_s = 0;
     g_value_count = 0;
     g_update_hook = NULL;
@@ -233,13 +238,13 @@ int cartpole_open(const char *port, int baud)
     await_name("");
     proto_rx_init(&g_rx);
     int result = uart_open(&g_uart, port, baud);
-    g_snapshot.connected = result == 0;
+    g_snapshot.is_serial_open = result == 0;
     return result;
 }
 void cartpole_close(void)
 {
     uart_close(&g_uart);
-    g_snapshot = (cartpole_snapshot_t){.state_received_at_s = -1.};
+    g_snapshot = (cartpole_snapshot_t){.last_state_received_host_monotonic_s = -1.};
     g_value_count = 0;
     g_stream_error = CARTPOLE_OK;
     g_update_hook = NULL;
@@ -261,6 +266,8 @@ static void cache_value(const char *name, int64_t value)
 }
 int cartpole_cached_value(const char *name, int64_t *value)
 {
+    if (!name || !name[0])
+        return -1;
     for (size_t i = 0; i < g_value_count; i++)
         if (!strcmp(name, g_values[i].name)) {
             if (value)
@@ -275,31 +282,31 @@ static void handle_line(const char *line, size_t len, void *user)
     (void)user;
     proto_msg_t m;
     if (proto_parse_line(line, &m) == PROTO_UNKNOWN) {
-        g_snapshot.unknown_count++;
+        g_snapshot.received_unknown_line_count++;
         if (!strncmp(line, "STATE", 5) || !strncmp(line, "MODE", 4) || !strcmp(line, "!OVERLONG"))
             stream_failed(CARTPOLE_PROTOCOL_ERROR);
         return;
     }
     switch (m.type) {
     case PROTO_STATE:
-        g_snapshot.valid_flags = m.valid_flags;
+        g_snapshot.measurement_validity_bits = m.valid_flags;
         g_snapshot.x_um = m.x_um;
         g_snapshot.theta_urad = m.theta_urad;
         g_snapshot.vx_mm_s = m.vx_mm_s;
         g_snapshot.vth_mrad_s = m.vth_mrad_s;
-        g_snapshot.state_received_at_s = cartpole_now_s();
-        g_snapshot.state_sequence++;
-        g_snapshot.state_count++;
+        g_snapshot.last_state_received_host_monotonic_s = cartpole_host_monotonic_s();
+        g_snapshot.received_state_count++;
         break;
     case PROTO_MODE:
-        if (!g_snapshot.mode_known || g_snapshot.mode != m.mode || g_snapshot.reason != m.reason)
+        if (!g_snapshot.is_mode_received || g_snapshot.reported_mode != m.mode ||
+            g_snapshot.reported_mode_reason != m.reason)
             printf("[edge] MODE %s %s\n", proto_mode_name(m.mode), proto_reason_name(m.reason));
-        g_snapshot.mode = m.mode;
-        g_snapshot.reason = m.reason;
-        g_snapshot.mode_known = 1;
+        g_snapshot.reported_mode = m.mode;
+        g_snapshot.reported_mode_reason = m.reason;
+        g_snapshot.is_mode_received = 1;
         g_mode_seq++;
         if (m.mode == FW_FAULT) {
-            g_snapshot.fault_seen = 1;
+            g_snapshot.has_received_fault_mode = 1;
             g_fault_seq++;
         }
         break;
@@ -337,10 +344,10 @@ static int pump(int cleanup)
             return -1;
         }
         if (n == 0)
-            return !cleanup && g_snapshot.io_error ? -1 : 0;
+            return !cleanup && g_snapshot.has_stream_failure_latch ? -1 : 0;
         bytes += (size_t)n;
         proto_rx_feed(&g_rx, buf, (size_t)n, handle_line, NULL);
-        if (!cleanup && g_snapshot.io_error)
+        if (!cleanup && g_snapshot.has_stream_failure_latch)
             return -1;
     }
     return 1;
@@ -400,10 +407,10 @@ cartpole_result_t cartpole_wait_state(double timeout_s)
 {
     double end;
     TX_TRY(deadline(timeout_s, &end));
-    uint64_t seq = g_snapshot.state_sequence;
+    uint64_t seq = g_snapshot.received_state_count;
     for (;;) {
         TX_TRY(receive(end));
-        if (g_snapshot.state_sequence != seq)
+        if (g_snapshot.received_state_count != seq)
             return CARTPOLE_OK;
         nap_ms(1);
     }
@@ -469,7 +476,8 @@ static cartpole_result_t mode_transaction(const char *command, fw_mode_t target,
             return CARTPOLE_REJECTED;
         if (g_fault_seq != faults)
             return CARTPOLE_FAULT;
-        if (g_mode_seq != seq && g_snapshot.mode == target && g_snapshot.reason == FW_REASON_NONE)
+        if (g_mode_seq != seq && g_snapshot.reported_mode == target &&
+            g_snapshot.reported_mode_reason == FW_REASON_NONE)
             return CARTPOLE_OK;
         nap_ms(1);
     }
@@ -487,29 +495,31 @@ cartpole_stop_result_t cartpole_stop_and_confirm(double timeout_s)
     int drained;
     do {
         drained = pump(1);
-    } while (drained == 1 && cartpole_now_s() < end);
+    } while (drained == 1 && cartpole_host_monotonic_s() < end);
     if (drained != 0)
         return CARTPOLE_STOP_UNCONFIRMED;
-    uint64_t mode_seq = g_mode_seq, state_seq = g_snapshot.state_sequence;
+    uint64_t mode_seq = g_mode_seq, state_seq = g_snapshot.received_state_count;
     double next_send = 0.;
     int zero_observed = 0;
-    while (cartpole_now_s() < end) {
-        if (cartpole_now_s() >= next_send) {
+    while (cartpole_host_monotonic_s() < end) {
+        if (cartpole_host_monotonic_s() >= next_send) {
             (void)send_simple("VEL 0", end, 1);
             if (zero_observed)
                 (void)send_simple("DISABLE", end, 1);
             (void)send_simple("QUERY", end, 1);
-            next_send = cartpole_now_s() + .02;
+            next_send = cartpole_host_monotonic_s() + .02;
         }
-        if (pump(1) < 0 || cartpole_now_s() >= end)
+        if (pump(1) < 0 || cartpole_host_monotonic_s() >= end)
             return CARTPOLE_STOP_UNCONFIRMED;
         if (g_mode_seq != mode_seq) {
-            if (g_snapshot.mode == FW_DISABLED && g_snapshot.reason == FW_REASON_NONE)
+            if (g_snapshot.reported_mode == FW_DISABLED &&
+                g_snapshot.reported_mode_reason == FW_REASON_NONE)
                 return CARTPOLE_STOP_DISABLED;
-            if (g_snapshot.mode == FW_FAULT)
+            if (g_snapshot.reported_mode == FW_FAULT)
                 return CARTPOLE_STOP_FAULT;
         }
-        if (g_snapshot.state_sequence != state_seq && (g_snapshot.valid_flags & 1) &&
+        if (g_snapshot.received_state_count != state_seq &&
+            (g_snapshot.measurement_validity_bits & CARTPOLE_MEASUREMENT_CART_VALID) &&
             g_snapshot.vx_mm_s == 0 && !zero_observed) {
             zero_observed = 1;
             next_send = 0.;

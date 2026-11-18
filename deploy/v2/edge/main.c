@@ -7,6 +7,7 @@
 #include "policy.h"
 #include "proto.h"
 
+#include <inttypes.h>
 #include <math.h>
 #include <signal.h>
 #include <stdio.h>
@@ -43,13 +44,14 @@ static control_input snapshot_input(const cartpole_snapshot_t *snapshot,
                                     cartpole_pump_result_t pump_result)
 {
     control_input in = {0};
-    in.ready = snapshot->mode_known && snapshot->mode == FW_READY &&
-               snapshot->reason == FW_REASON_NONE && !snapshot->fault_seen;
-    in.flags = snapshot->valid_flags;
-    in.age_s = cartpole_snapshot_age(*snapshot);
+    in.ready = snapshot->is_mode_received && snapshot->reported_mode == FW_READY &&
+               snapshot->reported_mode_reason == FW_REASON_NONE &&
+               !snapshot->has_received_fault_mode;
+    in.flags = snapshot->measurement_validity_bits;
+    in.age_s = cartpole_state_age_s(*snapshot);
     in.theta_rad = (double)snapshot->theta_urad * 1e-6;
     in.backlog = pump_result == CARTPOLE_PUMP_BACKLOG;
-    in.io_error = pump_result == CARTPOLE_PUMP_ERROR || snapshot->io_error;
+    in.io_error = pump_result == CARTPOLE_PUMP_ERROR || snapshot->has_stream_failure_latch;
     return in;
 }
 static control_input current_input(cartpole_pump_result_t result)
@@ -92,7 +94,7 @@ static void observe_update(proto_msg_type_t event, const cartpole_snapshot_t *sn
     control_input in = snapshot_input(snapshot, CARTPOLE_PUMP_EMPTY);
     if (!active_metadata_matches(runtime->package, runtime->length, runtime->margin))
         in.io_error = 1;
-    (void)control_observe(&runtime->gate, &in, snapshot->state_received_at_s);
+    (void)control_observe(&runtime->gate, &in, snapshot->last_state_received_host_monotonic_s);
 }
 
 static int control_end(int result)
@@ -105,10 +107,10 @@ static int control_loop(const edge_package *package, int64_t length, int64_t mar
 {
     const double period = 1.0 / package->control_hz;
     const double track_limit_m = (length * .5 - margin) * 1e-6;
-    double next = cartpole_now_s();
+    double next = cartpole_host_monotonic_s();
     control_runtime runtime = {.package = package, .length = length, .margin = margin};
     runtime.gate.has_time = 1;
-    runtime.gate.last_observed_at = cartpole_snapshot().state_received_at_s;
+    runtime.gate.last_observed_at = cartpole_snapshot().last_state_received_host_monotonic_s;
     cartpole_set_observer(observe_update, &runtime);
     uint64_t consumed = 0;
     printf("[edge] %.0f Hz; scale %d mm/s; limit %d mm/s; angle pause 20/resume 18 deg\n",
@@ -125,7 +127,7 @@ static int control_loop(const edge_package *package, int64_t length, int64_t mar
             return control_end(-1);
         }
         cartpole_snapshot_t sample = cartpole_snapshot();
-        uint64_t seq = sample.state_sequence;
+        uint64_t seq = sample.received_state_count;
         if (decision == CONTROL_DRIVE && seq != consumed) {
             int64_t x, theta, vx, w;
             x = sample.x_um;
@@ -134,7 +136,7 @@ static int control_loop(const edge_package *package, int64_t length, int64_t mar
             w = sample.vth_mrad_s;
             float obs[4] = {(float)(x * 1e-6), (float)(package->angle_sign * theta * 1e-6),
                             (float)(vx * 1e-3), (float)(package->angle_sign * w * 1e-3)};
-            double sample_at = sample.state_received_at_s;
+            double sample_at = sample.last_state_received_host_monotonic_s;
             unsigned long long generation = runtime.gate.generation;
             float action;
             consumed = seq;
@@ -151,7 +153,7 @@ static int control_loop(const edge_package *package, int64_t length, int64_t mar
             if (decision == CONTROL_STOP)
                 return control_end(-1);
             if (decision == CONTROL_DRIVE && generation == runtime.gate.generation &&
-                !cartpole_stop_requested() && cartpole_now_s() - sample_at <= .020) {
+                !cartpole_stop_requested() && cartpole_host_monotonic_s() - sample_at <= .020) {
                 x = cartpole_snapshot().x_um;
                 double velocity =
                     control_velocity(action, package->action_scale_mm_s,
@@ -167,7 +169,7 @@ static int control_loop(const edge_package *package, int64_t length, int64_t mar
                 }
             }
         }
-        next = control_next_tick(next, cartpole_now_s(), period);
+        next = control_next_tick(next, cartpole_host_monotonic_s(), period);
     }
     return control_end(0);
 }
@@ -252,7 +254,7 @@ static int run_console(void)
         console_transaction_result("QUERY", query);
         return 1;
     }
-    fw_mode_t mode = cartpole_snapshot().mode;
+    fw_mode_t mode = cartpole_snapshot().reported_mode;
     printf("[edge] firmware mode: %s\n", proto_mode_name(mode));
 
     g_motion_session = 1;
@@ -277,24 +279,24 @@ static int oneshot_state_window(double secs)
     if (console_transaction_result("STATE", cartpole_wait_state(1.0)) != 0) {
         return 1;
     }
-    long states_before = cartpole_snapshot().state_count,
-         unknown_before = cartpole_snapshot().unknown_count;
+    uint64_t states_before = cartpole_snapshot().received_state_count,
+             unknown_before = cartpole_snapshot().received_unknown_line_count;
     int64_t x, th;
     int64_t xmin = INT64_MAX, xmax = INT64_MIN;
     int64_t thmin = INT64_MAX, thmax = INT64_MIN;
-    double t0 = cartpole_now_s();
-    while (!cartpole_stop_requested() && cartpole_now_s() - t0 < secs) {
+    double t0 = cartpole_host_monotonic_s();
+    while (!cartpole_stop_requested() && cartpole_host_monotonic_s() - t0 < secs) {
         if (cartpole_pump() < 0)
             return 1;
         x = cartpole_snapshot().x_um;
         th = cartpole_snapshot().theta_urad;
-        if (cartpole_snapshot().valid_flags & 1) {
+        if (cartpole_snapshot().measurement_validity_bits & CARTPOLE_MEASUREMENT_CART_VALID) {
             if (x < xmin)
                 xmin = x;
             if (x > xmax)
                 xmax = x;
         }
-        if (cartpole_snapshot().valid_flags & 2) {
+        if (cartpole_snapshot().measurement_validity_bits & CARTPOLE_MEASUREMENT_POLE_VALID) {
             if (th < thmin)
                 thmin = th;
             if (th > thmax)
@@ -302,12 +304,13 @@ static int oneshot_state_window(double secs)
         }
         nap_ms(20);
     }
-    double dt = cartpole_now_s() - t0;
-    double rate = dt > 0.0 ? (double)(cartpole_snapshot().state_count - states_before) / dt : 0.0;
-    long unknown = (cartpole_snapshot().unknown_count - unknown_before);
-    printf("[edge] window %.1f s: %ld STATE lines -> %.1f Hz (observed)\n", dt,
-           (cartpole_snapshot().state_count - states_before), rate);
-    printf("[edge] unknown lines: %ld (require 0)\n", unknown);
+    double dt = cartpole_host_monotonic_s() - t0;
+    double rate =
+        dt > 0.0 ? (double)(cartpole_snapshot().received_state_count - states_before) / dt : 0.0;
+    uint64_t unknown = (cartpole_snapshot().received_unknown_line_count - unknown_before);
+    printf("[edge] window %.1f s: %" PRIu64 " STATE lines -> %.1f Hz (observed)\n", dt,
+           (cartpole_snapshot().received_state_count - states_before), rate);
+    printf("[edge] unknown lines: %" PRIu64 " (require 0)\n", unknown);
     if (xmin != INT64_MAX)
         printf("[edge] sampled x range [%lld, %lld] um  (x = %.2f .. %.2f mm)\n", (long long)xmin,
                (long long)xmax, xmin / 1000.0, xmax / 1000.0);
@@ -318,7 +321,7 @@ static int oneshot_state_window(double secs)
                (long long)thmin, (long long)thmax, thmin / 17453.3, thmax / 17453.3);
     else
         puts("[edge] pole samples unavailable");
-    return ((cartpole_snapshot().state_count - states_before) > 0 && unknown == 0) ? 0 : 1;
+    return ((cartpole_snapshot().received_state_count - states_before) > 0 && unknown == 0) ? 0 : 1;
 }
 
 /* 看门狗断流验证（与 host 工具 wdt-test 同流程）：以 200 mm/s 持续喂狗
@@ -331,9 +334,9 @@ static int oneshot_wdt_test(void)
     int known;
     fw_reason_t reason;
     cartpole_snapshot_t snapshot = cartpole_snapshot();
-    known = snapshot.mode_known;
-    reason = snapshot.reason;
-    fw_mode_t mode = snapshot.mode;
+    known = snapshot.is_mode_received;
+    reason = snapshot.reported_mode_reason;
+    fw_mode_t mode = snapshot.reported_mode;
     if (!known || mode != FW_READY) {
         fprintf(stderr, "[edge] wdt-test requires READY (current %s)\n",
                 known ? proto_mode_name(mode) : "unknown");
@@ -343,16 +346,16 @@ static int oneshot_wdt_test(void)
         return 1;
     }
     g_motion_session = 1;
-    double t0 = cartpole_now_s();
-    while (!cartpole_stop_requested() && cartpole_now_s() - t0 < 1.0) {
+    double t0 = cartpole_host_monotonic_s();
+    while (!cartpole_stop_requested() && cartpole_host_monotonic_s() - t0 < 1.0) {
         if (cartpole_send_vel(200.0) != 0)
             return 1;
         cartpole_pump();
         nap_ms(5);
     }
     printf("[edge] feeding stopped, observing 1 s ...\n");
-    t0 = cartpole_now_s();
-    while (!cartpole_stop_requested() && cartpole_now_s() - t0 < 1.0) {
+    t0 = cartpole_host_monotonic_s();
+    while (!cartpole_stop_requested() && cartpole_host_monotonic_s() - t0 < 1.0) {
         cartpole_pump();
         nap_ms(20);
     }
@@ -360,9 +363,9 @@ static int oneshot_wdt_test(void)
         return 1;
     }
     snapshot = cartpole_snapshot();
-    known = snapshot.mode_known;
-    reason = snapshot.reason;
-    mode = snapshot.mode;
+    known = snapshot.is_mode_received;
+    reason = snapshot.reported_mode_reason;
+    mode = snapshot.reported_mode;
     printf("[edge] QUERY -> %s %s (expect READY NONE: watchdog is a transient guard)\n",
            known ? proto_mode_name(mode) : "unknown", known ? proto_reason_name(reason) : "-");
     return (known && mode == FW_READY && reason == FW_REASON_NONE) ? 0 : 1;
@@ -375,8 +378,8 @@ static int oneshot_vel(double v_mm_s, double hold_s)
     }
     int known;
     cartpole_snapshot_t snapshot = cartpole_snapshot();
-    known = snapshot.mode_known;
-    fw_mode_t mode = snapshot.mode;
+    known = snapshot.is_mode_received;
+    fw_mode_t mode = snapshot.reported_mode;
     if (!known || mode != FW_READY) {
         fprintf(stderr, "[edge] VEL requires READY (current %s)\n",
                 known ? proto_mode_name(mode) : "unknown");
@@ -388,30 +391,44 @@ static int oneshot_vel(double v_mm_s, double hold_s)
         return 1;
     }
     g_motion_session = 1;
-    if (!(cartpole_snapshot().valid_flags & 1) || cartpole_send_vel(v_mm_s) != 0) {
-        fprintf(stderr, "[edge] invalid velocity value\n");
+    snapshot = cartpole_snapshot();
+    if (!(snapshot.measurement_validity_bits & CARTPOLE_MEASUREMENT_CART_VALID)) {
+        fprintf(stderr, "[edge] VEL blocked: cart measurement invalid\n");
         return 1;
     }
-    double t0 = cartpole_now_s();
+    if (cartpole_send_vel(v_mm_s) != CARTPOLE_SEND_COMPLETE) {
+        fprintf(stderr, "[edge] VEL send failed or blocked by session checks\n");
+        return 1;
+    }
+    double t0 = cartpole_host_monotonic_s();
     int rc = 0;
-    while (!cartpole_stop_requested() && cartpole_now_s() - t0 < hold_s) {
+    while (!cartpole_stop_requested() && cartpole_host_monotonic_s() - t0 < hold_s) {
         cartpole_pump();
         snapshot = cartpole_snapshot();
-        known = snapshot.mode_known;
-        mode = snapshot.mode;
-        if (!known || mode != FW_READY || cartpole_snapshot().fault_seen ||
-            cartpole_snapshot().io_error || !(cartpole_snapshot().valid_flags & 1)) {
-            fprintf(stderr, "[edge] firmware left READY during hold\n");
+        known = snapshot.is_mode_received;
+        mode = snapshot.reported_mode;
+        const char *hold_failure = NULL;
+        if (!known || mode != FW_READY)
+            hold_failure = "reported mode is not READY";
+        else if (snapshot.has_received_fault_mode)
+            hold_failure = "MODE FAULT observed in this session";
+        else if (snapshot.has_stream_failure_latch)
+            hold_failure = "session stream failure latched";
+        else if (!(snapshot.measurement_validity_bits & CARTPOLE_MEASUREMENT_CART_VALID))
+            hold_failure = "cart measurement invalid";
+        if (hold_failure) {
+            fprintf(stderr, "[edge] VEL hold stopped: %s\n", hold_failure);
             rc = 1;
             break;
         }
-        double age = cartpole_snapshot_age(cartpole_snapshot());
+        double age = cartpole_state_age_s(snapshot);
         if (age < 0.0 || age > CFG_STATE_TIMEOUT_S) {
             fprintf(stderr, "[edge] WARNING: STATE stream stale during hold\n");
             rc = 1;
             break;
         }
-        if (cartpole_send_vel(v_mm_s) != 0) {
+        if (cartpole_send_vel(v_mm_s) != CARTPOLE_SEND_COMPLETE) {
+            fprintf(stderr, "[edge] VEL hold send failed or blocked by session checks\n");
             rc = 1;
             break;
         } /* 喂固件看门狗 */
