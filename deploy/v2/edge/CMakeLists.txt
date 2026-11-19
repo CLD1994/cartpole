@@ -45,6 +45,7 @@ add_executable(cartpole_edge
     serial_cartpole.c
     cartpole_controller.c
     cartpole_motion.c
+    cartpole_pole_calibration.c
     console.c
     policy.c
     cpu_policy.c

@@ -107,6 +107,8 @@ static bool parse_reason_word(const char *w, size_t len, fw_reason_t *out)
         *out = FW_REASON_AS5600;
     } else if (word_eq(w, len, "MT6835")) {
         *out = FW_REASON_MT6835;
+    } else if (word_eq(w, len, "POWER")) {
+        *out = FW_REASON_POWER;
     } else {
         return false;
     }
@@ -299,6 +301,8 @@ const char *proto_reason_name(fw_reason_t r)
         return "AS5600";
     case FW_REASON_MT6835:
         return "MT6835";
+    case FW_REASON_POWER:
+        return "POWER";
     default:
         return "?";
     }
@@ -349,7 +353,8 @@ bool proto_parse_command(const char *line, proto_command_t *out)
             {"QUERY\n", PROTO_COMMAND_QUERY}, {"CALIB?\n", PROTO_COMMAND_CALIBRATION_QUERY},
             {"CONFIG?\n", PROTO_COMMAND_CONFIGURATION_QUERY}, {"ENABLE\n", PROTO_COMMAND_ENABLE},
             {"DISABLE\n", PROTO_COMMAND_DISABLE}, {"RESET\n", PROTO_COMMAND_RESET},
-            {"MARK LEFT\n", PROTO_COMMAND_MARK_LEFT}, {"MARK RIGHT\n", PROTO_COMMAND_MARK_RIGHT}
+            {"MARK LEFT\n", PROTO_COMMAND_MARK_LEFT}, {"MARK RIGHT\n", PROTO_COMMAND_MARK_RIGHT},
+            {"CONFIRM LEFT\n", PROTO_COMMAND_CONFIRM_LEFT}
         };
         bool found = false;
         for (size_t i = 0; i < sizeof simple / sizeof *simple; i++) {

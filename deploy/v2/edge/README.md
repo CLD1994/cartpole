@@ -42,7 +42,7 @@ CPU 后端不需要 NPU 服务或动态库。NPU 后端需要匹配的驱动、S
 
 `--backend cpu|npu` 必须显式选择，缺模型或该构建不支持时直接失败，不静默回退。
 
-`--port` 放在子命令之前；默认 `/dev/ttyAMA1` 只是可配置默认值，实际 UART 节点必须按接线确认。波特率固定 460800。
+`--port`、`--baud` 放在子命令之前。默认使用 `/dev/ttyAMA1` 和 460800；须按接线和固件配置确认，例如采用固件的 1000000 波特率时传入 `--baud 1000000`。
 
 启动策略前，固件须已完成左参考确认、处于 `READY NONE`，速度和加速度须匹配模型包，`WDT_MS=100`。程序回读 `CALIB?` 和 `CONFIG?`，检查校准存储状态和轨道长度；不发送 `CONFIG`、`RESET`、`ENABLE` 或自动回中命令。预检不符时报告失败，不尝试替用户修正台位。
 
@@ -57,7 +57,18 @@ CPU 后端不需要 NPU 服务或动态库。NPU 后端需要匹配的驱动、S
 
 ### 维护命令
 
-无子命令进入交互控制台。`query`、`state`、`config`（不带参数）为读取；`config NAME VALUE`、`enable`、`reset`、标定命令需要操作者明确调用。`center`、`vel <mm/s> --hold <秒>`、`wdt-test` 会实际运动，不属于策略启动步骤。
+无子命令进入交互控制台。端侧运行所需的固件操作与 [固件工具](https://github.com/CLD1994/device-nerve-esp32/blob/main/tools/cartpole_host.py) 使用相同命令。
+
+| 命令 | 作用 |
+|---|---|
+| `query`、`state` | 查询固件模式、读取最近的测量。 |
+| `dump`（或不带参数的 `config`） | 读取全部可设置的固件参数，包括摆杆零点和方向。缺项时返回失败，不用旧值填充。 |
+| `config NAME VALUE` | 设置一个固件参数，等待对应回执。 |
+| `calib-status`、`confirm-left` | 查看轨道标定状态；断电后，若固件要求恢复左参考，在 `DISABLED` 下将小车手动推到左标定位，再执行 `confirm-left`。不重新测量轨道，也不使能。未保存轨道时才使用 `mark-left`、`mark-right`。 |
+| `calibrate-pole-down` | 停止其他串口客户端。在 `DISABLED NONE` 下让摆杆自然下垂静止。只有有效测量满足稳定性要求时才写入零点，保持 `POLE_INV` 不变；成功后回读核对，直立对应约 0 rad。 |
+| `enable [--timeout 秒]`、`disable`、`reset` | 明确执行使能、禁用和清故障。默认等 5 秒使能；`disable` 不发送速度命令，须等小车停稳。固件处于 FAULT 时保留故障。 |
+
+`run` 不自动执行这些维护操作。`calib` 是端侧便利命令，交互标定轨道两端后会尝试使能，不用于标定摆杆。`center`、`vel <mm/s> --hold <秒>`、`wdt-test` 会实际运动，不属于策略启动步骤。
 
 `state --secs` 报告接收行率及采集到的有效快照范围，不声称覆盖每个设备样本的极值；无效摆杆通道显示 unavailable，不将占位 0 当作真实角度。`vel` 是定时保持工具，不与 Python 固件工具的按轨道行程模式等同。
 
@@ -68,7 +79,7 @@ make -C deploy/v2/edge test-unit
 make -C deploy/v2/edge test-integration PYTHON=/path/to/python
 ```
 
-`test` 默认只运行单元测试。设备注入单元测试使用受能力接口约束的替身，不链接 UART/协议实现，覆盖实例与时钟隔离、逐事件门控和配置瞬态；串口适配器测试验证业务事件、通信统计和故障历史。集成测试 Python 环境需要安装 `onnx`（模型包构建测试）。集成测试在 Linux/WSL 使用 PTY 和 socketpair，不打开真实串口，不需要 NPU。它以真实 CLI、协议、会话和 UART 实现配合测试固件及 NPU 替身，覆盖 MODE 回执、STATE 有效位、参数预检、启动写入边界及退出确认。
+`test` 运行单元、集成和依赖检查。设备注入单元测试使用受能力接口约束的替身，不链接 UART/协议实现，覆盖实例与时钟隔离、逐事件门控和配置瞬态；串口适配器测试验证业务事件、通信统计和故障历史。集成测试 Python 环境需要安装 `onnx`（模型包构建测试）。集成测试在 Linux/WSL 使用 PTY 和 socketpair，不打开真实串口，不需要 NPU。它以真实 CLI、协议、会话和 UART 实现配合测试固件及 NPU 替身，覆盖 MODE 回执、STATE 有效位、参数预检、启动写入边界及退出确认。
 
 测试程序明确命名 `.test-build/edge_TEST_ONLY`，启动推理时输出测试标识。生产 CMake 没有测试替身选项；CPU-only 无 SDK 依赖，开启 NPU 时缺 SDK 头文件或链接库会构建失败；可使用厂商交叉链接 stub，板端使用匹配的真实运行库。测试通过不能代替真实 ARM 链接、目标 SDK 加载、模型精度、400 Hz 板端时序或真机验证。
 
@@ -84,6 +95,7 @@ make -C deploy/v2/edge test-integration PYTHON=/path/to/python
 | `cartpole_device.h` | 业务定义的设备能力，由实际设备适配器实现 |
 | `serial_cartpole.c` / `serial_cartpole.h` | 串口实例、固件协议事务、接收缓存与通信统计 |
 | `cartpole_schedule.c` / `cartpole_control.h` | 上层有界业务调度与控制操作接口 |
+| `cartpole_pole_calibration.c` | 自然下垂标定、测量门禁、零点写入和回读确认 |
 | `cartpole_clock.c` / `cartpole_clock.h` | 可共享的纯单调时钟与绝对等待服务 |
 | `cartpole_controller.c` | 正式控制调度、推理前后门控与动作提交 |
 | `cartpole_motion.c` | 定时速度保持、回中等完整维护操作 |

@@ -80,12 +80,38 @@ static cartpole_result_t name(void *ctx, double timeout) \
 TRANSACTION(query, FAKE_QUERY)
 TRANSACTION(wait_measurement, FAKE_WAIT)
 TRANSACTION(enable, FAKE_ENABLE)
+TRANSACTION(disable, FAKE_DISABLE)
 TRANSACTION(reset, FAKE_RESET)
 TRANSACTION(refresh, FAKE_REFRESH)
+static cartpole_result_t read_settings(void *ctx, cartpole_settings_t *out, double timeout)
+{
+    fake_device *d = ctx;
+    record(d, FAKE_READ_SETTINGS, timeout, 0, 0);
+    if (d->transaction_result == CARTPOLE_OK)
+        *out = d->settings;
+    return d->transaction_result;
+}
 static cartpole_result_t mark(void *ctx, cartpole_endpoint_t endpoint, double timeout)
 {
     fake_device *d = ctx;
     record(d, FAKE_MARK, timeout, endpoint, 0);
+    return d->transaction_result;
+}
+static cartpole_result_t confirm_left(void *ctx, int64_t *position_um, double timeout)
+{
+    fake_device *d = ctx;
+    record(d, FAKE_CONFIRM_LEFT, timeout, 0, 0);
+    if (d->transaction_result == CARTPOLE_OK)
+        *position_um = d->confirmed_left_position_um;
+    return d->transaction_result;
+}
+static cartpole_result_t read_calibration_status(void *ctx, cartpole_calibration_status_t *out,
+                                                 double timeout)
+{
+    fake_device *d = ctx;
+    record(d, FAKE_READ_CALIBRATION_STATUS, timeout, 0, 0);
+    if (d->transaction_result == CARTPOLE_OK)
+        *out = d->calibration_status;
     return d->transaction_result;
 }
 static cartpole_result_t configure(void *ctx, cartpole_setting_t setting, long value, double timeout)
@@ -117,9 +143,13 @@ static const cartpole_device_ops_t ops = {.bind_cancellation = bind_cancellation
                                           .query_mode = query,
                                           .wait_for_measurement = wait_measurement,
                                           .enable = enable,
+                                          .disable = disable,
                                           .reset = reset,
                                           .refresh_configuration = refresh,
+                                          .read_settings = read_settings,
                                           .mark_endpoint = mark,
+                                          .confirm_left = confirm_left,
+                                          .read_calibration_status = read_calibration_status,
                                           .configure = configure,
                                           .stop_and_confirm = stop,
                                           .send_velocity = send_velocity};

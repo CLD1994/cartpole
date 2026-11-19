@@ -89,7 +89,7 @@ def parse_state_output(output: str) -> StateOutput:
         normalized = normalized[:-1]
     records, events = [], []
     for line in normalized.split('\n'):
-        mode = re.fullmatch(r'\[edge\] MODE (DISABLED|READY|FAULT) (NONE|STEP_LOSS|AS5600|MT6835)', line)
+        mode = re.fullmatch(r'\[edge\] MODE (DISABLED|READY|FAULT) (NONE|STEP_LOSS|AS5600|MT6835|POWER)', line)
         loss = re.fullmatch(r'\[edge\] STEP_LOSS event=([0-9]{1,19}) run=([0-9]{1,19}) device_us=([0-9]{1,19})', line)
         if mode:
             events.append(ModeEvent(mode[1], mode[2]))

@@ -27,7 +27,7 @@ if __name__ == "__main__":
 
 
 class Firmware:
-    def __init__(self, flags=3, stream=True, mode="READY", velocity=900, acknowledge_stop=True, acknowledge_enable=True):
+    def __init__(self, flags=3, stream=True, mode="READY", velocity=900, acknowledge_stop=True, acknowledge_enable=True, missing_setting=None, disable_error=None):
         self.master, self.slave = pty.openpty()
         tty.setraw(self.slave)
         os.set_blocking(self.master, False)
@@ -35,6 +35,14 @@ class Firmware:
         self.flags, self.stream, self.mode = flags, stream, mode
         self.velocity, self.acknowledge_stop = velocity, acknowledge_stop
         self.acknowledge_enable = acknowledge_enable
+        self.disable_error = disable_error
+        self.fault_reason = "MT6835"
+        self.config_reply = None
+        self.mark_errors = {}
+        self.settings = dict(VEL_MAX=velocity, ACC_MAX=10000, WDT_MS=100, X_MARGIN_UM=10000,
+                             POLE_ZERO_URAD=-3127572, POLE_INV=1, X_INV=0, STEP_LOSS_UM=3000)
+        if missing_setting:
+            del self.settings[missing_setting]
         self.commands = []
         self.end = threading.Event()
         self.driving = threading.Event()
@@ -81,16 +89,37 @@ class Firmware:
                                 self.mode = "READY"
                                 self.send("MODE READY NONE")
                         elif command == "QUERY":
-                            self.send(f"MODE {self.mode} NONE")
+                            reason = self.fault_reason if self.mode == "FAULT" else "NONE"
+                            self.send(f"MODE {self.mode} {reason}")
                         elif command == "DISABLE":
-                            if self.acknowledge_stop:
+                            if self.disable_error:
+                                self.send(f"ERR {self.disable_error}")
+                            elif self.mode == "FAULT":
+                                self.send(f"MODE FAULT {self.fault_reason}")
+                            elif self.acknowledge_stop:
                                 self.mode = "DISABLED"
                                 self.send("MODE DISABLED NONE")
                         elif command == "CALIB?":
                             for key, value in [("CAL_STATE", 2), ("CAL_LENGTH_UM", 894845), ("CAL_SAVED", 1), ("CAL_STORAGE", 0)]:
                                 self.send(f"OK {key} {value}")
+                        elif command in self.mark_errors:
+                            self.send(f"ERR {self.mark_errors[command]}")
+                        elif command == "CONFIRM LEFT":
+                            if self.mode == "DISABLED":
+                                self.send("OK CONFIRM_LEFT -447422")
+                            else:
+                                self.send("ERR CONFIRM_LEFT")
                         elif command == "CONFIG?":
-                            for key, value in [("VEL_MAX", self.velocity), ("ACC_MAX", 10000), ("WDT_MS", 100), ("X_MARGIN_UM", 10000)]:
+                            for key, value in self.settings.items():
+                                self.send(f"OK {key} {value}")
+                        elif command.startswith("CONFIG "):
+                            _, key, value = command.split()
+                            if self.config_reply is not None:
+                                self.send(self.config_reply)
+                            elif key not in self.settings or (key.startswith("POLE_") and self.mode != "DISABLED"):
+                                self.send(f"ERR {key}")
+                            else:
+                                self.settings[key] = int(value)
                                 self.send(f"OK {key} {value}")
                         elif command.startswith("VEL ") and float(command.split()[1]) != 0:
                             self.driving.set()
@@ -118,6 +147,156 @@ def package(directory):
 
 @unittest.skipUnless(BINARY, "需 make test-integration 构建 PTY 测试应用，或设置 EDGE_TEST_BINARY")
 class CommandTests(unittest.TestCase):
+    def test_calib_status_reads_track_metadata_only(self):
+        with Firmware(mode="DISABLED") as fw:
+            result = fw.run("calib-status")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(fw.commands, ["CALIB?"])
+            for key, value in dict(CAL_STATE=2, CAL_LENGTH_UM=894845, CAL_SAVED=1, CAL_STORAGE=0).items():
+                self.assertIn(f"{key} = {value}\n", result.stdout)
+
+    def test_confirm_left_references_stored_length_without_enabling(self):
+        with Firmware(mode="DISABLED") as fw:
+            result = fw.run("confirm-left")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("CONFIRM_LEFT = -447422", result.stdout)
+            self.assertEqual(fw.commands, ["CONFIRM LEFT"])
+
+    def test_confirm_left_rejection_does_not_enable(self):
+        with Firmware(mode="READY") as fw:
+            result = fw.run("confirm-left")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("CONFIRM LEFT", result.stderr)
+            self.assertEqual(fw.commands, ["CONFIRM LEFT"])
+
+    def test_disable_only_requests_firmware_disable(self):
+        with Firmware() as fw:
+            result = fw.run("disable")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(fw.commands, ["DISABLE"])
+            self.assertIn("DISABLED", result.stdout)
+
+    def test_disable_busy_does_not_request_other_motion_transitions(self):
+        with Firmware(disable_error="BUSY") as fw:
+            result = fw.run("disable")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("BUSY", result.stderr)
+            self.assertEqual(fw.commands, ["DISABLE"])
+            self.assertEqual(fw.mode, "READY")
+
+    def test_disable_preserves_power_fault_without_reset(self):
+        with Firmware(mode="FAULT") as fw:
+            fw.fault_reason = "POWER"
+            result = fw.run("disable")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("MODE FAULT POWER", result.stdout)
+            self.assertIn("DISABLE: FAULT", result.stderr)
+            self.assertEqual(fw.commands, ["DISABLE"])
+            self.assertEqual(fw.mode, "FAULT")
+
+    def test_calibrate_pole_down_writes_only_final_zero_without_enabling(self):
+        with Firmware(mode="DISABLED") as fw:
+            fw.theta = 3000000
+            result = fw.run("calibrate-pole-down")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(fw.commands, ["QUERY", "CONFIG?", "CONFIG?", "QUERY",
+                                           "CONFIG POLE_ZERO_URAD -2985980", "CONFIG?", "QUERY"])
+            self.assertEqual(fw.settings["POLE_ZERO_URAD"], -2985980)
+            self.assertEqual(fw.settings["POLE_INV"], 1)
+
+    def test_calibrate_pole_down_rejects_ready_without_writing(self):
+        with Firmware() as fw:
+            result = fw.run("calibrate-pole-down")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(fw.commands, ["QUERY"])
+
+    def test_baud_accepts_current_firmware_default(self):
+        with Firmware() as fw:
+            result = fw.run("--baud", "1000000", "query")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(fw.commands, ["QUERY"])
+            self.assertIn("MODE READY NONE", result.stdout)
+
+    def test_enable_accepts_timeout(self):
+        with Firmware(mode="DISABLED") as fw:
+            result = fw.run("enable", "--timeout", "1.5")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(fw.commands, ["ENABLE"])
+
+    def test_enable_rejects_nonpositive_timeout_without_writing(self):
+        with Firmware(mode="DISABLED") as fw:
+            result = fw.run("enable", "--timeout", "0")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(fw.commands, [])
+
+    def assert_full_config(self, result, fw):
+        self.assertEqual(result.returncode, 0, result.stderr)
+        values = {}
+        for line in result.stdout.splitlines():
+            self.assertTrue(line.startswith("[edge] ") and " = " in line, line)
+            name, value = line[len("[edge] "):].split(" = ", 1)
+            self.assertNotIn(name, values)
+            values[name] = int(value)
+        self.assertEqual(values, fw.settings)
+        self.assertEqual(fw.commands, ["CONFIG?"])
+
+    def test_config_reads_all_firmware_settings_without_writing(self):
+        with Firmware() as fw:
+            self.assert_full_config(fw.run("config"), fw)
+
+    def test_dump_reads_all_firmware_settings_without_writing(self):
+        with Firmware() as fw:
+            self.assert_full_config(fw.run("dump"), fw)
+
+    def test_configure_accepts_lowercase_and_writes_uppercase_protocol_name(self):
+        with Firmware(mode="DISABLED") as fw:
+            result = fw.run("config", "pole_zero_urad", "12345")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("POLE_ZERO_URAD = 12345", result.stdout)
+            self.assertEqual(fw.settings["POLE_ZERO_URAD"], 12345)
+            self.assertEqual(fw.commands, ["CONFIG POLE_ZERO_URAD 12345"])
+
+    def test_configure_reports_pole_persistence_rejection(self):
+        with Firmware(mode="DISABLED") as fw:
+            fw.config_reply = "ERR CAL_STORAGE"
+            result = fw.run("config", "POLE_ZERO_URAD", "12345")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("CAL_STORAGE", result.stderr)
+            self.assertFalse(result.stdout, result.stdout)
+            self.assertEqual(fw.commands, ["CONFIG POLE_ZERO_URAD 12345"])
+
+    def test_mark_left_reports_calibration_storage_error(self):
+        with Firmware(mode="DISABLED") as fw:
+            fw.mark_errors["MARK LEFT"] = "CAL_STORAGE"
+            result = fw.run("mark-left")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("CAL_STORAGE", result.stderr)
+            self.assertEqual(fw.commands, ["MARK LEFT"])
+
+    def test_mark_right_reports_calibration_storage_error(self):
+        with Firmware(mode="DISABLED") as fw:
+            fw.mark_errors["MARK RIGHT"] = "CAL_STORAGE"
+            result = fw.run("mark-right")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("CAL_STORAGE", result.stderr)
+            self.assertEqual(fw.commands, ["MARK RIGHT"])
+
+    def test_mark_right_reports_calibration_reference_error(self):
+        with Firmware(mode="DISABLED") as fw:
+            fw.mark_errors["MARK RIGHT"] = "CAL_REFERENCE"
+            result = fw.run("mark-right")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("CAL_REFERENCE", result.stderr)
+            self.assertEqual(fw.commands, ["MARK RIGHT"])
+
+    def test_config_reports_missing_settings_as_failure(self):
+        with Firmware(missing_setting="POLE_INV") as fw:
+            result = fw.run("config")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(result.stdout, result.stdout)
+            self.assertIn("CONFIG?", result.stderr)
+            self.assertEqual(fw.commands, ["CONFIG?"])
+
     def test_console_preserves_multiple_commands_from_one_stdin_write(self):
         with Firmware() as fw:
             result=subprocess.run([BINARY,"--port",fw.path,"console"],input="query\nstate\nquery\nquit\n",
@@ -256,7 +435,7 @@ class CommandTests(unittest.TestCase):
 
     def test_timeout_reports_unconfirmed_and_no_automatic_retry(self):
         with Firmware(mode="DISABLED", acknowledge_enable=False) as fw:
-            result = fw.run("enable")
+            result = fw.run("enable", "--timeout", "0.2")
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("ENABLE: TIMEOUT", result.stderr)
             self.assertIn("execution unconfirmed", result.stderr)

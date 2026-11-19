@@ -16,6 +16,7 @@
 
 #include "cartpole.h"
 #include "cartpole_control.h"
+#include "cartpole_pole_calibration.h"
 #include "config.h"
 
 #define CONSOLE_LINE_MAX 128
@@ -47,13 +48,15 @@ static int parse_double_token(const char *s, double *out)
     return 0;
 }
 
-static int valid_param_name(const char *s)
+static int normalize_param_name(char *s)
 {
     size_t n = strlen(s);
     if (n == 0 || n >= 16) { /* 与 console_req_t.name 同容量，含 NUL */
         return 0;
     }
     for (size_t i = 0; i < n; i++) {
+        if (s[i] >= 'a' && s[i] <= 'z')
+            s[i] = (char)(s[i] - 'a' + 'A');
         char c = s[i];
         int ok = (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
         if (!ok) {
@@ -107,23 +110,37 @@ int console_parse(const char *line, console_req_t *req)
         req->cmd = CONSOLE_CMD_HELP;
         return 0;
     }
-    if (strcmp(tok[0], "calib") == 0 || strcmp(tok[0], "mark-left") == 0 ||
-        strcmp(tok[0], "mark-right") == 0 || strcmp(tok[0], "enable") == 0 ||
-        strcmp(tok[0], "center") == 0 || strcmp(tok[0], "state") == 0 ||
-        strcmp(tok[0], "query") == 0 || strcmp(tok[0], "reset") == 0) {
-        if (n != 1) {
-            snprintf(req->err, sizeof(req->err), "%s takes no arguments", tok[0]);
+    if (strcmp(tok[0], "enable") == 0) {
+        req->timeout_s = 5.0;
+        if (n != 1 && (n != 3 || strcmp(tok[1], "--timeout") != 0 ||
+                       parse_double_token(tok[2], &req->timeout_s) != 0 ||
+                       req->timeout_s <= 0)) {
+            snprintf(req->err, sizeof req->err, "usage: enable [--timeout SECONDS]");
             return -1;
         }
-        req->cmd = strcmp(tok[0], "calib") == 0        ? CONSOLE_CMD_CALIB
-                   : strcmp(tok[0], "mark-left") == 0  ? CONSOLE_CMD_MARK_LEFT
-                   : strcmp(tok[0], "mark-right") == 0 ? CONSOLE_CMD_MARK_RIGHT
-                   : strcmp(tok[0], "enable") == 0     ? CONSOLE_CMD_ENABLE
-                   : strcmp(tok[0], "center") == 0     ? CONSOLE_CMD_CENTER
-                   : strcmp(tok[0], "state") == 0      ? CONSOLE_CMD_STATE
-                   : strcmp(tok[0], "query") == 0      ? CONSOLE_CMD_QUERY
-                                                       : CONSOLE_CMD_RESET;
+        req->cmd = CONSOLE_CMD_ENABLE;
         return 0;
+    }
+    static const struct {
+        const char *name;
+        console_cmd_t command;
+    } no_args[] = {
+        {"calib", CONSOLE_CMD_CALIB}, {"mark-left", CONSOLE_CMD_MARK_LEFT},
+        {"mark-right", CONSOLE_CMD_MARK_RIGHT}, {"confirm-left", CONSOLE_CMD_CONFIRM_LEFT},
+        {"calib-status", CONSOLE_CMD_CALIB_STATUS},
+        {"calibrate-pole-down", CONSOLE_CMD_CALIBRATE_POLE_DOWN},
+        {"disable", CONSOLE_CMD_DISABLE}, {"center", CONSOLE_CMD_CENTER},
+        {"state", CONSOLE_CMD_STATE}, {"query", CONSOLE_CMD_QUERY}, {"reset", CONSOLE_CMD_RESET},
+    };
+    for (size_t i = 0; i < sizeof no_args / sizeof no_args[0]; ++i) {
+        if (strcmp(tok[0], no_args[i].name) == 0) {
+            if (n != 1) {
+                snprintf(req->err, sizeof req->err, "%s takes no arguments", tok[0]);
+                return -1;
+            }
+            req->cmd = no_args[i].command;
+            return 0;
+        }
     }
     if (strcmp(tok[0], "vel") == 0) {
         if (n != 2) {
@@ -137,6 +154,15 @@ int console_parse(const char *line, console_req_t *req)
         req->cmd = CONSOLE_CMD_VEL;
         return 0;
     }
+    if (strcmp(tok[0], "dump") == 0) {
+        if (n != 1) {
+            snprintf(req->err, sizeof(req->err), "dump takes no arguments");
+            return -1;
+        }
+        req->cmd = CONSOLE_CMD_CONFIG;
+        req->dump = 1;
+        return 0;
+    }
     if (strcmp(tok[0], "config") == 0) {
         if (n == 1) {
             req->cmd = CONSOLE_CMD_CONFIG;
@@ -147,7 +173,7 @@ int console_parse(const char *line, console_req_t *req)
             snprintf(req->err, sizeof(req->err), "usage: config [NAME VALUE]");
             return -1;
         }
-        if (!valid_param_name(tok[1])) {
+        if (!normalize_param_name(tok[1])) {
             snprintf(req->err, sizeof(req->err), "invalid param name '%s'", tok[1]);
             return -1;
         }
@@ -287,8 +313,40 @@ int console_exec(cartpole_t *c, const console_req_t *req)
         return console_transaction_result("MARK LEFT", cartpole_mark_endpoint(c, CARTPOLE_LEFT, 1.0));
     case CONSOLE_CMD_MARK_RIGHT:
         return console_transaction_result("MARK RIGHT", cartpole_mark_endpoint(c, CARTPOLE_RIGHT, 1.0));
+    case CONSOLE_CMD_CONFIRM_LEFT: {
+        int64_t position_um;
+        if (console_transaction_result("CONFIRM LEFT", cartpole_confirm_left(c, &position_um, 1.0)))
+            return -1;
+        printf("[edge] CONFIRM_LEFT = %" PRId64 " um (still DISABLED)\n", position_um);
+        return 0;
+    }
+    case CONSOLE_CMD_CALIB_STATUS: {
+        cartpole_calibration_status_t status;
+        if (console_transaction_result("CALIB?", cartpole_read_calibration_status(c, &status, 1.0)))
+            return -1;
+        printf("[edge] CAL_STATE = %" PRId64 "\n[edge] CAL_LENGTH_UM = %" PRId64
+               "\n[edge] CAL_SAVED = %" PRId64 "\n[edge] CAL_STORAGE = %" PRId64 "\n",
+               status.state, status.length_um, status.saved, status.storage);
+        return 0;
+    }
+    case CONSOLE_CMD_CALIBRATE_POLE_DOWN: {
+        cartpole_pole_calibration_t result = {0};
+        int rc = console_transaction_result("calibrate-pole-down",
+                                           cartpole_calibrate_pole_down(c, &result));
+        if (rc != 0) {
+            if (result.write_attempted)
+                fputs("[edge] zero write not confirmed; check dump before retrying\n", stderr);
+            return rc;
+        }
+        printf("[edge] POLE_ZERO_URAD: %" PRId64 " -> %" PRId64
+               " (read back); POLE_INV = %d unchanged\n",
+               result.old_zero_urad, result.new_zero_urad, result.pole_inverted);
+        return 0;
+    }
     case CONSOLE_CMD_ENABLE:
-        return console_transaction_result("ENABLE", cartpole_enable(c, 2.0));
+        return console_transaction_result("ENABLE", cartpole_enable(c, req->timeout_s));
+    case CONSOLE_CMD_DISABLE:
+        return console_transaction_result("DISABLE", cartpole_disable(c, 1.0));
     case CONSOLE_CMD_CENTER:
         if (console_goto_center(c, 15.0) != 0) {
             fprintf(stderr, "[edge] move-to-center failed\n");
@@ -309,19 +367,12 @@ int console_exec(cartpole_t *c, const console_req_t *req)
     }
     case CONSOLE_CMD_CONFIG: {
         if (req->dump) {
-            if (console_transaction_result("metadata",
-                                           cartpole_refresh_configuration(c, DUMP_WINDOW_S)))
+            cartpole_settings_t settings;
+            if (console_transaction_result("CONFIG?",
+                                           cartpole_read_settings(c, &settings, DUMP_WINDOW_S)) != 0)
                 return -1;
-            cartpole_configuration_t config = cartpole_get_configuration(c);
-            printf("[edge] calibration=%s length=%" PRId64 " um; VEL_MAX=%" PRId64
-                   " ACC_MAX=%" PRId64 " WDT_MS=%" PRId64 " X_MARGIN_UM=%" PRId64 "\n",
-                   config.calibration_state == CARTPOLE_CALIBRATION_READY ? "ready"
-                   : config.calibration_state == CARTPOLE_CALIBRATION_REFERENCE_REQUIRED
-                       ? "reference-required"
-                       : "not-ready",
-                   config.track_length_um, config.velocity_limit_mm_s,
-                   config.acceleration_limit_mm_s2, config.watchdog_timeout_ms,
-                   config.track_margin_um);
+            for (int i = 0; i < CARTPOLE_SETTING_COUNT; i++)
+                printf("[edge] %s = %" PRId64 "\n", cartpole_setting_to_string(i), settings.values[i]);
             return 0;
         }
         char operation[32];
@@ -372,10 +423,15 @@ static void print_help(void)
            "LEFT/RIGHT + ENABLE)\n"
            "  mark-left             send MARK LEFT (cart at left end)\n"
            "  mark-right            send MARK RIGHT (cart at right end)\n"
-           "  enable                ENABLE after calibration, wait READY\n"
+           "  confirm-left          restore the saved left reference, without enabling\n"
+           "  calib-status          read track calibration status\n"
+           "  calibrate-pole-down   calibrate the stationary, hanging pole (DISABLED)\n"
+           "  enable [--timeout s]  ENABLE after calibration, wait READY\n"
+           "  disable               disable only when the firmware is stopped\n"
            "  center                move cart to track center\n"
            "  state                 print latest STATE snapshot\n"
            "  query                 ask firmware mode\n"
+           "  dump                  read all firmware settings\n"
            "  config [NAME VALUE]   set a firmware param, or dump all with no args\n"
            "  reset                 clear FAULT\n"
            "  help | quit\n");

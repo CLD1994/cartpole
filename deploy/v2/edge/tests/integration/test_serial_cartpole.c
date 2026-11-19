@@ -36,6 +36,71 @@ static void event(const cartpole_event_t *e, void *ctx)
     }
     in_event = 0;
 }
+
+static const char *request, *response;
+static unsigned request_count;
+static int firmware_reply(fake_uart_t *port, const uint8_t *bytes, size_t size)
+{
+    assert(size == strlen(request) && memcmp(bytes, request, size) == 0);
+    request_count++;
+    fake_uart_queue(port, response);
+    return 0;
+}
+
+static void expect_request(fake_uart_t *port, const char *wire_request, const char *wire_response)
+{
+    request = wire_request;
+    response = wire_response;
+    request_count = 0;
+    port->write = firmware_reply;
+}
+
+static void test_maintenance_wire_contracts(const cartpole_clock_t *clock)
+{
+    fake_uart_reset();
+    serial_cartpole_t *s = serial_cartpole_open("maintenance", 460800, clock);
+    assert(s);
+    fake_uart_t *p = fake_uart_port(0);
+    cartpole_device_t d = serial_cartpole_get_device(s);
+
+    /* Stale success arrives before write; only response to the new request counts. */
+    fake_uart_queue(p, "OK CONFIRM_LEFT -300000\n");
+    expect_request(p, "CONFIRM LEFT\n", "OK CONFIRM_LEFT -447422\n");
+    int64_t position = 0;
+    assert(d.ops->confirm_left(d.context, &position, .1) == CARTPOLE_OK);
+    assert(position == -447422 && request_count == 1);
+    expect_request(p, "CONFIRM LEFT\n", "ERR CONFIRM_LEFT\n");
+    assert(d.ops->confirm_left(d.context, &position, .1) == CARTPOLE_REJECTED);
+    assert(position == -447422 && request_count == 1);
+
+    fake_uart_queue(p, "MODE DISABLED NONE\n");
+    expect_request(p, "DISABLE\n", "ERR BUSY\n");
+    assert(d.ops->disable(d.context, .1) == CARTPOLE_BUSY && request_count == 1);
+    expect_request(p, "DISABLE\n", "MODE DISABLED NONE\n");
+    assert(d.ops->disable(d.context, .1) == CARTPOLE_OK && request_count == 1);
+    expect_request(p, "DISABLE\n", "MODE FAULT POWER\n");
+    assert(d.ops->disable(d.context, .1) == CARTPOLE_FAULT && request_count == 1);
+    assert(d.ops->get_session_state(d.context).reported_mode_reason == CARTPOLE_REASON_POWER);
+    fake_uart_queue(p, "MODE DISABLED NONE\n");
+    expect_request(p, "ENABLE\n", "ERR POWER\n");
+    assert(d.ops->enable(d.context, .1) == CARTPOLE_POWER_UNAVAILABLE && request_count == 1);
+    /* A previous DISABLED response cannot stand in for the current request. */
+    fake_uart_queue(p, "MODE DISABLED NONE\n");
+    expect_request(p, "DISABLE\n", "");
+    assert(d.ops->disable(d.context, .1) == CARTPOLE_TIMEOUT && request_count == 1);
+
+    expect_request(p, "CALIB?\n", "OK CAL_STATE 3\nOK CAL_LENGTH_UM 894845\nOK CAL_SAVED 1\nOK CAL_STORAGE 7\n");
+    cartpole_calibration_status_t status = {0};
+    assert(d.ops->read_calibration_status(d.context, &status, .1) == CARTPOLE_OK);
+    assert(status.state == 3 && status.length_um == 894845 &&
+           status.saved == 1 && status.storage == 7 && request_count == 1);
+    expect_request(p, "CALIB?\n", "OK CAL_STATE 2\nOK CAL_LENGTH_UM 800000\nOK CAL_SAVED 0\n");
+    assert(d.ops->read_calibration_status(d.context, &status, .1) == CARTPOLE_TIMEOUT);
+    assert(status.state == 3 && status.length_um == 894845 &&
+           status.saved == 1 && status.storage == 7 && request_count == 1);
+    serial_cartpole_close(s);
+}
+
 int main(void)
 {
     fake_uart_reset();
@@ -87,5 +152,6 @@ int main(void)
     assert(stats.received_measurements == 2 && stats.unknown_received_lines == 0);
     serial_cartpole_close(a);
     serial_cartpole_close(b);
+    test_maintenance_wire_contracts(&clock);
     puts("serial_cartpole: ok");
 }
