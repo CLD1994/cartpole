@@ -24,12 +24,19 @@ struct cached_value {
     char name[16];
     int64_t value;
 };
+typedef enum {
+    STARTUP_IDLE,
+    STARTUP_DISCARD_FIRST_LINE,
+    STARTUP_AWAIT_STATE,
+    STARTUP_COMPLETE
+} startup_sync_t;
 struct serial_cartpole {
     const cartpole_clock_t *clock;
     cartpole_cancellation_probe_t cancellation;
     void *cancellation_context;
     uart_t uart;
     proto_rx_t rx;
+    startup_sync_t startup_sync;
     serial_snapshot_t snapshot;
     int need_frame_boundary;
     uint64_t mode_seq, fault_seq, non_disabled_seq, invalid_dual_state_seq;
@@ -320,8 +327,14 @@ static void adapter_handle_line(const char *line, size_t len, void *user)
 {
     serial_cartpole_t *s = user;
     proto_msg_t m;
+    if (s->startup_sync == STARTUP_DISCARD_FIRST_LINE) {
+        s->startup_sync = STARTUP_AWAIT_STATE;
+        return;
+    }
     s->configuration_changed = 0;
     if (proto_parse_line(line, &m) == PROTO_UNKNOWN) {
+        if (s->startup_sync == STARTUP_AWAIT_STATE)
+            return;
         s->snapshot.received_unknown_line_count++;
         if (len) {
             const cartpole_event_t event = {.kind = CARTPOLE_EVENT_UNRECOGNIZED_LINE};
@@ -333,6 +346,8 @@ static void adapter_handle_line(const char *line, size_t len, void *user)
     }
     switch (m.type) {
     case PROTO_STATE:
+        if (s->startup_sync == STARTUP_AWAIT_STATE)
+            s->startup_sync = STARTUP_COMPLETE;
         s->snapshot.measurement_validity_bits = m.valid_flags;
         if (m.valid_flags != (CARTPOLE_MEASUREMENT_CART_VALID | CARTPOLE_MEASUREMENT_POLE_VALID))
             s->invalid_dual_state_seq++;
@@ -1059,6 +1074,25 @@ serial_cartpole_t *serial_cartpole_open(const char *port, int baud, const cartpo
     }
     s->snapshot.is_serial_open = 1;
     return s;
+}
+void serial_cartpole_sync_startup(serial_cartpole_t *s)
+{
+    if (!s || s->startup_sync != STARTUP_IDLE)
+        return;
+    /* 首批字节可能从一行中间开始。等待第二条边界明确的有效 STATE，
+     * 不要求传感器数据有效，也不占用后续命令的回执等待时间。 */
+    const double end = adapter_now(s) + .025;
+    s->startup_sync = STARTUP_DISCARD_FIRST_LINE;
+    while (adapter_checkpoint(s, end, 0) == CARTPOLE_OK) {
+        if (adapter_pump(s, 0) < 0 || s->startup_sync == STARTUP_COMPLETE)
+            break;
+        cartpole_clock_sleep_until(s->clock, fmin(end, adapter_now(s) + .001));
+    }
+    if (s->startup_sync != STARTUP_COMPLETE) {
+        /* 启动窗口耗尽时不等待遥测，并清空已缓存的半行，避免与命令回执拼接。 */
+        proto_rx_init(&s->rx);
+        s->startup_sync = STARTUP_COMPLETE;
+    }
 }
 cartpole_device_t serial_cartpole_get_device(serial_cartpole_t *s)
 {

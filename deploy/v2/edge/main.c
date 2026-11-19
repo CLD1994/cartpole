@@ -592,6 +592,7 @@ int main(int argc, char **argv)
         serial_cartpole_close(serial);
         return 1;
     }
+    serial_cartpole_sync_startup(serial);
     int rc = dispatch(c, serial, cmd, argc, argv, first);
 
     /* 会话形态（run/console）退出即停机；一次性命令不干预电机状态，
