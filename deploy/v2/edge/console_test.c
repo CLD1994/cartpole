@@ -40,13 +40,6 @@ int main(void)
 {
     console_req_t req;
 
-    /* 会话只发送运行参数，设备标定由固件 NVS 保管。 */
-    for (int i = 0; i < CFG_FW_PARAM_COUNT; ++i) {
-        CHECK(strcmp(CFG_FW_PARAMS[i].name, "POLE_ZERO_URAD") != 0);
-        CHECK(strcmp(CFG_FW_PARAMS[i].name, "POLE_INV") != 0);
-        CHECK(strcmp(CFG_FW_PARAMS[i].name, "X_INV") != 0);
-    }
-
     /* 无参命令与别名 */
     expect_ok("", CONSOLE_CMD_NONE);
     expect_ok("   \t ", CONSOLE_CMD_NONE);

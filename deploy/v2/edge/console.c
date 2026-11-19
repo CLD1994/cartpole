@@ -1,8 +1,10 @@
+#include "cartpole_format.h"
 /* 交互控制台实现。协议契约见 docs/deployment/protocol.md。 */
 
 #include "console.h"
 
 #include <errno.h>
+#include <inttypes.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,8 +14,9 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "cartpole.h"
+#include "cartpole_control.h"
 #include "config.h"
-#include "rig.h"
 
 #define CONSOLE_LINE_MAX 128
 #define DUMP_WINDOW_S 0.5 /* CONFIG? dump 的应答收集窗口 */
@@ -112,14 +115,14 @@ int console_parse(const char *line, console_req_t *req)
             snprintf(req->err, sizeof(req->err), "%s takes no arguments", tok[0]);
             return -1;
         }
-        req->cmd = strcmp(tok[0], "calib") == 0          ? CONSOLE_CMD_CALIB
-                   : strcmp(tok[0], "mark-left") == 0    ? CONSOLE_CMD_MARK_LEFT
-                   : strcmp(tok[0], "mark-right") == 0   ? CONSOLE_CMD_MARK_RIGHT
-                   : strcmp(tok[0], "enable") == 0       ? CONSOLE_CMD_ENABLE
-                   : strcmp(tok[0], "center") == 0       ? CONSOLE_CMD_CENTER
-                   : strcmp(tok[0], "state") == 0        ? CONSOLE_CMD_STATE
-                   : strcmp(tok[0], "query") == 0        ? CONSOLE_CMD_QUERY
-                                                        : CONSOLE_CMD_RESET;
+        req->cmd = strcmp(tok[0], "calib") == 0        ? CONSOLE_CMD_CALIB
+                   : strcmp(tok[0], "mark-left") == 0  ? CONSOLE_CMD_MARK_LEFT
+                   : strcmp(tok[0], "mark-right") == 0 ? CONSOLE_CMD_MARK_RIGHT
+                   : strcmp(tok[0], "enable") == 0     ? CONSOLE_CMD_ENABLE
+                   : strcmp(tok[0], "center") == 0     ? CONSOLE_CMD_CENTER
+                   : strcmp(tok[0], "state") == 0      ? CONSOLE_CMD_STATE
+                   : strcmp(tok[0], "query") == 0      ? CONSOLE_CMD_QUERY
+                                                       : CONSOLE_CMD_RESET;
         return 0;
     }
     if (strcmp(tok[0], "vel") == 0) {
@@ -162,153 +165,195 @@ int console_parse(const char *line, console_req_t *req)
 
 /* ---- 单命令执行（控制台与一次性子命令共用） ---- */
 
-static void nap_ms(int ms)
+/* 输入缓存保留同一次 read 中尚未执行的后续命令。 */
+typedef struct {
+    char chunk[256], line[CONSOLE_LINE_MAX];
+    size_t pos, size, length;
+    int eof, overflow, ready;
+} console_input;
+static console_input input;
+static int read_line_tick(double elapsed, cartpole_tick_action_t *action, void *context)
 {
-    struct timespec ts = {0, (long)ms * 1000 * 1000};
-    nanosleep(&ts, NULL);
+    (void)elapsed;
+    (void)context;
+    action->kind = CARTPOLE_TICK_OBSERVE;
+    int filled = 0;
+    while (1) {
+        if (input.pos == input.size) {
+            if (filled)
+                return 0;
+            filled = 1;
+            fd_set rf;
+            FD_ZERO(&rf);
+            FD_SET(STDIN_FILENO, &rf);
+            struct timeval tv = {0, 0};
+            int rc = select(STDIN_FILENO + 1, &rf, NULL, NULL, &tv);
+            if (rc < 0)
+                return errno == EINTR ? 0 : -1;
+            if (!rc)
+                return 0;
+            ssize_t n = read(STDIN_FILENO, input.chunk, sizeof input.chunk);
+            if (n < 0)
+                return errno == EINTR || errno == EAGAIN ? 0 : -1;
+            if (!n) {
+                input.eof = 1;
+                action->kind = CARTPOLE_TICK_FINISH;
+                return 0;
+            }
+            input.pos = 0;
+            input.size = (size_t)n;
+        }
+        char c = input.chunk[input.pos++];
+        if (c == '\n') {
+            input.line[input.length] = 0;
+            input.ready = 1;
+            action->kind = CARTPOLE_TICK_FINISH;
+            return 0;
+        }
+        if (c == '\r')
+            continue;
+        if (input.length + 1 < sizeof input.line)
+            input.line[input.length++] = c;
+        else
+            input.overflow = 1;
+    }
+}
+static void consume_line(void)
+{
+    input.length = 0;
+    input.ready = 0;
+    input.overflow = 0;
+}
+static int wait_enter(cartpole_t *c)
+{
+    cartpole_result_t rc = cartpole_run_loop(c, .020, 0, read_line_tick, NULL);
+    int ok = rc == CARTPOLE_OK && input.ready && !input.eof;
+    consume_line();
+    return ok ? 0 : -1;
 }
 
-/* 等操作者推车到位后按回车（calib 交互引导用）。 */
-static int wait_enter(void)
+/* 统一结果提示，不将拒绝、取消或故障统称为超时。 */
+int console_transaction_result(const char *operation, cartpole_result_t result)
 {
-    int c = getchar();
-    while (c != '\n' && c != EOF) {
-        c = getchar();
-    }
-    return c == EOF ? -1 : 0;
-}
-
-/* 发命令并等 OK/ERR 回执（回执名经控制台回显核对）。 */
-static int send_and_await(const char *cmd)
-{
-    if (rig_send_simple(cmd) != 0) {
-        return -1;
-    }
-    if (rig_wait_reply(1.0) != 0) {
-        fprintf(stderr, "[edge] %s rejected/failed\n", cmd);
-        return -1;
-    }
-    return 0;
-}
-
-/* 模式未知时先 QUERY 同步（一次性命令是新进程、控制台首条命令同理）。
- * 返回 0 表示模式已知，-1 表示 QUERY 超时。 */
-static int ensure_mode_known(void)
-{
-    int known;
-    rig_mode(&known, NULL);
-    if (known) {
+    if (result == CARTPOLE_OK)
         return 0;
-    }
-    return rig_sync_mode(1.0) == 0 ? 0 : -1;
+    fprintf(stderr, "[edge] %s: %s%s\n", operation, cartpole_result_to_string(result),
+            result == CARTPOLE_TIMEOUT ? " (execution unconfirmed; do not automatically retry)"
+                                       : "");
+    return -1;
+}
+static int query_mode_for_command(cartpole_t *c)
+{
+    return console_transaction_result("QUERY", cartpole_query_mode(c, 1.0));
 }
 
-int console_exec(const console_req_t *req)
+int console_exec(cartpole_t *c, const console_req_t *req)
 {
     switch (req->cmd) {
     case CONSOLE_CMD_CALIB: {
-        /* 同步失败时保持原行为：前置检查跳过，由固件对 MARK 的拒绝兜底 */
-        (void)ensure_mode_known();
+        if (query_mode_for_command(c) != 0)
+            return -1;
         int known;
-        fw_mode_t m = rig_mode(&known, NULL);
-        if (known && m != FW_DISABLED) {
-            fprintf(stderr, "[edge] calib requires DISABLED (current %s)\n",
-                    proto_mode_name(m));
+        cartpole_session_t snapshot = cartpole_get_session_state(c);
+        known = snapshot.is_mode_received;
+        cartpole_mode_t m = snapshot.reported_mode;
+        if (known && m != CARTPOLE_MODE_DISABLED) {
+            fprintf(stderr, "[edge] calib requires DISABLED (current %s)\n", cartpole_mode_to_string(m));
             return -1;
         }
         printf("[edge] push cart to LEFT end, then press Enter...");
         fflush(stdout);
-        if (wait_enter() != 0) {
+        if (wait_enter(c) != 0) {
             return -1;
         }
-        if (send_and_await("MARK LEFT") != 0) {
-            fprintf(stderr, "[edge] MARK LEFT rejected/failed\n");
+        if (console_transaction_result("MARK LEFT", cartpole_mark_endpoint(c, CARTPOLE_LEFT, 1.0)) != 0) {
             return -1;
         }
         printf("[edge] push cart to RIGHT end, then press Enter...");
         fflush(stdout);
-        if (wait_enter() != 0) {
+        if (wait_enter(c) != 0) {
             return -1;
         }
-        if (send_and_await("MARK RIGHT") != 0) {
-            fprintf(stderr, "[edge] MARK RIGHT rejected (L invalid? no left mark?)\n");
+        if (console_transaction_result("MARK RIGHT", cartpole_mark_endpoint(c, CARTPOLE_RIGHT, 1.0)) != 0) {
             return -1;
         }
-        if (rig_send_simple("ENABLE") != 0) {
-            return -1;
-        }
-        if (rig_wait_mode(FW_READY, 2.0) != 0) {
-            fprintf(stderr, "[edge] ENABLE failed (see MODE events)\n");
+        if (console_transaction_result("ENABLE", cartpole_enable(c, 2.0)) != 0) {
             return -1;
         }
         printf("[edge] calibrated & READY; use 'center' to move to mid-track\n");
         return 0;
     }
     case CONSOLE_CMD_MARK_LEFT:
-        return send_and_await("MARK LEFT");
+        return console_transaction_result("MARK LEFT", cartpole_mark_endpoint(c, CARTPOLE_LEFT, 1.0));
     case CONSOLE_CMD_MARK_RIGHT:
-        return send_and_await("MARK RIGHT");
+        return console_transaction_result("MARK RIGHT", cartpole_mark_endpoint(c, CARTPOLE_RIGHT, 1.0));
     case CONSOLE_CMD_ENABLE:
-        return send_and_await("ENABLE");
+        return console_transaction_result("ENABLE", cartpole_enable(c, 2.0));
     case CONSOLE_CMD_CENTER:
-        if (rig_goto_center(15.0) != 0) {
+        if (console_goto_center(c, 15.0) != 0) {
             fprintf(stderr, "[edge] move-to-center failed\n");
             return -1;
         }
         return 0;
     case CONSOLE_CMD_STATE:
-        rig_print_state();
+        console_print_state(c);
         return 0;
     case CONSOLE_CMD_QUERY: {
-        if (rig_sync_mode(1.0) != 0) {
-            fprintf(stderr, "[edge] no MODE reply (QUERY timed out)\n");
+        if (console_transaction_result("QUERY", cartpole_query_mode(c, 1.0)) != 0) {
             return -1;
         }
-        int known;
-        fw_reason_t reason;
-        fw_mode_t m = rig_mode(&known, &reason);
-        printf("MODE %s %s\n", proto_mode_name(m), proto_reason_name(reason));
+        cartpole_reason_t reason = cartpole_get_session_state(c).reported_mode_reason;
+        cartpole_mode_t m = cartpole_get_session_state(c).reported_mode;
+        printf("MODE %s %s\n", cartpole_mode_to_string(m), cartpole_reason_to_string(reason));
         return 0;
     }
-    case CONSOLE_CMD_CONFIG:
+    case CONSOLE_CMD_CONFIG: {
         if (req->dump) {
-            if (rig_send_simple("CONFIG?") != 0) {
+            if (console_transaction_result("metadata",
+                                           cartpole_refresh_configuration(c, DUMP_WINDOW_S)))
                 return -1;
-            }
-            double t0 = rig_now_s();
-            while (rig_now_s() - t0 < DUMP_WINDOW_S) {
-                rig_pump();
-                nap_ms(5);
-            }
+            cartpole_configuration_t config = cartpole_get_configuration(c);
+            printf("[edge] calibration=%s length=%" PRId64 " um; VEL_MAX=%" PRId64
+                   " ACC_MAX=%" PRId64 " WDT_MS=%" PRId64 " X_MARGIN_UM=%" PRId64 "\n",
+                   config.calibration_state == CARTPOLE_CALIBRATION_READY ? "ready"
+                   : config.calibration_state == CARTPOLE_CALIBRATION_REFERENCE_REQUIRED
+                       ? "reference-required"
+                       : "not-ready",
+                   config.track_length_um, config.velocity_limit_mm_s,
+                   config.acceleration_limit_mm_s2, config.watchdog_timeout_ms,
+                   config.track_margin_um);
             return 0;
         }
-        if (rig_send_config(req->name, req->value) != 0) {
+        char operation[32];
+        snprintf(operation, sizeof operation, "CONFIG %s", req->name);
+        cartpole_setting_t setting;
+        if (cartpole_parse_setting(req->name, &setting) != 0) {
+            fprintf(stderr, "[edge] unsupported setting %s\n", req->name);
             return -1;
         }
-        return rig_wait_reply(1.0) == 0 ? 0 : -1;
+        int rc =
+            console_transaction_result(operation, cartpole_configure(c, setting, req->value, 1.0));
+        if (rc == 0)
+            printf("[edge] %s = %ld\n", cartpole_setting_to_string(setting), req->value);
+        return rc;
+    }
     case CONSOLE_CMD_RESET: {
-        if (ensure_mode_known() != 0) {
-            fprintf(stderr, "[edge] no MODE reply (QUERY timed out)\n");
+        if (query_mode_for_command(c) != 0)
             return -1;
-        }
         int known;
-        fw_mode_t m = rig_mode(&known, NULL);
-        if (known && m == FW_DISABLED) {
+        cartpole_session_t snapshot = cartpole_get_session_state(c);
+        known = snapshot.is_mode_received;
+        cartpole_mode_t m = snapshot.reported_mode;
+        if (known && m == CARTPOLE_MODE_DISABLED) {
             printf("[edge] already DISABLED\n");
             return 0;
         }
-        if (m != FW_FAULT) {
-            fprintf(stderr, "[edge] RESET only clears FAULT (current %s)\n",
-                    proto_mode_name(m));
+        if (m != CARTPOLE_MODE_FAULT) {
+            fprintf(stderr, "[edge] RESET only clears FAULT (current %s)\n", cartpole_mode_to_string(m));
             return -1;
         }
-        if (rig_send_simple("RESET") != 0) {
+        if (console_transaction_result("RESET", cartpole_reset(c, 2.0)) != 0)
             return -1;
-        }
-        if (rig_wait_mode(FW_DISABLED, 2.0) != 0) {
-            fprintf(stderr, "[edge] no DISABLED event after RESET\n");
-            return -1;
-        }
         return 0;
     }
     default:
@@ -321,8 +366,10 @@ int console_exec(const console_req_t *req)
 static void print_help(void)
 {
     printf("commands:\n"
-           "  vel <mm/s>            set held target velocity (kept while READY & STATE fresh)\n"
-           "  calib                 interactive 2-point calibration (MARK LEFT/RIGHT + ENABLE)\n"
+           "  vel <mm/s>            set held target velocity (kept while READY & "
+           "STATE fresh)\n"
+           "  calib                 interactive 2-point calibration (MARK "
+           "LEFT/RIGHT + ENABLE)\n"
            "  mark-left             send MARK LEFT (cart at left end)\n"
            "  mark-right            send MARK RIGHT (cart at right end)\n"
            "  enable                ENABLE after calibration, wait READY\n"
@@ -334,134 +381,91 @@ static void print_help(void)
            "  help | quit\n");
 }
 
-/* 处理一行输入。返回 1 表示退出控制台。 */
-static int handle_line(const char *line, int *holding, double *held_vel)
+typedef struct {
+    int holding;
+    double velocity;
+} console_hold;
+static int console_tick(double elapsed, cartpole_tick_action_t *action, void *context)
 {
-    console_req_t req;
-    if (console_parse(line, &req) != 0) {
-        printf("? %s\n", req.err);
-        return 0;
+    console_hold *hold = context;
+    int rc = read_line_tick(elapsed, action, NULL);
+    if (rc || action->kind == CARTPOLE_TICK_FINISH)
+        return rc;
+    if (hold->holding) {
+        action->kind = CARTPOLE_TICK_VELOCITY;
+        action->velocity_mm_s = hold->velocity;
     }
-    switch (req.cmd) {
-    case CONSOLE_CMD_QUIT:
-        return 1;
-    case CONSOLE_CMD_HELP:
-        print_help();
-        return 0;
-    case CONSOLE_CMD_NONE:
-        return 0;
-    case CONSOLE_CMD_VEL:
-        /* 保持前先等 STATE 流就位、模式已知（与一次性 vel 子命令同语义）：
-         * tick_hold 对未知模式会立即释放保持，首条命令必须先 QUERY 同步 */
-        if (rig_wait_state(CFG_STATE_TIMEOUT_S) != 0) {
-            printf("[edge] WARNING: no STATE stream, ignoring vel\n");
-            return 0;
-        }
-        if (ensure_mode_known() != 0) {
-            printf("[edge] WARNING: no MODE reply, ignoring vel\n");
-            return 0;
-        }
-        *holding = 1;
-        *held_vel = req.vel_mm_s;
-        return 0;
-    case CONSOLE_CMD_CALIB:
-    case CONSOLE_CMD_MARK_LEFT:
-    case CONSOLE_CMD_MARK_RIGHT:
-    case CONSOLE_CMD_ENABLE:
-    case CONSOLE_CMD_CENTER:
-    case CONSOLE_CMD_RESET:
-    case CONSOLE_CMD_CONFIG:
-        /* 模式变更类命令期间不保持速度，避免标定/使能/清障后意外续动 */
-        *holding = 0;
-        console_exec(&req);
-        return 0;
-    default: /* QUERY / STATE 只读，不打断保持 */
-        console_exec(&req);
-        return 0;
-    }
+    return 0;
 }
-
-/* 保持心跳：检查模式与 STATE 新鲜度并重发目标速度（喂固件看门狗）。
- * 语义不依赖输入节奏：每处理完一行输入、每个 select 超时各调用一次。 */
-static void tick_hold(int *holding, double held_vel)
+int console_run(cartpole_t *c)
 {
-    if (!*holding) {
+    console_hold hold = {0};
+    memset(&input, 0, sizeof input);
+    print_help();
+    puts("[edge] console ready (quit/Ctrl+D to exit)");
+    while (!cartpole_is_stop_requested(c)) {
+        cartpole_result_t result = cartpole_run_loop(c, .020, 0, console_tick, &hold);
+        if (result == CARTPOLE_CANCELLED)
+            return 0;
+        if (result != CARTPOLE_OK)
+            return console_transaction_result("console", result);
+        if (input.eof)
+            break;
+        if (!input.ready)
+            continue;
+        console_req_t req;
+        int parsed = input.overflow ? -1 : console_parse(input.line, &req);
+        if (input.overflow)
+            puts("? line too long");
+        else if (parsed)
+            printf("? %s\n", req.err);
+        consume_line();
+        if (parsed)
+            continue;
+        if (req.cmd == CONSOLE_CMD_QUIT)
+            break;
+        if (req.cmd == CONSOLE_CMD_NONE)
+            continue;
+        if (req.cmd == CONSOLE_CMD_HELP) {
+            print_help();
+            continue;
+        }
+        if (req.cmd == CONSOLE_CMD_VEL) {
+            if (query_mode_for_command(c) ||
+                console_transaction_result("STATE",
+                                           cartpole_wait_for_measurement(c, CFG_STATE_TIMEOUT_S))) {
+                hold.holding = 0;
+                continue;
+            }
+            hold.holding = 1;
+            hold.velocity = req.vel_mm_s;
+            continue;
+        }
+        if (req.cmd != CONSOLE_CMD_QUERY && req.cmd != CONSOLE_CMD_STATE)
+            hold.holding = 0;
+        (void)console_exec(c, &req);
+    }
+    return 0;
+}
+int console_goto_center(cartpole_t *c, double timeout_s)
+{
+    return console_transaction_result("center", cartpole_move_to_center(c, timeout_s));
+}
+void console_print_state(cartpole_t *c)
+{
+    cartpole_measurement_t m = cartpole_get_latest_measurement(c);
+    if (m.received_host_monotonic_s < 0) {
+        puts("[edge] no STATE received");
         return;
     }
-    int known;
-    fw_mode_t m = rig_mode(&known, NULL);
-    double age = rig_state_age_s();
-    if (!known || m != FW_READY) {
-        *holding = 0;
-        printf("[edge] hold released (firmware in %s)\n",
-               known ? proto_mode_name(m) : "unknown mode");
-    } else if (age < 0.0 || age > CFG_STATE_TIMEOUT_S) {
-        *holding = 0;
-        rig_send_vel(0.0);
-        printf("[edge] WARNING: STATE stream stale, motor stopped\n");
-    } else {
-        rig_send_vel(held_vel);
-    }
-}
-
-int console_run(void)
-{
-    char line[CONSOLE_LINE_MAX];
-    size_t len = 0;
-    int holding = 0;
-    double held_vel = 0.0;
-
-    print_help();
-    printf("[edge] console ready (quit/Ctrl+D to exit)\n");
-    for (;;) {
-        fd_set rf;
-        FD_ZERO(&rf);
-        FD_SET(STDIN_FILENO, &rf);
-        struct timeval tv = {0, 20 * 1000};
-        int r = select(STDIN_FILENO + 1, &rf, NULL, NULL, &tv);
-        if (r < 0) {
-            if (errno == EINTR) {
-                r = 0; /* 信号打断：走下面的停止与保持检查 */
-            } else {
-                fprintf(stderr, "[edge] select: %s\n", strerror(errno));
-                break;
-            }
-        }
-        if (r > 0) {
-            char chunk[64];
-            ssize_t got = read(STDIN_FILENO, chunk, sizeof(chunk));
-            if (got < 0 && errno == EINTR) {
-                got = 0;
-            }
-            if (got < 0) {
-                fprintf(stderr, "[edge] read: %s\n", strerror(errno));
-                break;
-            }
-            if (got == 0) { /* Ctrl+D */
-                break;
-            }
-            for (ssize_t k = 0; k < got; k++) {
-                char c = chunk[k];
-                if (c == '\n') {
-                    line[len] = '\0';
-                    if (handle_line(line, &holding, &held_vel)) {
-                        goto out;
-                    }
-                    len = 0;
-                    tick_hold(&holding, held_vel);
-                } else if (len + 1 < sizeof(line)) {
-                    line[len++] = c;
-                } /* 超长输入截断，与协议接收器同策略 */
-            }
-        }
-
-        rig_pump();
-        tick_hold(&holding, held_vel);
-
-        if (rig_stop_requested()) {
-            break;
-        }
-    }
-out:
-    return 0; /* 停机由 main 的会话退出路径统一发送 */
+    if (m.cart_valid)
+        printf("[edge] cart x=%.6f m velocity=%.6f m/s\n", m.cart_position_m, m.cart_velocity_m_s);
+    else
+        puts("[edge] cart measurement unavailable");
+    if (m.pole_valid)
+        printf("[edge] pole angle=%.6f rad velocity=%.6f rad/s\n", m.pole_angle_rad,
+               m.pole_angular_velocity_rad_s);
+    else
+        puts("[edge] pole measurement unavailable");
+    printf("[edge] measurement age=%.1f ms\n", cartpole_calculate_measurement_age_s(c, m) * 1000);
 }

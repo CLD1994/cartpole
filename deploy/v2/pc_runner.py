@@ -25,7 +25,7 @@ scripts/rsl_rl/play.py 跑一次 v2 任务导出（checkpoint 同目录 exported
 policy.onnx，normalizer 已烘焙进图，输入顺序 [x, θ, ẋ, θ̇]）。
 
 安全语义与 edge/main.c 逐条对齐；常量不在此处另立权威——默认值从
-edge/config.h 与 edge/rig.c 的 CFG_FW_PARAMS 表解析（失败即拒绝启动），
+edge/config.h 与 edge/cartpole.c 的 CFG_FW_PARAMS 表解析（失败即拒绝启动），
 CLI 可临时覆盖。固件侧另有看门狗、软限位、STEP_LOSS 兜底。
 
 部署边界符号映射（2026-09-25 实机定案，见本文件旧台位符号说明）：训练侧摆角
@@ -201,7 +201,7 @@ def map_action(action: float, x_m: float, v_max_mps: float, track_limit_m: float
 
 
 # ================================================================
-# edge 常量加载（单一权威：edge/config.h 与 edge/rig.c）
+# edge 常量加载（单一权威：edge/config.h 与 edge/cartpole.c）
 # ================================================================
 
 def parse_config_h(text: str) -> dict[str, float]:
@@ -233,12 +233,12 @@ def parse_fw_params(text: str) -> list[tuple[str, int]]:
 
 def load_edge_defaults(edge_dir: Path) -> tuple[dict[str, float], list[tuple[str, int]]]:
     config_h = edge_dir / "config.h"
-    rig_c = edge_dir / "rig.c"
-    for path in (config_h, rig_c):
+    cartpole_c = edge_dir / "cartpole.c"
+    for path in (config_h, cartpole_c):
         if not path.is_file():
             raise RuntimeError("缺少权威常量来源 %s（edge 目录不完整？）" % path)
     cfg = parse_config_h(config_h.read_text(encoding="utf-8"))
-    params = parse_fw_params(rig_c.read_text(encoding="utf-8"))
+    params = parse_fw_params(cartpole_c.read_text(encoding="utf-8"))
     return cfg, params
 
 
@@ -622,7 +622,7 @@ def main(argv=None) -> int:
             "开" if args.frame_fix else "关",
         )
     )
-    print("[pc] 会话参数推送集（%d 项，来自 edge/rig.c）" % len(params))
+    print("[pc] 会话参数推送集（%d 项，来自 edge/cartpole.c）" % len(params))
 
     try:
         policy = PolicyOnnx(args.onnx)

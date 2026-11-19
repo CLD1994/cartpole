@@ -70,21 +70,21 @@ static int32_t g_acl_init_ret, g_set_device_ret, g_reset_device_ret, g_finalize_
 
 int32_t svp_acl_init(const char *config_path)
 {
-    (void)config_path;
+    assert(config_path == NULL); /* 使用 SDK 默认配置，不伪造配置路径。 */
     ev(EV_ACL_INIT);
     return g_acl_init_ret;
 }
 
 int32_t svp_acl_rt_set_device(int32_t device_id)
 {
-    (void)device_id;
+    assert(device_id == 0); /* 初始化与释放必须针对同一个设备。 */
     ev(EV_SET_DEVICE);
     return g_set_device_ret;
 }
 
 int32_t svp_acl_rt_reset_device(int32_t device_id)
 {
-    (void)device_id;
+    assert(device_id == 0); /* 初始化与释放必须针对同一个设备。 */
     ev(EV_RESET_DEVICE);
     return g_reset_device_ret;
 }
@@ -105,6 +105,9 @@ static cartpole_status g_infer_ret = CARTPOLE_OK;
 static int g_infer_inf_output;    /* 成功返回但动作为无穷大（库外部防御分支） */
 static int g_close_fail_times;    /* 前 N 次 close 失败（资源保留，可重试） */
 static int g_infer_calls;
+static const char *g_expected_model;
+static float g_received_observation[4];
+static const float g_action = 0.375f;
 
 static void fill_error(cartpole_error *err, cartpole_status code, const char *stage)
 {
@@ -119,7 +122,7 @@ static void fill_error(cartpole_error *err, cartpole_status code, const char *st
 
 cartpole_status cartpole_npu_open(const char *model_path, cartpole_npu **handle, cartpole_error *error)
 {
-    (void)model_path;
+    assert(model_path && strcmp(model_path, g_expected_model) == 0);
     ev(EV_OPEN);
     if (handle == NULL || *handle != NULL) {
         fill_error(error, CARTPOLE_ARGUMENT, "open_argument");
@@ -144,6 +147,7 @@ cartpole_status cartpole_npu_infer(cartpole_npu *handle, const float obs[4], flo
 {
     ev(EV_INFER);
     g_infer_calls++;
+    memcpy(g_received_observation, obs, sizeof g_received_observation);
     if (handle != g_fake) {
         if (action != NULL) {
             *action = NAN;
@@ -168,7 +172,7 @@ cartpole_status cartpole_npu_infer(cartpole_npu *handle, const float obs[4], flo
         return g_infer_ret;
     }
     if (action != NULL) {
-        *action = g_infer_inf_output ? INFINITY : 0.1f * (obs[0] + obs[1] + obs[2] + obs[3]);
+        *action = g_infer_inf_output ? INFINITY : g_action;
     }
     return CARTPOLE_OK;
 }
@@ -199,6 +203,8 @@ static void reset_state(void)
     g_infer_inf_output = 0;
     g_close_fail_times = 0;
     g_infer_calls = 0;
+    g_expected_model = "model.om";
+    memset(g_received_observation, 0, sizeof g_received_observation);
 }
 
 /* ---- 测试 ---- */
@@ -206,21 +212,24 @@ static void reset_state(void)
 static void test_init_happy_path(void)
 {
     reset_state();
-    assert(policy_init("model.om") == 0);
+    g_expected_model = "packages/current/model.om";
+    assert(policy_init(POLICY_NPU, g_expected_model) == 0);
     assert(before(EV_ACL_INIT, EV_SET_DEVICE) && before(EV_SET_DEVICE, EV_OPEN));
     assert(count(EV_OPEN) == 1 && count(EV_ACL_FINALIZE) == 0);
 
     float action = 1.0f;
     float obs[4] = {0.1f, 0.2f, -0.3f, -0.4f};
     assert(policy_forward(obs, &action) == 0);
-    assert(action == 0.1f * (obs[0] + obs[1] + obs[2] + obs[3])); /* 原始动作直传，不缩放 */
+    assert(action == g_action); /* 原始动作直传，不缩放 */
+    for (int i = 0; i < 4; i++)
+        assert(g_received_observation[i] == obs[i]); /* 不允许交换、缩放或漏传观测。 */
 
     policy_deinit();
     assert(before(EV_CLOSE, EV_RESET_DEVICE) && before(EV_RESET_DEVICE, EV_ACL_FINALIZE));
     assert(count(EV_CLOSE) == 1 && count(EV_RESET_DEVICE) == 1 && count(EV_ACL_FINALIZE) == 1);
 
-    policy_deinit(); /* 幂等：仅剩对 NULL 句柄的幂等 close，不再释放任何资源 */
-    assert(count(EV_CLOSE) == 2); /* 幂等 close 仍被调用（契约允许） */
+    policy_deinit(); /* 幂等：不再释放任何资源 */
+    assert(count(EV_CLOSE) == 1);
     assert(count(EV_RESET_DEVICE) == 1 && count(EV_ACL_FINALIZE) == 1);
     assert(count(EV_OPEN) == 1 && count(EV_INFER) == 1);
 }
@@ -229,7 +238,7 @@ static void test_init_acl_init_fails(void)
 {
     reset_state();
     g_acl_init_ret = 1;
-    assert(policy_init("model.om") != 0);
+    assert(policy_init(POLICY_NPU, "model.om") != 0);
     assert(count(EV_ACL_INIT) == 1 && count(EV_SET_DEVICE) == 0 && count(EV_OPEN) == 0);
 
     policy_deinit(); /* 运行时未建立：不得 finalize */
@@ -240,7 +249,7 @@ static void test_init_set_device_fails(void)
 {
     reset_state();
     g_set_device_ret = 2;
-    assert(policy_init("model.om") != 0);
+    assert(policy_init(POLICY_NPU, "model.om") != 0);
     assert(count(EV_OPEN) == 0 && count(EV_RESET_DEVICE) == 0);
     assert(count(EV_ACL_FINALIZE) == 1); /* init 已成功：须 finalize 释放 */
     policy_deinit();
@@ -251,7 +260,7 @@ static void test_init_open_fails_clean(void)
 {
     reset_state();
     g_open_ret = CARTPOLE_IO;
-    assert(policy_init("model.om") != 0);
+    assert(policy_init(POLICY_NPU, "model.om") != 0);
     /* 退出梯子仍完整：close（NULL 幂等）-> reset -> finalize */
     assert(count(EV_CLOSE) == 1 && count(EV_RESET_DEVICE) == 1 && count(EV_ACL_FINALIZE) == 1);
     policy_deinit();
@@ -263,7 +272,7 @@ static void test_init_open_leaves_close_only_handle(void)
     reset_state();
     g_open_ret = CARTPOLE_MODEL;
     g_open_leave_handle = 1;
-    assert(policy_init("model.om") != 0);
+    assert(policy_init(POLICY_NPU, "model.om") != 0);
     /* 残留句柄由退出路径的 close 释放，随后正常释放运行时 */
     assert(count(EV_CLOSE) == 1 && count(EV_RESET_DEVICE) == 1 && count(EV_ACL_FINALIZE) == 1);
     policy_deinit();
@@ -276,7 +285,7 @@ static void test_close_failure_holds_runtime(void)
     g_open_leave_handle = 1;
     g_open_ret = CARTPOLE_MODEL;
     g_close_fail_times = 1; /* 第一次 close 失败 */
-    assert(policy_init("model.om") != 0);
+    assert(policy_init(POLICY_NPU, "model.om") != 0);
     assert(count(EV_CLOSE) == 1 && count(EV_RESET_DEVICE) == 0 && count(EV_ACL_FINALIZE) == 0);
 
     policy_deinit(); /* 重试 close：成功后补全梯子 */
@@ -296,7 +305,7 @@ static void test_forward_before_init(void)
 static void test_forward_infer_failure_invalidates_handle(void)
 {
     reset_state();
-    assert(policy_init("model.om") == 0);
+    assert(policy_init(POLICY_NPU, "model.om") == 0);
     float action = 1.0f;
     g_infer_ret = CARTPOLE_SDK;
     assert(policy_forward((const float[4]){0.5f, 0.1f, 0, 0}, &action) != 0);
@@ -313,18 +322,18 @@ static void test_forward_infer_failure_invalidates_handle(void)
 static void test_forward_rejects_nonfinite_observation(void)
 {
     reset_state();
-    assert(policy_init("model.om") == 0);
+    assert(policy_init(POLICY_NPU, "model.om") == 0);
     float action = 1.0f;
     const float obs[4] = {0.0f, NAN, 0.0f, 0.0f};
     assert(policy_forward(obs, &action) != 0);
-    assert(action == 0.0f && g_infer_calls == 1);
+    assert(action == 0.0f && g_infer_calls == 0);
     policy_deinit();
 }
 
 static void test_forward_rejects_nonfinite_action(void)
 {
     reset_state();
-    assert(policy_init("model.om") == 0);
+    assert(policy_init(POLICY_NPU, "model.om") == 0);
     g_infer_inf_output = 1;
     float action = 1.0f;
     assert(policy_forward((const float[4]){1, 1, 1, 1}, &action) != 0);
@@ -339,15 +348,31 @@ static void test_forward_rejects_nonfinite_action(void)
 static void test_double_init_rejected(void)
 {
     reset_state();
-    assert(policy_init("model.om") == 0);
-    assert(policy_init("model.om") != 0);
+    assert(policy_init(POLICY_NPU, "model.om") == 0);
+    assert(policy_init(POLICY_NPU, "model.om") != 0);
     assert(count(EV_OPEN) == 1); /* 未重复 open，也未破坏现有会话 */
     policy_deinit();
     assert(count(EV_CLOSE) == 1);
 }
 
+static void test_finalize_failure_retains_resources(void)
+{
+    reset_state();
+    assert(policy_init(POLICY_NPU, "model.om") == 0);
+    g_finalize_ret = 9;
+    policy_deinit();
+    assert(policy_init(POLICY_NPU, "model.om") != 0);
+    assert(policy_init(POLICY_CPU, "absent.fp32") != 0);
+    g_finalize_ret = 0;
+    policy_deinit();
+    assert(count(EV_ACL_FINALIZE) == 2);
+    assert(policy_init(POLICY_NPU, "model.om") == 0);
+    policy_deinit();
+}
+
 int main(void)
 {
+    test_finalize_failure_retains_resources();
     test_init_happy_path();
     test_init_acl_init_fails();
     test_init_set_device_fails();

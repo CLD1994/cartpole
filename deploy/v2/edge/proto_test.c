@@ -13,31 +13,32 @@
 /* 行缓冲测试用的记录器 */
 static char last_line[160];
 static int cb_count;
+static int received_types[8];
 static void cb(const char *line, size_t len, void *user)
 {
     (void)user;
     memcpy(last_line, line, len < sizeof(last_line) ? len : sizeof(last_line) - 1);
     last_line[len < sizeof(last_line) ? len : sizeof(last_line) - 1] = '\0';
-    cb_count++;
+    assert(cb_count < 8);
+    received_types[cb_count++] = proto_parse_line(last_line, &(proto_msg_t){0});
 }
 
 static void test_state_valid(void)
 {
     proto_msg_t m;
-    assert(proto_parse_line("STATE -265000 -3141593 -1500 -10000", &m) == PROTO_STATE);
-    assert(m.x_um == -265000 && m.theta_urad == -3141593 && m.vx_mm_s == -1500 && m.vth_mrad_s == -10000);
-    assert(proto_parse_line("STATE 0 0 0 0", &m) == PROTO_STATE);
+    assert(proto_parse_line("STATE 3 -265000 -3141592 -1500 -10000", &m) == PROTO_STATE);
+    assert(m.x_um == -265000 && m.theta_urad == -3141592 && m.vx_mm_s == -1500 && m.vth_mrad_s == -10000);
+    assert(proto_parse_line("STATE 3 0 0 0 0", &m) == PROTO_STATE);
     assert(m.x_um == 0 && m.theta_urad == 0 && m.vx_mm_s == 0 && m.vth_mrad_s == 0);
-    /* 多空格是合法分隔（parse_int/parse_word 均跳过前导空格） */
-    assert(proto_parse_line("STATE  123  456 78 9", &m) == PROTO_STATE);
-    assert(m.x_um == 123 && m.vth_mrad_s == 9);
+    /* 正式 STATE 必须使用单空格分隔。 */
+    assert(proto_parse_line("STATE  3 123 456 78 9", &m) == PROTO_UNKNOWN);
 }
 
 static void test_state_invalid(void)
 {
     proto_msg_t m;
     assert(proto_parse_line("STATE 1 2 3", &m) == PROTO_UNKNOWN);        /* 缺字段 */
-    assert(proto_parse_line("STATE 1 2 3 4 5", &m) == PROTO_UNKNOWN);    /* 多余字段 */
+    assert(proto_parse_line("STATE 3 1 2 3 4 5", &m) == PROTO_UNKNOWN);    /* 多余字段 */
     assert(proto_parse_line("STATE 1 2 x 4", &m) == PROTO_UNKNOWN);      /* 非数字 */
     assert(proto_parse_line("STATE", &m) == PROTO_UNKNOWN);              /* 只有头 */
 }
@@ -99,13 +100,45 @@ static void test_garbage(void)
 static void test_format(void)
 {
     char buf[64];
-    assert(proto_format_vel(buf, 200.0) > 0 && strcmp(buf, "VEL 200\n") == 0);
-    assert(proto_format_vel(buf, -12.6) > 0 && strcmp(buf, "VEL -13\n") == 0); /* 四舍五入 */
+    proto_command_t command;
+    assert(proto_format_vel(buf, 200.0) > 0);
+    assert(proto_parse_command(buf, &command) && command.kind == PROTO_COMMAND_VELOCITY && command.value == 200);
+    assert(proto_format_vel(buf, -12.6) > 0);
+    assert(proto_parse_command(buf, &command) && command.kind == PROTO_COMMAND_VELOCITY && command.value == -13); /* 四舍五入 */
     assert(proto_format_vel(buf, NAN) == 0);                                   /* NaN 拒发 */
     assert(proto_format_vel(buf, 1.0e12) == 0);                                /* 超界拒发 */
-    assert(proto_format_simple(buf, "MARK LEFT") > 0 && strcmp(buf, "MARK LEFT\n") == 0);
-    assert(proto_format_simple(buf, "ENABLE") > 0 && strcmp(buf, "ENABLE\n") == 0);
-    assert(proto_format_config(buf, "X_MARGIN_UM", 10000) > 0 && strcmp(buf, "CONFIG X_MARGIN_UM 10000\n") == 0);
+    assert(proto_format_simple(buf, "MARK LEFT") > 0);
+    assert(proto_parse_command(buf, &command) && command.kind == PROTO_COMMAND_MARK_LEFT);
+    assert(proto_format_simple(buf, "ENABLE") > 0);
+    assert(proto_parse_command(buf, &command) && command.kind == PROTO_COMMAND_ENABLE);
+    assert(proto_format_config(buf, "X_MARGIN_UM", 10000) > 0);
+    assert(proto_parse_command(buf, &command));
+    assert(command.kind == PROTO_COMMAND_CONFIGURE);
+    assert(strcmp(command.parameter, "X_MARGIN_UM") == 0 && command.value == 10000);
+}
+
+static void test_command_parser_contract(void)
+{
+    /* 独立字面帧，避免只用格式化器生成输入形成同错自证。 */
+    proto_command_t command = {.kind = PROTO_COMMAND_RESET, .value = 77};
+    assert(proto_parse_command("VEL -900\n", &command));
+    assert(command.kind == PROTO_COMMAND_VELOCITY && command.value == -900);
+    assert(proto_parse_command("CONFIG ACC_MAX 10000\n", &command));
+    assert(command.kind == PROTO_COMMAND_CONFIGURE && command.value == 10000);
+    assert(strcmp(command.parameter, "ACC_MAX") == 0);
+    assert(proto_parse_command("MARK RIGHT\n", &command));
+    assert(command.kind == PROTO_COMMAND_MARK_RIGHT);
+    const char *invalid[] = {"", "VEL 1", "VEL +1\n", "VEL 01\n", "VEL -0\n",
+        "VEL  1\n", "VEL 1 \n", "VEL 1\r\n", "VEL 1000000001\n",
+        "VEL 9999999999999999999999999999999999\n", "VEL 1\nQUERY\n",
+        "CONFIG acc 1\n", "CONFIG  1\n", "CONFIG X 1 extra\n", "UNKNOWN\n"};
+    for (size_t i = 0; i < sizeof invalid / sizeof *invalid; i++) {
+        command = (proto_command_t){.kind = PROTO_COMMAND_RESET, .value = 77};
+        assert(!proto_parse_command(invalid[i], &command));
+        assert(command.kind == PROTO_COMMAND_RESET && command.value == 77);
+    }
+    assert(!proto_parse_command(NULL, &command));
+    assert(!proto_parse_command("QUERY\n", NULL));
 }
 
 static void test_rx_feed(void)
@@ -130,9 +163,10 @@ static void test_rx_feed(void)
     memset(longline, 'x', sizeof(longline));
     longline[299] = '\n';
     proto_rx_feed(&rx, longline, sizeof(longline), cb, NULL);
-    proto_rx_feed(&rx, (const uint8_t *)"STATE 9 9 9 9\n", 14, cb, NULL);
-    assert(cb_count == 5 && strcmp(last_line, "STATE 9 9 9 9") == 0);
-    assert(proto_parse_line("xxxx", &(proto_msg_t){0}) == PROTO_UNKNOWN); /* 截断垃圾行被丢弃 */
+    proto_rx_feed(&rx, (const uint8_t *)"STATE 3 9 9 9 9\n", 16, cb, NULL);
+    assert(cb_count == 5 && strcmp(last_line, "STATE 3 9 9 9 9") == 0);
+    assert(received_types[3] == PROTO_UNKNOWN); /* 检查实际溢出回调 */
+    assert(received_types[4] == PROTO_STATE); /* 恢复帧能被真实解析器接收 */
 }
 
 int main(void)
@@ -144,6 +178,7 @@ int main(void)
     test_config_replies();
     test_garbage();
     test_format();
+    test_command_parser_contract();
     test_rx_feed();
     printf("proto_test: all passed\n");
     return 0;

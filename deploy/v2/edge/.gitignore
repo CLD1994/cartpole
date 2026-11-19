@@ -2,3 +2,5 @@
 proto_test
 policy_test
 console_test
+
+.test-build/

@@ -1,4 +1,4 @@
-> 本库服务于 [旧 V2 CV610 控制程序](../README.md)，是独立 NPU 接口参考。它不代表当前 Python ONNX 运行器的模型格式、400/500 Hz 调度或固件适配已在 CV610 验收。
+> 本库为 [CV610 端侧控制应用](../README.md) 提供模型执行接口。接口和主机替身测试不代替目标板模型、数值及调度验收。
 
 # cartpole_npu 推理库（外部依赖产物）
 
@@ -28,9 +28,15 @@
 `svp_acl_init` / `svp_acl_rt_set_device` 等运行时符号不在本库内，由 CV610 SDK
 的 `svp_acl` 库提供（头文件为 `<acl/svp_acl.h>`，错误码类型 `svp_acl_error`，
 0 表示成功；与 `policy.c` 主机侧最小声明逐项核验一致）。`libsvp_acl.so` 自身
-只登记 `libc.so`，链接时必须显式带入附加库，否则出现未定义符号：完整集合为
-`svp_acl` + `ss_mpi_sysmem` + `protobuf-c` + `securec` + `ot_osal` + `ot_irq`
-+ `ot_sys` + `ot_base`。
+只登记 `libc.so`，需显式链接其依赖。已验证 Tools_V1.0.1 的 musl ARM
+`stub` 目录配合工具链 sysroot 可完成链接：`svp_acl`、`ss_mpi_sysmem`、
+`protobuf-c`、`securec`。这些 vendor stub 是交叉链接接口，不是测试替身；
+不能将它们复制上板替换运行库。板端仍使用其配套 SDK 运行库。
+
+`build.sh` 默认上述集合，可通过 `SVP_ACL_EXTRA_LIBRARIES`（分号分隔）覆盖。
+其他 SDK 交接包可能还需要 `ot_osal;ot_irq;ot_sys;ot_base`，应以其符号依赖为准，
+不强制所有 SDK 都链接八个库。成功交叉链接仅验证构建侧符号与 ARM ABI；
+板端还需核对动态库版本、musl 时间函数 ABI、驱动及实际模型加载。
 
 交叉工具链（`arm-v01c02-linux-musleabi-gcc`，GCC 10.3 musl 1.2.3，Cortex-A7
 softfp）与 SDK 头文件、musl ARM 库由 CV610 侧项目的交叉编译交接包提供。
@@ -38,3 +44,9 @@ softfp）与 SDK 头文件、musl ARM 库由 CV610 侧项目的交叉编译交�
 敏感文件名，不能作为工具链的家）：`setup-wsl.sh` 负责一次性导入并按交接清单
 恢复完整性，`build.sh` 是日常交叉编译入口（含产物自检），两者都在 WSL
 Ubuntu 内执行、随本仓库版本化。板端沿用已验证的 SDK 启动环境解析上述动态库。
+
+## 模型验收
+
+ONNX 到 OM 的转换使用匹配 Hi3516CV610 的 ATC 工具，不能用交叉编译器替代。四维输入是状态 feature map，单位与顺序必须与正式模型一致。保留转换工具版本、源模型和校准数据，使用独立验证观测对比 ONNX 与 OM 的原始动作、限幅后的速度和误差分布。
+
+参考程序 `src/replay.c` 读取无表头 CSV，每行四个 SI 状态值，输出 `sample,action,inference_ns`。它不读写电机串口，但需要板端 NPU 与运行库，不能使用现有 ARM 静态库当作 PC 仿真后端。输出文件须不存在。回放通过后还须测试完整应用的控制周期与停止路径。
