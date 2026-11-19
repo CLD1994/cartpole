@@ -35,14 +35,16 @@ static void test_delegation_and_invalid_timeouts(void)
     }
     d.call_count = 0;
     d.transaction_result = CARTPOLE_REPLY_MISMATCH;
-    assert(cartpole_mark_endpoint(c, CARTPOLE_RIGHT, .25) == CARTPOLE_REPLY_MISMATCH);
+    int64_t mark_value = 123;
+    assert(cartpole_mark_endpoint(c, CARTPOLE_RIGHT, &mark_value, .25) == CARTPOLE_REPLY_MISMATCH);
+    assert(mark_value == 123);
     assert(d.call_count == 1 && d.calls[0].operation == FAKE_MARK);
     assert(d.calls[0].argument == CARTPOLE_RIGHT && d.calls[0].timeout == .25);
     assert(cartpole_configure(c, CARTPOLE_SETTING_ACCELERATION_LIMIT, 10000, .5) == CARTPOLE_REPLY_MISMATCH);
     assert(d.call_count == 2 && d.calls[1].operation == FAKE_CONFIGURE);
     assert(d.calls[1].argument == CARTPOLE_SETTING_ACCELERATION_LIMIT && d.calls[1].value == 10000);
     assert(d.calls[1].timeout == .5);
-    assert(cartpole_mark_endpoint(c, CARTPOLE_LEFT, NAN) == CARTPOLE_INVALID_ARGUMENT);
+    assert(cartpole_mark_endpoint(c, CARTPOLE_LEFT, &mark_value, NAN) == CARTPOLE_INVALID_ARGUMENT);
     assert(cartpole_configure(c, CARTPOLE_SETTING_ACCELERATION_LIMIT, 5000, -1) == CARTPOLE_INVALID_ARGUMENT);
     assert(d.call_count == 2);
     d.stop_result = CARTPOLE_STOP_FAULT;

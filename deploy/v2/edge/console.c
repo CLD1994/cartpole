@@ -263,14 +263,81 @@ int console_transaction_result(const char *operation, cartpole_result_t result)
 {
     if (result == CARTPOLE_OK)
         return 0;
-    fprintf(stderr, "[edge] %s: %s%s\n", operation, cartpole_result_to_string(result),
-            result == CARTPOLE_TIMEOUT ? " (execution unconfirmed; do not automatically retry)"
-                                       : "");
+    const char *detail = "";
+    switch (result) {
+    case CARTPOLE_TIMEOUT:
+        detail = "（执行未确认，不要自动重试）";
+        break;
+    case CARTPOLE_MEASUREMENT_UNAVAILABLE:
+        detail = "（未收到所需的新鲜有效测量）";
+        break;
+    case CARTPOLE_POWER_UNAVAILABLE:
+        detail = "（固件未确认供电就绪，检查 20 V 供电）";
+        break;
+    case CARTPOLE_BUSY:
+        detail = "（固件未确认小车停稳；先请求零速、观察停稳，再禁用）";
+        break;
+    case CARTPOLE_FAULT:
+        detail = "（固件处于故障，故障状态保留）";
+        break;
+    case CARTPOLE_CALIBRATION_REFERENCE_ERROR:
+        detail = "（标定参考点无效，先用 calib-status 查看状态，再恢复参考点或重做左右端标定）";
+        break;
+    case CARTPOLE_STORAGE_ERROR:
+        detail = "（固件未确认保存成功）";
+        break;
+    default:
+        break;
+    }
+    fprintf(stderr, "[ERR] %s: %s%s\n", operation, cartpole_result_to_string(result), detail);
     return -1;
 }
 static int query_mode_for_command(cartpole_t *c)
 {
     return console_transaction_result("QUERY", cartpole_query_mode(c, 1.0));
+}
+
+static int enable_checked(cartpole_t *c, double timeout)
+{
+    const double end = cartpole_get_monotonic_time_s(c) + timeout;
+    const uint64_t previous_faults = cartpole_get_session_state(c).received_fault_mode_count;
+    if (console_transaction_result("ENABLE/QUERY", cartpole_query_mode(c, timeout)))
+        return -1;
+    cartpole_session_t session = cartpole_get_session_state(c);
+    if (session.reported_mode == CARTPOLE_MODE_FAULT ||
+        session.received_fault_mode_count != previous_faults)
+        return console_transaction_result("ENABLE", CARTPOLE_FAULT);
+    if (!session.connection_open || session.has_stream_failure_latch)
+        return console_transaction_result("ENABLE", CARTPOLE_SESSION_UNAVAILABLE);
+    if (session.is_mode_received && session.reported_mode == CARTPOLE_MODE_READY &&
+        session.reported_mode_reason == CARTPOLE_REASON_NONE) {
+        puts("[OK] ENABLE：已处于 READY，无需再次使能");
+        return 0;
+    }
+    if (!session.is_mode_received || session.reported_mode != CARTPOLE_MODE_DISABLED ||
+        session.reported_mode_reason != CARTPOLE_REASON_NONE)
+        return console_transaction_result("ENABLE", CARTPOLE_REJECTED);
+    const double remaining = end - cartpole_get_monotonic_time_s(c);
+    if (remaining <= 0)
+        return console_transaction_result("ENABLE/STATE", CARTPOLE_MEASUREMENT_UNAVAILABLE);
+    /* 适配器在每次真正写入前确认模式、双路测量和接收时效。 */
+    const cartpole_result_t result = cartpole_enable(c, remaining);
+    if (console_transaction_result(result == CARTPOLE_MEASUREMENT_UNAVAILABLE
+                                       ? "ENABLE/STATE" : "ENABLE", result))
+        return -1;
+    puts("[OK] ENABLE：固件已确认进入 READY");
+    return 0;
+}
+
+static int mark_endpoint(cartpole_t *c, cartpole_endpoint_t endpoint)
+{
+    int64_t value_um;
+    const char *command = endpoint == CARTPOLE_LEFT ? "MARK LEFT" : "MARK RIGHT";
+    if (console_transaction_result(command, cartpole_mark_endpoint(c, endpoint, &value_um, 1.0)))
+        return -1;
+    printf("[OK] %s = %" PRId64 " um\n", endpoint == CARTPOLE_LEFT ? "MARK_LEFT" : "MARK_RIGHT",
+           value_um);
+    return 0;
 }
 
 int console_exec(cartpole_t *c, const console_req_t *req)
@@ -292,7 +359,7 @@ int console_exec(cartpole_t *c, const console_req_t *req)
         if (wait_enter(c) != 0) {
             return -1;
         }
-        if (console_transaction_result("MARK LEFT", cartpole_mark_endpoint(c, CARTPOLE_LEFT, 1.0)) != 0) {
+        if (mark_endpoint(c, CARTPOLE_LEFT) != 0) {
             return -1;
         }
         printf("[edge] push cart to RIGHT end, then press Enter...");
@@ -300,51 +367,59 @@ int console_exec(cartpole_t *c, const console_req_t *req)
         if (wait_enter(c) != 0) {
             return -1;
         }
-        if (console_transaction_result("MARK RIGHT", cartpole_mark_endpoint(c, CARTPOLE_RIGHT, 1.0)) != 0) {
+        if (mark_endpoint(c, CARTPOLE_RIGHT) != 0) {
             return -1;
         }
-        if (console_transaction_result("ENABLE", cartpole_enable(c, 2.0)) != 0) {
+        if (enable_checked(c, 2.0) != 0) {
             return -1;
         }
         printf("[edge] calibrated & READY; use 'center' to move to mid-track\n");
         return 0;
     }
     case CONSOLE_CMD_MARK_LEFT:
-        return console_transaction_result("MARK LEFT", cartpole_mark_endpoint(c, CARTPOLE_LEFT, 1.0));
+        return mark_endpoint(c, CARTPOLE_LEFT);
     case CONSOLE_CMD_MARK_RIGHT:
-        return console_transaction_result("MARK RIGHT", cartpole_mark_endpoint(c, CARTPOLE_RIGHT, 1.0));
+        return mark_endpoint(c, CARTPOLE_RIGHT);
     case CONSOLE_CMD_CONFIRM_LEFT: {
         int64_t position_um;
         if (console_transaction_result("CONFIRM LEFT", cartpole_confirm_left(c, &position_um, 1.0)))
             return -1;
-        printf("[edge] CONFIRM_LEFT = %" PRId64 " um (still DISABLED)\n", position_um);
+        printf("[OK] CONFIRM_LEFT = %" PRId64 " um（仍处于 DISABLED）\n", position_um);
         return 0;
     }
     case CONSOLE_CMD_CALIB_STATUS: {
         cartpole_calibration_status_t status;
         if (console_transaction_result("CALIB?", cartpole_read_calibration_status(c, &status, 1.0)))
             return -1;
-        printf("[edge] CAL_STATE = %" PRId64 "\n[edge] CAL_LENGTH_UM = %" PRId64
-               "\n[edge] CAL_SAVED = %" PRId64 "\n[edge] CAL_STORAGE = %" PRId64 "\n",
+        printf("[OK] CAL_STATE = %" PRId64 "\n[OK] CAL_LENGTH_UM = %" PRId64
+               "\n[OK] CAL_SAVED = %" PRId64 "\n[OK] CAL_STORAGE = %" PRId64 "\n",
                status.state, status.length_um, status.saved, status.storage);
         return 0;
     }
     case CONSOLE_CMD_CALIBRATE_POLE_DOWN: {
+        puts("请让摆杆自然下垂并松手，保持静止；仅在 DISABLED 下校准。");
+        fflush(stdout);
         cartpole_pole_calibration_t result = {0};
         int rc = console_transaction_result("calibrate-pole-down",
                                            cartpole_calibrate_pole_down(c, &result));
         if (rc != 0) {
-            if (result.write_attempted)
-                fputs("[edge] zero write not confirmed; check dump before retrying\n", stderr);
+            const char *detail = cartpole_pole_calibration_detail_string(result.detail);
+            if (detail)
+                fprintf(stderr, "[ERR] %s\n", detail);
+            if (result.write_confirmed)
+                fputs("[ERR] 新零点已写入并读回，但下垂角验证未通过；未自动回滚。\n", stderr);
+            else if (result.write_attempted)
+                fputs("[ERR] 零点写入未确认；先用 dump 核对，不要直接重试。\n", stderr);
             return rc;
         }
-        printf("[edge] POLE_ZERO_URAD: %" PRId64 " -> %" PRId64
-               " (read back); POLE_INV = %d unchanged\n",
+        printf("[OK] POLE_ZERO_URAD: %" PRId64 " -> %" PRId64
+               "（已读回）；POLE_INV = %d 不变\n",
                result.old_zero_urad, result.new_zero_urad, result.pole_inverted);
+        printf("[OK] 下垂角验收通过：%.3f rad\n", result.verified_down_angle_rad);
         return 0;
     }
     case CONSOLE_CMD_ENABLE:
-        return console_transaction_result("ENABLE", cartpole_enable(c, req->timeout_s));
+        return enable_checked(c, req->timeout_s);
     case CONSOLE_CMD_DISABLE:
         return console_transaction_result("DISABLE", cartpole_disable(c, 1.0));
     case CONSOLE_CMD_CENTER:
@@ -356,36 +431,46 @@ int console_exec(cartpole_t *c, const console_req_t *req)
     case CONSOLE_CMD_STATE:
         console_print_state(c);
         return 0;
-    case CONSOLE_CMD_QUERY: {
-        if (console_transaction_result("QUERY", cartpole_query_mode(c, 1.0)) != 0) {
-            return -1;
-        }
-        cartpole_reason_t reason = cartpole_get_session_state(c).reported_mode_reason;
-        cartpole_mode_t m = cartpole_get_session_state(c).reported_mode;
-        printf("MODE %s %s\n", cartpole_mode_to_string(m), cartpole_reason_to_string(reason));
-        return 0;
-    }
+    case CONSOLE_CMD_QUERY:
+        return query_mode_for_command(c); /* 统一的会话事件负责输出 MODE。 */
     case CONSOLE_CMD_CONFIG: {
         if (req->dump) {
             cartpole_settings_t settings;
-            if (console_transaction_result("CONFIG?",
-                                           cartpole_read_settings(c, &settings, DUMP_WINDOW_S)) != 0)
-                return -1;
+            uint32_t received_mask;
+            cartpole_result_t result =
+                cartpole_read_settings_observed(c, &settings, &received_mask, DUMP_WINDOW_S);
+            if (result != CARTPOLE_OK) {
+                if (result == CARTPOLE_TIMEOUT) {
+                    fputs("[ERR] CONFIG?: TIMEOUT（缺少回执字段：", stderr);
+                    int shown = 0;
+                    for (int i = 0; i < CARTPOLE_SETTING_COUNT; i++) {
+                        if (!(received_mask & (UINT32_C(1) << i))) {
+                            fprintf(stderr, "%s%s", shown++ ? "、" : "",
+                                    cartpole_setting_to_string(i));
+                        }
+                    }
+                    if (!shown)
+                        fputs("无，收到完整回执时已超出期限", stderr);
+                    fputs("）\n", stderr);
+                    return -1;
+                }
+                return console_transaction_result("CONFIG?", result);
+            }
             for (int i = 0; i < CARTPOLE_SETTING_COUNT; i++)
-                printf("[edge] %s = %" PRId64 "\n", cartpole_setting_to_string(i), settings.values[i]);
+                printf("[OK] %s = %" PRId64 "\n", cartpole_setting_to_string(i), settings.values[i]);
             return 0;
         }
         char operation[32];
         snprintf(operation, sizeof operation, "CONFIG %s", req->name);
         cartpole_setting_t setting;
         if (cartpole_parse_setting(req->name, &setting) != 0) {
-            fprintf(stderr, "[edge] unsupported setting %s\n", req->name);
+            fprintf(stderr, "[ERR] CONFIG：不支持字段 %s\n", req->name);
             return -1;
         }
         int rc =
             console_transaction_result(operation, cartpole_configure(c, setting, req->value, 1.0));
         if (rc == 0)
-            printf("[edge] %s = %ld\n", cartpole_setting_to_string(setting), req->value);
+            printf("[OK] %s = %ld\n", cartpole_setting_to_string(setting), req->value);
         return rc;
     }
     case CONSOLE_CMD_RESET: {
@@ -396,11 +481,11 @@ int console_exec(cartpole_t *c, const console_req_t *req)
         known = snapshot.is_mode_received;
         cartpole_mode_t m = snapshot.reported_mode;
         if (known && m == CARTPOLE_MODE_DISABLED) {
-            printf("[edge] already DISABLED\n");
+            puts("[OK] RESET：已处于 DISABLED，无需复位");
             return 0;
         }
         if (m != CARTPOLE_MODE_FAULT) {
-            fprintf(stderr, "[edge] RESET only clears FAULT (current %s)\n", cartpole_mode_to_string(m));
+            fprintf(stderr, "[ERR] RESET：仅可清除 FAULT（当前 %s）\n", cartpole_mode_to_string(m));
             return -1;
         }
         if (console_transaction_result("RESET", cartpole_reset(c, 2.0)) != 0)

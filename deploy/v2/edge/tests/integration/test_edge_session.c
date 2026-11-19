@@ -34,6 +34,8 @@ static double largest_sleep, velocity_write_delay;
 static int config_queries, calib_queries;
 static int try_result, try_calls, framing_newlines, cancel_once, enable_writes;
 static int cancel_transport, metadata_missing;
+static const char *enable_pressure_input;
+static double enable_pressure_delay;
 static double clock_s = 1., write_delay, read_delay;
 static double fake_now(void *context)
 {
@@ -80,6 +82,15 @@ static int write_command(fake_uart_t *u, const uint8_t *data, size_t n)
     (void)data;
     (void)n;
     try_calls++;
+    if (n == 7 && !memcmp(data, "ENABLE\n", 7) &&
+        (enable_pressure_input || enable_pressure_delay > 0.)) {
+        if (enable_pressure_input)
+            fake_uart_queue(u, enable_pressure_input);
+        clock_s += enable_pressure_delay;
+        enable_pressure_input = NULL;
+        enable_pressure_delay = 0.;
+        return 1; /* UART accepted zero bytes. */
+    }
     if (cancel_transport) {
         cartpole_request_stop(device);
         return -1;
@@ -161,6 +172,50 @@ static void open_ready(void)
     queue("STATE 3 1 2 3 4\n");
     assert(receive() == 0);
 }
+static void open_disabled(void)
+{
+    assert(open_test() == 0);
+    query_reply = "MODE DISABLED NONE\n";
+    assert(cartpole_query_mode(device, .02) == CARTPOLE_OK);
+    queue("STATE 3 1 2 0 0\n");
+    assert(receive() == CARTPOLE_RECEIVE_EMPTY);
+}
+
+static void test_enable_rechecks_at_uart_boundary(void)
+{
+    int count = enable_writes;
+    open_disabled();
+    queue("MODE FAULT MT6835\nMODE DISABLED NONE\n");
+    assert(cartpole_enable(device, .05) == CARTPOLE_FAULT);
+    assert(enable_writes == count);
+
+    open_disabled();
+    queue("MODE READY NONE\nMODE DISABLED NONE\n");
+    assert(cartpole_enable(device, .05) == CARTPOLE_REJECTED);
+    assert(enable_writes == count);
+
+    open_disabled();
+    queue("STATE 1 1 0 0 0\nSTATE 3 1 2 0 0\n");
+    assert(cartpole_enable(device, .05) == CARTPOLE_MEASUREMENT_UNAVAILABLE);
+    assert(enable_writes == count);
+
+    open_disabled();
+    enable_pressure_input = "STATE 1 1 0 0 0\n";
+    assert(cartpole_enable(device, .05) == CARTPOLE_MEASUREMENT_UNAVAILABLE);
+    assert(enable_writes == count);
+
+    open_disabled();
+    enable_pressure_delay = .12;
+    assert(cartpole_enable(device, .2) == CARTPOLE_MEASUREMENT_UNAVAILABLE);
+    assert(enable_writes == count);
+
+    open_disabled();
+    enable_pressure_input = "STATE 3 1 2 0 0\n";
+    enable_reply = "MODE READY NONE\n";
+    assert(cartpole_enable(device, .05) == CARTPOLE_OK);
+    assert(enable_writes == count + 1);
+}
+
 static unsigned measurement_flags(void)
 {
     cartpole_measurement_t m = cartpole_get_latest_measurement(device);
@@ -327,6 +382,7 @@ static void test_business_controller(void)
 
 int main(void)
 {
+    test_enable_rechecks_at_uart_boundary();
     open_ready();
     query_reply = "MODE FAULT MT6835\n";
     assert(cartpole_query_mode(device, .02) == CARTPOLE_OK);
@@ -348,7 +404,7 @@ int main(void)
     assert(cartpole_calculate_measurement_age_s(device, cartpole_get_latest_measurement(device)) < 0);
     assert(measurement_flags() == 0);
     /* 事务预算不能在drain/send后重置；过期也不得接受已排队回执。 */
-    open_ready();
+    open_disabled();
     enable_reply = "MODE READY NONE\n";
     write_delay = .01;
     double started = cartpole_get_monotonic_time_s(device);
@@ -359,11 +415,14 @@ int main(void)
     open_ready();
     query_reply = NULL;
     assert(cartpole_query_mode(device, .003) == CARTPOLE_TIMEOUT);
-    /* ENABLE按新MODE而非OK确认，不能复用已有READY。 */
+    /* ENABLE按新MODE而非OK确认，已有READY必须在上层作为只读成功处理。 */
     open_ready();
+    assert(cartpole_enable(device, .003) == CARTPOLE_REJECTED);
+    open_disabled();
     assert(cartpole_enable(device, .003) == CARTPOLE_TIMEOUT);
     enable_reply = "MODE READY NONE\n";
     assert(cartpole_enable(device, .02) == 0);
+    open_disabled();
     enable_reply = "ERR ENABLE\nMODE READY NONE\n";
     assert(cartpole_enable(device, .02) == CARTPOLE_REJECTED);
     /* 无效小车不能变成零值有效测量。 */
@@ -499,20 +558,24 @@ int main(void)
     assert(!cartpole_get_configuration(device).complete);
     open_ready();
     queue("OK MARK_LEFT -42\n");
-    assert(cartpole_mark_endpoint(device, CARTPOLE_LEFT, .003) ==
+    int64_t mark_value = 987;
+    assert(cartpole_mark_endpoint(device, CARTPOLE_LEFT, &mark_value, .003) ==
            CARTPOLE_TIMEOUT); /* stale response discarded */
     mark_reply = "OK MARK_RIGHT 84\n";
-    assert(cartpole_mark_endpoint(device, CARTPOLE_LEFT, .003) ==
+    assert(cartpole_mark_endpoint(device, CARTPOLE_LEFT, &mark_value, .003) ==
            CARTPOLE_TIMEOUT); /* request correlation */
     mark_reply = "OK MARK_LEFT -42\n";
-    assert(cartpole_mark_endpoint(device, CARTPOLE_LEFT, .02) == 0);
-    assert(cartpole_mark_endpoint(device, (cartpole_endpoint_t)99, .02) == CARTPOLE_INVALID_ARGUMENT);
+    assert(mark_value == 987);
+    assert(cartpole_mark_endpoint(device, CARTPOLE_LEFT, &mark_value, .02) == CARTPOLE_OK);
+    assert(mark_value == -42);
+    assert(cartpole_mark_endpoint(device, (cartpole_endpoint_t)99, &mark_value, .02) ==
+           CARTPOLE_INVALID_ARGUMENT);
     reset_reply = "MODE DISABLED NONE\n";
     assert(cartpole_reset(device, .02) == 0);
     assert(cartpole_get_session_state(device).reported_mode == CARTPOLE_MODE_DISABLED);
     reset_reply = "ERR RESET\nMODE DISABLED NONE\n";
     assert(cartpole_reset(device, .02) == CARTPOLE_REJECTED);
-    open_ready();
+    open_disabled();
     int before_enable = enable_writes;
     cancel_once = 1;
     assert(cartpole_enable(device, .02) == CARTPOLE_CANCELLED);
@@ -532,7 +595,7 @@ int main(void)
     open_ready();
     queue("STATE invalid\n");
     assert(cartpole_wait_for_measurement(device, .02) == CARTPOLE_PROTOCOL_ERROR);
-    open_ready();
+    open_disabled();
     enable_reply = "MODE FAULT MT6835\nMODE READY NONE\n";
     assert(cartpole_enable(device, .02) == CARTPOLE_FAULT);
     open_ready();
@@ -542,6 +605,7 @@ int main(void)
     metadata_missing = 1;
     assert(cartpole_refresh_configuration(device, .003) == CARTPOLE_TIMEOUT);
     metadata_missing = 0;
+    open_disabled();
     cancel_transport = 1;
     assert(cartpole_enable(device, .02) == CARTPOLE_TRANSPORT_ERROR);
     cancel_transport = 0;

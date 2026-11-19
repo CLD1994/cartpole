@@ -12,7 +12,7 @@ import tempfile
 import unittest
 
 EDGE = Path(__file__).resolve().parents[2]
-MODULES = ('cartpole.c', 'cartpole_controller.c', 'cartpole_schedule.c', 'cartpole_motion.c', 'console.c')
+MODULES = ('cartpole.c', 'cartpole_controller.c', 'cartpole_schedule.c', 'cartpole_motion.c', 'cartpole_travel.c', 'cartpole_pole_calibration.c', 'console.c')
 
 
 class BusinessDependencies(unittest.TestCase):

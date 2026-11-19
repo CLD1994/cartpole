@@ -55,6 +55,39 @@ static void expect_request(fake_uart_t *port, const char *wire_request, const ch
     port->write = firmware_reply;
 }
 
+static int congested_config_write(fake_uart_t *port, const uint8_t *bytes, size_t size)
+{
+    const char command[] = "CONFIG POLE_ZERO_URAD 17\n";
+    assert(size == sizeof(command) - 1 && memcmp(bytes, command, size) == 0);
+    ++request_count;
+    fake_uart_queue(port, "STATE 1 123 0 0 0\n");
+    return 1; /* 输出拥塞，此次没有写入任何字节。 */
+}
+
+static cartpole_result_t configure_gate(cartpole_configure_stage_t stage, void *context)
+{
+    cartpole_device_t *d = context;
+    assert(stage == CARTPOLE_CONFIGURE_CHECK);
+    return d->ops->get_latest_measurement(d->context).pole_valid ? CARTPOLE_OK
+                                                               : CARTPOLE_MEASUREMENT_UNAVAILABLE;
+}
+
+static void test_configure_rechecks_telemetry_after_backpressure(const cartpole_clock_t *clock)
+{
+    fake_uart_reset();
+    serial_cartpole_t *s = serial_cartpole_open("guarded-configure", 460800, clock);
+    assert(s);
+    fake_uart_t *p = fake_uart_port(0);
+    cartpole_device_t d = serial_cartpole_get_device(s);
+    request_count = 0;
+    p->write = congested_config_write;
+    fake_uart_queue(p, "STATE 3 123 0 0 0\n");
+    assert(d.ops->configure(d.context, CARTPOLE_SETTING_POLE_ZERO, 17, .1,
+                            configure_gate, &d) == CARTPOLE_MEASUREMENT_UNAVAILABLE);
+    assert(request_count == 1); /* 第一次未写入，第二次收到失效帧后拒绝写入。 */
+    serial_cartpole_close(s);
+}
+
 static void test_maintenance_wire_contracts(const cartpole_clock_t *clock)
 {
     fake_uart_reset();
@@ -81,7 +114,8 @@ static void test_maintenance_wire_contracts(const cartpole_clock_t *clock)
     expect_request(p, "DISABLE\n", "MODE FAULT POWER\n");
     assert(d.ops->disable(d.context, .1) == CARTPOLE_FAULT && request_count == 1);
     assert(d.ops->get_session_state(d.context).reported_mode_reason == CARTPOLE_REASON_POWER);
-    fake_uart_queue(p, "MODE DISABLED NONE\n");
+    fake_uart_queue(p, "MODE DISABLED NONE\nSTATE 3 0 0 0 0\n");
+    assert(d.ops->receive(d.context) == CARTPOLE_RECEIVE_EMPTY);
     expect_request(p, "ENABLE\n", "ERR POWER\n");
     assert(d.ops->enable(d.context, .1) == CARTPOLE_POWER_UNAVAILABLE && request_count == 1);
     /* A previous DISABLED response cannot stand in for the current request. */
@@ -98,6 +132,17 @@ static void test_maintenance_wire_contracts(const cartpole_clock_t *clock)
     assert(d.ops->read_calibration_status(d.context, &status, .1) == CARTPOLE_TIMEOUT);
     assert(status.state == 3 && status.length_um == 894845 &&
            status.saved == 1 && status.storage == 7 && request_count == 1);
+
+    /* 摆杆标定只需要这两个设置；新查询不能沿用上一批参数。 */
+    cartpole_pole_settings_t pole_settings = {0};
+    expect_request(p, "CONFIG?\n", "OK POLE_ZERO_URAD -32100\nOK POLE_INV 1\n");
+    assert(d.ops->read_pole_settings(d.context, &pole_settings, .1) == CARTPOLE_OK);
+    assert(pole_settings.zero_urad == -32100 && pole_settings.inverted == 1 &&
+           request_count == 1);
+    expect_request(p, "CONFIG?\n", "OK POLE_ZERO_URAD 13500\n");
+    assert(d.ops->read_pole_settings(d.context, &pole_settings, .1) == CARTPOLE_TIMEOUT);
+    assert(pole_settings.zero_urad == -32100 && pole_settings.inverted == 1 &&
+           request_count == 1);
     serial_cartpole_close(s);
 }
 
@@ -153,5 +198,6 @@ int main(void)
     serial_cartpole_close(a);
     serial_cartpole_close(b);
     test_maintenance_wire_contracts(&clock);
+    test_configure_rechecks_telemetry_after_backpressure(&clock);
     puts("serial_cartpole: ok");
 }

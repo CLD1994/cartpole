@@ -48,7 +48,10 @@ int uart_open(uart_t *u, const char *device, int baud)
         close(fd);
         return -1;
     }
-    cfmakeraw(&tio); /* 原始模式：无行编辑、无信号、无软件流控 */
+    cfmakeraw(&tio); /* 原始模式：无行编辑、无信号。 */
+    /* 不继承前一个进程留下的两位停止位或接收侧软件流控。 */
+    tio.c_iflag &= ~(IXON | IXOFF | IXANY);
+    tio.c_cflag &= ~CSTOPB;
     tio.c_cflag |= CLOCAL | CREAD;
 #ifdef CRTSCTS
     tio.c_cflag &= ~(unsigned)CRTSCTS; /* 硬件流控关闭 */

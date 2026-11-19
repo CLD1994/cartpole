@@ -2,6 +2,7 @@
 /* CV610 应用层：组织模型、用户命令与输出；设备循环由 cartpole 会话负责。 */
 #include "cartpole.h"
 #include "cartpole_control.h"
+#include "cartpole_travel.h"
 #include "cartpole_device.h"
 #include "config.h"
 #include "console.h"
@@ -32,7 +33,7 @@ static void print_event(const cartpole_event_t *event, void *context)
     if (event->kind == CARTPOLE_EVENT_SESSION) {
         const cartpole_session_t *s = &event->data.session;
         if (s->is_mode_received)
-            printf("[edge] MODE %s %s\n", cartpole_mode_to_string(s->reported_mode),
+            printf("[MODE] %s %s\n", cartpole_mode_to_string(s->reported_mode),
                    cartpole_reason_to_string(s->reported_mode_reason));
     } else if (event->kind == CARTPOLE_EVENT_STEP_LOSS) {
         printf("[edge] STEP_LOSS event=%" PRId64 " run=%" PRId64 " device_us=%" PRId64 "\n",
@@ -40,6 +41,23 @@ static void print_event(const cartpole_event_t *event, void *context)
                event->data.step_loss.device_time_us);
     }
 }
+typedef struct {
+    int mode_seen, loss_seen;
+    cartpole_event_t mode, first_loss;
+} deferred_motion_events_t;
+
+static void defer_motion_event(const cartpole_event_t *event, void *context)
+{
+    deferred_motion_events_t *pending = context;
+    if (event->kind == CARTPOLE_EVENT_SESSION && event->data.session.is_mode_received) {
+        pending->mode_seen = 1;
+        pending->mode = *event;
+    } else if (event->kind == CARTPOLE_EVENT_STEP_LOSS && !pending->loss_seen) {
+        pending->loss_seen = 1;
+        pending->first_loss = *event;
+    }
+}
+
 static int infer_model(const cartpole_measurement_t *m, float *action, void *context)
 {
     const edge_package *p = context;
@@ -130,66 +148,84 @@ static int run_console(cartpole_t *c)
     g_motion_session = 1;
     return console_run(c);
 }
-static int oneshot_state(cartpole_t *c)
-{
-    if (console_transaction_result("STATE", cartpole_wait_for_measurement(c, 1.0)))
-        return 1;
-    console_print_state(c);
-    return 0;
-}
 typedef struct {
-    cartpole_t *cartpole;
+    double duration_s, elapsed_s;
     double xmin, xmax, tmin, tmax;
+    uint64_t total, valid;
     int cart, pole;
 } state_window;
-static int sample_window(double elapsed, cartpole_tick_action_t *action, void *context)
+
+static void collect_state_event(const cartpole_event_t *event, void *context)
 {
-    (void)elapsed;
-    action->kind = CARTPOLE_TICK_OBSERVE;
+    if (event->kind != CARTPOLE_EVENT_MEASUREMENT)
+        return;
     state_window *w = context;
-    cartpole_t *c = w->cartpole;
-    cartpole_measurement_t m = cartpole_get_latest_measurement(c);
+    const cartpole_measurement_t m = event->data.measurement;
+    w->total++;
+    if (m.cart_valid && m.pole_valid)
+        w->valid++;
     if (m.cart_valid) {
-        if (!w->cart || m.cart_position_m < w->xmin)
-            w->xmin = m.cart_position_m;
-        if (!w->cart || m.cart_position_m > w->xmax)
-            w->xmax = m.cart_position_m;
+        w->xmin = w->cart ? fmin(w->xmin, m.cart_position_m) : m.cart_position_m;
+        w->xmax = w->cart ? fmax(w->xmax, m.cart_position_m) : m.cart_position_m;
         w->cart = 1;
     }
     if (m.pole_valid) {
-        if (!w->pole || m.pole_angle_rad < w->tmin)
-            w->tmin = m.pole_angle_rad;
-        if (!w->pole || m.pole_angle_rad > w->tmax)
-            w->tmax = m.pole_angle_rad;
+        w->tmin = w->pole ? fmin(w->tmin, m.pole_angle_rad) : m.pole_angle_rad;
+        w->tmax = w->pole ? fmax(w->tmax, m.pole_angle_rad) : m.pole_angle_rad;
         w->pole = 1;
     }
-    return 0;
 }
-static int oneshot_state_window(cartpole_t *c, serial_cartpole_t *serial, double secs)
+
+static cartpole_result_t read_state_window(cartpole_t *c, void *context)
+{
+    state_window *w = context;
+    double start = cartpole_get_monotonic_time_s(c), end = start + w->duration_s;
+    for (;;) {
+        double now = cartpole_get_monotonic_time_s(c);
+        w->elapsed_s = now - start;
+        if (cartpole_is_stop_requested(c))
+            return CARTPOLE_CANCELLED;
+        if (now >= end)
+            return CARTPOLE_OK;
+        if (cartpole_receive(c) == CARTPOLE_RECEIVE_ERROR)
+            return cartpole_get_stream_result(c);
+        cartpole_result_t sleep = cartpole_sleep_until(c, fmin(end, now + .001));
+        if (sleep != CARTPOLE_OK)
+            return sleep;
+    }
+}
+
+static int oneshot_state_window(cartpole_t *c, serial_cartpole_t *serial, double secs, double expected)
 {
     if (console_transaction_result("STATE", cartpole_wait_for_measurement(c, 1.0)))
         return 1;
-    serial_cartpole_statistics_t before = serial_cartpole_get_statistics(serial);
-    state_window w = {.cartpole = c};
-    double start = cartpole_get_monotonic_time_s(c);
-    cartpole_result_t result = cartpole_run_loop(c, .020, secs, sample_window, &w);
-    double dt = cartpole_get_monotonic_time_s(c) - start;
-    serial_cartpole_statistics_t after = serial_cartpole_get_statistics(serial);
-    uint64_t count = after.received_measurements - before.received_measurements;
-    uint64_t unknown = after.unknown_received_lines - before.unknown_received_lines;
-    printf("[edge] window %.1f s: %" PRIu64 " STATE lines -> %.1f Hz (observed)\n", dt, count,
-           dt > 0 ? count / dt : 0);
-    printf("[edge] unknown lines: %" PRIu64 " (require 0)\n", unknown);
+    uint64_t before = serial_cartpole_get_statistics(serial).unknown_received_lines;
+    state_window w = {.duration_s = secs};
+    cartpole_result_t result = cartpole_execute_operation(c, read_state_window, collect_state_event, &w);
+    uint64_t unknown = serial_cartpole_get_statistics(serial).unknown_received_lines - before;
+    double hz = w.elapsed_s > 0 ? w.valid / w.elapsed_s : 0;
+    int rate_ok = !expected || fabs(hz - expected) <= 1.0;
+    printf("时长 %.1f s，有效 STATE %" PRIu64 " 行 → %.1f Hz（接收总数 %" PRIu64 " 行）\n",
+           w.elapsed_s, w.valid, hz, w.total);
+    printf("UNKNOWN 行：%" PRIu64 "（要求 0）\n", unknown);
     if (w.cart)
-        printf("[edge] sampled x range [%.0f, %.0f] um\n", w.xmin * 1e6, w.xmax * 1e6);
+        printf("x_um ∈ [%.0f, %.0f]（漂移 %.0f µm；x ≈ %.2f mm）\n",
+               w.xmin * 1e6, w.xmax * 1e6, (w.xmax - w.xmin) * 1e6, (w.xmin + w.xmax) * 500);
     else
-        puts("[edge] cart samples unavailable");
+        puts("小车测量不可用");
     if (w.pole)
-        printf("[edge] sampled theta range [%.0f, %.0f] urad\n", w.tmin * 1e6, w.tmax * 1e6);
+        printf("theta_urad ∈ [%.0f, %.0f]（θ ∈ [%.2f°, %.2f°]）\n",
+               w.tmin * 1e6, w.tmax * 1e6, w.tmin * (180.0 / 3.14159265358979323846),
+               w.tmax * (180.0 / 3.14159265358979323846));
     else
-        puts("[edge] pole samples unavailable");
-    return result == CARTPOLE_OK && count > 0 && unknown == 0 ? 0 : 1;
+        puts("摆杆测量不可用");
+    if (expected)
+        printf("目标 %.9g Hz（容差 ±1 Hz）：%s\n", expected, rate_ok ? "通过" : "未通过");
+    else
+        puts("未指定目标频率，仅检查收到有效 STATE 且 UNKNOWN 为 0；不证明期间没有无效帧。");
+    return !console_transaction_result("STATE", result) && w.valid > 0 && unknown == 0 && rate_ok ? 0 : 1;
 }
+
 static int watchdog_tick(double elapsed, cartpole_tick_action_t *action, void *context)
 {
     (void)context;
@@ -213,10 +249,13 @@ static int oneshot_wdt_test(cartpole_t *c)
     if (console_transaction_result("QUERY", cartpole_query_mode(c, 1.0)))
         return 1;
     s = cartpole_get_session_state(c);
-    return s.is_mode_received && s.reported_mode == CARTPOLE_MODE_READY &&
-                   s.reported_mode_reason == CARTPOLE_REASON_NONE
-               ? 0
-               : 1;
+    const int ready = s.is_mode_received && s.reported_mode == CARTPOLE_MODE_READY &&
+                      s.reported_mode_reason == CARTPOLE_REASON_NONE;
+    if (ready)
+        puts("[OK] 停止发送 VEL 后固件仍为 READY；随后执行端侧停机确认。");
+    else
+        fputs("[ERR] 停止发送 VEL 后未观察到 READY NONE。\n", stderr);
+    return ready ? 0 : 1;
 }
 static int oneshot_vel(cartpole_t *c, double velocity, double hold)
 {
@@ -283,11 +322,8 @@ static void print_usage(const char *prog)
             "  disable                          disable only when the firmware is stopped\n"
             "  center                           one-shot: move cart to track "
             "center (needs READY)\n"
-            "  vel <mm/s> [--hold s]            one-shot: hold velocity for s "
-            "seconds (default 1.0)\n"
-            "  state [--secs s]                one-shot: STATE snapshot, or "
-            "s-second window stats"
-            " (rate/unknown/ranges)\n"
+            "  vel <mm/s> [--hold s | --plan]   按行程制动；--hold 定时，--plan 只读\n"
+            "  state [--secs s] [--expected-hz Hz]  观测有效 STATE（默认 10 秒）\n"
             "  query                            one-shot: print firmware mode\n"
             "  dump                             one-shot: read all firmware settings\n"
             "  config [NAME VALUE]              one-shot: set one param, or dump "
@@ -344,17 +380,25 @@ static int dispatch(cartpole_t *c, serial_cartpole_t *serial, const char *cmd, i
         return console_exec(c, &req) == 0 ? 0 : 1;
     }
     if (strcmp(cmd, "state") == 0) {
-        double secs = 0.0;
-        if (nargs == 2 && strcmp(argv[first], "--secs") == 0) {
-            if (parse_duration(argv[first + 1], &secs) != 0 || secs <= 0.0) {
+        double secs = 10.0, expected = 0.0;
+        int have_secs = 0;
+        for (int i = first; i + 1 < argc; i += 2) {
+            if (!have_secs && strcmp(argv[i], "--secs") == 0 &&
+                parse_duration(argv[i + 1], &secs) == 0 && secs > 0) {
+                have_secs = 1;
+            } else if (!expected && strcmp(argv[i], "--expected-hz") == 0 &&
+                       parse_duration(argv[i + 1], &expected) == 0 && expected > 0) {
+                continue;
+            } else {
                 print_usage(prog);
                 return 1;
             }
-        } else if (nargs != 0) {
+        }
+        if (nargs % 2 != 0) {
             print_usage(prog);
             return 1;
         }
-        return secs > 0.0 ? oneshot_state_window(c, serial, secs) : oneshot_state(c);
+        return oneshot_state_window(c, serial, secs, expected);
     }
     if (strcmp(cmd, "wdt-test") == 0) {
         if (nargs != 0) {
@@ -364,22 +408,89 @@ static int dispatch(cartpole_t *c, serial_cartpole_t *serial, const char *cmd, i
         return oneshot_wdt_test(c);
     }
     if (strcmp(cmd, "vel") == 0) {
-        double hold = 1.0;
-        if (nargs == 3 && strcmp(argv[first + 1], "--hold") == 0) {
-            if (parse_duration(argv[first + 2], &hold) != 0) {
-                print_usage(prog);
-                return 1;
+        cartpole_travel_options_t opts = {.reserve_mm = 20, .inflight_ms = 10,
+                                         .start_tolerance_mm = .5, .max_seconds = 30};
+        const char *speed = NULL;
+        double hold = 0;
+        unsigned seen = 0;
+        for (int i = first; i < argc; ++i) {
+            const char *arg = argv[i];
+            if (!strcmp(arg, "--plan")) {
+                if (opts.plan_only)
+                    goto invalid_vel;
+                opts.plan_only = 1;
+                continue;
             }
-        } else if (nargs != 1) {
-            print_usage(prog);
-            return 1;
+            static const char *const names[] = {
+                "--hold", "--reserve-mm", "--inflight-ms", "--start-tolerance-mm", "--max-seconds"
+            };
+            double *values[] = {&hold, &opts.reserve_mm, &opts.inflight_ms,
+                                &opts.start_tolerance_mm, &opts.max_seconds};
+            size_t k = 0;
+            for (; k < sizeof names / sizeof names[0]; ++k)
+                if (!strcmp(arg, names[k]))
+                    break;
+            if (k < sizeof names / sizeof names[0]) {
+                if (seen & (1u << k) || ++i >= argc || parse_duration(argv[i], values[k]))
+                    goto invalid_vel;
+                seen |= 1u << k;
+            } else if (!speed) {
+                speed = arg;
+            } else {
+                goto invalid_vel;
+            }
         }
         console_req_t req;
-        if (parse_argv_as_console("vel", argv[first], NULL, &req) != 0) {
-            print_usage(prog);
-            return 1;
+        if (!speed || parse_argv_as_console("vel", speed, NULL, &req) != 0)
+            goto invalid_vel;
+        if (seen & 1) {
+            if (opts.plan_only || seen != 1 || hold <= 0)
+                goto invalid_vel;
+            return oneshot_vel(c, req.vel_mm_s, hold);
         }
-        return oneshot_vel(c, req.vel_mm_s, hold);
+        if (req.vel_mm_s == 0 || opts.start_tolerance_mm > 1.0 || opts.max_seconds <= 0)
+            goto invalid_vel;
+        cartpole_travel_report_t report = {0};
+        deferred_motion_events_t events = {0};
+        if (cartpole_subscribe(c, defer_motion_event, &events) != CARTPOLE_OK)
+            return 1;
+        cartpole_result_t result = cartpole_travel_velocity(c, req.vel_mm_s, &opts, &report);
+        int fallback = report.motion_attempted && !report.stop_confirmed && !opts.plan_only;
+        cartpole_stop_result_t stop_result = fallback ? cartpole_stop_and_confirm(c, 2.0)
+                                                     : CARTPOLE_STOP_UNCONFIRMED;
+        (void)cartpole_subscribe(c, print_event, NULL);
+        /* 串口收尾前不做可能被终端/日志管道阻塞的输出。 */
+        if (events.mode_seen)
+            print_event(&events.mode, NULL);
+        if (events.loss_seen)
+            print_event(&events.first_loss, NULL);
+        if (report.plan_valid)
+            printf("物理端 ±%.3f mm；软件端 ±%.3f mm；目标 %.3f mm；"
+                   "正常提前制动预算 %.3f mm；异常断链条件预算 %.3f mm\n",
+                   report.physical_mm, report.soft_mm, report.target_mm,
+                   report.braking_budget_mm, report.watchdog_budget_mm);
+        if (report.zero_requested && isfinite(report.zero_position_mm))
+            printf("零速请求位置：%.3f mm\n", report.zero_position_mm);
+        if (report.has_final_position)
+            printf("最终收到位置：%.3f mm；距目标：%.3f mm\n",
+                   report.final_position_mm, report.target_mm - report.final_position_mm);
+        if (report.observed_target_95)
+            printf("达到同向目标速度的 95%%：%.1f ms（主机接收估计）\n", report.target_95_s * 1000);
+        else if (report.observed_peak)
+            printf("未观测到目标速度的 95%%；同向峰值 %.0f mm/s，耗时 %.1f ms（主机接收估计）\n",
+                   report.peak_velocity_mm_s, report.peak_at_s * 1000);
+        if (report.stop_confirmed)
+            puts("收到停稳证据");
+        if (fallback) {
+            if (stop_result == CARTPOLE_STOP_DISABLED)
+                puts("行程停稳未确认；收尾已确认 DISABLED");
+            else
+                fputs("[ERR] 停稳及禁用未确认；需现场确认停止。\n", stderr);
+        }
+        return console_transaction_result(opts.plan_only ? "VEL --plan" : "VEL", result) ? 1 : 0;
+invalid_vel:
+        print_usage(prog);
+        return 1;
     }
     if (strcmp(cmd, "dump") == 0) {
         console_req_t req;
