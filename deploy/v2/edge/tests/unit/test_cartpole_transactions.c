@@ -13,7 +13,7 @@ static void test_delegation_and_invalid_timeouts(void)
 {
     fake_device d;
     cartpole_device_t device = fake_device_prepare(&d);
-    cartpole_t *c = cartpole_create(device, &d.clock);
+    cartpole_t *c = cartpole_create(device);
     assert(c);
     const cartpole_result_t outcomes[] = {CARTPOLE_OK, CARTPOLE_TIMEOUT, CARTPOLE_FAULT,
                                          CARTPOLE_TRANSPORT_ERROR, CARTPOLE_REJECTED};
@@ -74,7 +74,7 @@ static void test_event_subscription_and_callback_contract(void)
 {
     fake_device d;
     cartpole_device_t device = fake_device_prepare(&d);
-    cartpole_t *c = cartpole_create(device, &d.clock);
+    cartpole_t *c = cartpole_create(device);
     subscriber first = {c, 0, CARTPOLE_OK}, second = {c, 0, CARTPOLE_OK};
     assert(cartpole_subscribe(c, forbidden_mutation, &first) == CARTPOLE_OK);
     fake_device_emit(&d, CARTPOLE_EVENT_MEASUREMENT);
@@ -92,17 +92,17 @@ static void test_event_subscription_and_callback_contract(void)
     fake_device_emit(&d, CARTPOLE_EVENT_SESSION);
     assert(second.calls == 1 && d.detaches == 1);
 }
-static void test_failed_attach_allows_same_clock_retry(void)
+static void test_failed_attach_allows_retry(void)
 {
     fake_device d;
     cartpole_device_t device = fake_device_prepare(&d);
     d.attach_result = CARTPOLE_REJECTED;
-    assert(!cartpole_create(device, &d.clock));
+    assert(!cartpole_create(device));
     assert(d.attaches == 1 && d.detaches == 0 && !d.observer);
     d.attach_result = CARTPOLE_OK;
-    cartpole_t *c = cartpole_create(device, &d.clock);
+    cartpole_t *c = cartpole_create(device);
     assert(c && d.attaches == 2);
-    assert(!cartpole_create(device, &d.clock) && d.attaches == 3);
+    assert(!cartpole_create(device) && d.attaches == 3);
     cartpole_destroy(c);
     assert(d.detaches == 1 && !d.observer);
 }
@@ -136,7 +136,7 @@ static void test_operation_scope_and_readonly_evaluation(void)
 {
     fake_device d;
     cartpole_device_t device = fake_device_prepare(&d);
-    cartpole_t *c = cartpole_create(device, &d.clock);
+    cartpole_t *c = cartpole_create(device);
     operation_context context = { .device = &d, .session = c };
     assert(cartpole_subscribe(c, display_observer, &context) == CARTPOLE_OK);
     assert(cartpole_execute_operation(c, emit_operation, operation_observer, &context) == CARTPOLE_TIMEOUT);
@@ -164,7 +164,7 @@ static void test_basic_io_delegation_and_invalid_input(void)
 {
     fake_device d;
     cartpole_device_t device = fake_device_prepare(&d);
-    cartpole_t *c = cartpole_create(device, &d.clock);
+    cartpole_t *c = cartpole_create(device);
     d.on_send = skipped_send;
     d.on_receive = backlog_receive;
     assert(cartpole_send_velocity(c, -123.5, 1.25, 1) == CARTPOLE_SEND_SKIPPED);
@@ -198,7 +198,7 @@ static void test_early_wakeup_respects_deadline_or_cancellation(void)
         fake_device d;
         cartpole_device_t device = fake_device_prepare(&d);
         d.clock.sleep_until = interrupted_sleep;
-        cartpole_t *c = cartpole_create(device, &d.clock);
+        cartpole_t *c = cartpole_create(device);
         sleep_scenario scenario = {.session = c, .cancel = cancel};
         d.scenario_context = &scenario;
         assert(cartpole_sleep_until(c, 2.) == (cancel ? CARTPOLE_CANCELLED : CARTPOLE_OK));
@@ -217,7 +217,7 @@ static void test_operation_cannot_hide_illegal_destroy(void)
 {
     fake_device d;
     cartpole_device_t device = fake_device_prepare(&d);
-    cartpole_t *c = cartpole_create(device, &d.clock);
+    cartpole_t *c = cartpole_create(device);
     assert(cartpole_execute_operation(c, destroy_during_operation, NULL, NULL) == CARTPOLE_CALLBACK_ERROR);
     assert(d.detaches == 0 && cartpole_get_session_state(c).connection_open);
     assert(cartpole_get_session_state(c).has_stream_failure_latch);
@@ -228,7 +228,7 @@ int main(void)
 {
     test_delegation_and_invalid_timeouts();
     test_event_subscription_and_callback_contract();
-    test_failed_attach_allows_same_clock_retry();
+    test_failed_attach_allows_retry();
     test_operation_scope_and_readonly_evaluation();
     test_basic_io_delegation_and_invalid_input();
     test_early_wakeup_respects_deadline_or_cancellation();

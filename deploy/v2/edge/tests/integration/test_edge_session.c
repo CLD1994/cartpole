@@ -71,7 +71,7 @@ static int open_test(void)
     serial = serial_cartpole_open("fake", 460800, &test_clock);
     if (!serial)
         return -1;
-    device = cartpole_create(serial_cartpole_get_device(serial), &test_clock);
+    device = cartpole_create(serial_cartpole_get_device(serial));
     return device ? 0 : -1;
 }
 static int write_command(fake_uart_t *u, const uint8_t *data, size_t n)
@@ -192,7 +192,7 @@ static void business_event(const cartpole_event_t *event, void *context)
     }
     if (bad_callback) {
         assert(cartpole_enable(device, .01) == CARTPOLE_CALLBACK_ERROR);
-        assert(cartpole_create(serial_cartpole_get_device(serial), &test_clock) == NULL);
+        assert(cartpole_create(serial_cartpole_get_device(serial)) == NULL);
         cartpole_destroy(device);
         assert(cartpole_get_session_state(device).connection_open);
         assert(cartpole_subscribe(device, NULL, NULL) == CARTPOLE_CALLBACK_ERROR);

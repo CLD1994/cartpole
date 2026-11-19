@@ -22,13 +22,11 @@ static void test_lifecycle_and_cached_queries(void)
     cartpole_device_t da = fake_device_prepare(&a), db = fake_device_prepare(&b);
     cartpole_device_ops_t incomplete = {0};
     cartpole_device_t invalid = {&incomplete, &a, &a.clock};
-    assert(!cartpole_create(invalid, &a.clock));
+    assert(!cartpole_create(invalid));
     assert(!a.observer);
-    assert(!cartpole_create(da, &b.clock));
-    assert(!a.observer);
-    cartpole_t *ca = cartpole_create(da, &a.clock), *cb = cartpole_create(db, &b.clock);
+    cartpole_t *ca = cartpole_create(da), *cb = cartpole_create(db);
     assert(ca && cb);
-    assert(!cartpole_create(da, &a.clock));
+    assert(!cartpole_create(da));
     assert(a.observer);
     assert(cartpole_get_latest_measurement(ca).measurement_id == 1);
     assert(cartpole_get_session_state(ca).reported_mode == CARTPOLE_MODE_READY);
@@ -41,7 +39,7 @@ static void test_lifecycle_and_cached_queries(void)
     assert(!cartpole_is_stop_requested(cb));
     cartpole_destroy(ca);
     assert(!a.observer && b.observer);
-    cartpole_t *again = cartpole_create(da, &a.clock);
+    cartpole_t *again = cartpole_create(da);
     assert(again);
     cartpole_destroy(again);
     volatile sig_atomic_t external_stop = 0;
@@ -89,13 +87,28 @@ static cartpole_send_result_t controller_send(fake_device *d, double velocity, d
     cartpole_request_stop(((controller_scenario *)d->scenario_context)->session);
     return CARTPOLE_SEND_COMPLETE;
 }
+static void test_incomplete_device_clock_does_not_bind(void)
+{
+    fake_device d;
+    cartpole_device_t device = fake_device_prepare(&d);
+    cartpole_clock_t no_now = d.clock;
+    cartpole_clock_t no_wait = d.clock;
+    no_now.now = NULL;
+    no_wait.sleep_until = NULL;
+    const cartpole_clock_t *invalid_clocks[] = {NULL, &no_now, &no_wait};
+    for (size_t i = 0; i < sizeof invalid_clocks / sizeof invalid_clocks[0]; ++i) {
+        device.clock = invalid_clocks[i];
+        assert(cartpole_create(device) == NULL);
+        assert(d.attaches == 0 && !d.cancellation_probe);
+    }
+}
 static void test_shared_clock_independent_sessions(void)
 {
     fake_device a, b;
     cartpole_device_t da = fake_device_prepare(&a), db = fake_device_prepare(&b);
     db.clock = &a.clock;
-    cartpole_t *ca = cartpole_create(da, &a.clock);
-    cartpole_t *cb = cartpole_create(db, &a.clock);
+    cartpole_t *ca = cartpole_create(da);
+    cartpole_t *cb = cartpole_create(db);
     assert(ca && cb);
     a.now = 2.5;
     assert(cartpole_get_monotonic_time_s(ca) == 2.5);
@@ -118,7 +131,7 @@ static void test_controller(int test_case, cartpole_result_t expected, int sends
     d.scenario_context = &context;
     d.on_receive = controller_receive;
     d.on_send = controller_send;
-    cartpole_t *c = cartpole_create(device, &d.clock);
+    cartpole_t *c = cartpole_create(device);
     assert(c);
     context.session = c;
     cartpole_controller_options_t options = {400, 900, 900, d.configuration};
@@ -135,7 +148,7 @@ static void test_nested_hold_has_no_io_side_effects(void)
 {
     fake_device d;
     cartpole_device_t device = fake_device_prepare(&d);
-    cartpole_t *c = cartpole_create(device, &d.clock);
+    cartpole_t *c = cartpole_create(device);
     assert(cartpole_execute_operation(c, nested_hold, NULL, NULL) == CARTPOLE_CALLBACK_ERROR);
     assert(d.call_count == 0 && d.reads == 0 && d.sends == 0);
     cartpole_destroy(c);
@@ -143,6 +156,7 @@ static void test_nested_hold_has_no_io_side_effects(void)
 int main(void)
 {
     test_lifecycle_and_cached_queries();
+    test_incomplete_device_clock_does_not_bind();
     test_shared_clock_independent_sessions();
     test_nested_hold_has_no_io_side_effects();
     test_controller(0, CARTPOLE_CANCELLED, 1);

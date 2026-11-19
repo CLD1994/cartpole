@@ -128,9 +128,9 @@ typedef enum {
     CARTPOLE_SEND_LATE = 2
 } cartpole_send_result_t;
 
-/* 一个设备仅绑定一个会话；借用设备与时钟，destroy 不关闭设备、不停车。 */
+/* 会话借用设备及其时钟；一个设备仅绑定一个会话。destroy 不关闭设备、不停车。 */
 typedef struct cartpole_device cartpole_device_t;
-cartpole_t *cartpole_create(cartpole_device_t, const cartpole_clock_t *);
+cartpole_t *cartpole_create(cartpole_device_t device);
 void cartpole_destroy(cartpole_t *);
 typedef int (*cartpole_cancellation_probe_t)(void *);
 /* 取消源由调用者持有，必须活过会话；探针只读且非阻塞，不重入、不销毁会话，不调用任何会话 API。

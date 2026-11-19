@@ -23,13 +23,14 @@ typedef struct {
     cartpole_result_t (*mark_endpoint)(void *, cartpole_endpoint_t, double);
     cartpole_result_t (*configure)(void *, cartpole_setting_t, long, double);
     cartpole_stop_result_t (*stop_and_confirm)(void *, double);
-    /* try_once非零：不等待重试；deadline为同一runtime的绝对单调时间。
+    /* try_once非零：不等待重试；deadline为设备时钟的绝对单调时间。
      * COMPLETE只证明本机完整写入，不证明设备收讫。LATE表示写入完成但超过期限。 */
     cartpole_send_result_t (*send_velocity)(void *, double, double, int try_once);
 } cartpole_device_ops_t;
 struct cartpole_device {
     const cartpole_device_ops_t *ops;
     void *context;
+    /* 与适配器收发使用同一时钟，由装配者持有并保证其生命周期。 */
     const cartpole_clock_t *clock;
 };
 #endif

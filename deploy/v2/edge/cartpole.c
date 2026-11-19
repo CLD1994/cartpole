@@ -8,10 +8,11 @@ static int callback_enter(cartpole_t *);
 static int callback_leave(cartpole_t *);
 static int cancellation_probe(void *context) { return cartpole_is_stop_requested(context); }
 static void on_device_event(const cartpole_event_t *event, void *context);
-cartpole_t *cartpole_create(cartpole_device_t device, const cartpole_clock_t *clock)
+cartpole_t *cartpole_create(cartpole_device_t device)
 {
     const cartpole_device_ops_t *o = device.ops;
-    if (!o || !clock || device.clock != clock ||
+    const cartpole_clock_t *clock = device.clock;
+    if (!o || !clock ||
         !clock->now || !clock->sleep_until || !o->bind_cancellation || !o->get_latest_measurement ||
         !o->get_session_state || !o->get_configuration || !o->receive || !o->get_error ||
         !o->report_failure || !o->attach_observer || !o->detach_observer || !o->query_mode ||
@@ -22,7 +23,6 @@ cartpole_t *cartpole_create(cartpole_device_t device, const cartpole_clock_t *cl
     if (!c)
         return NULL;
     c->device = device;
-    c->clock = clock;
     if (o->attach_observer(device.context, on_device_event, c) != CARTPOLE_OK) {
         free(c);
         return NULL;
@@ -55,7 +55,7 @@ cartpole_configuration_t cartpole_get_configuration(cartpole_t *c)
 {
     return c->device.ops->get_configuration(c->device.context);
 }
-double cartpole_get_monotonic_time_s(cartpole_t *c) { return cartpole_clock_get_monotonic_time_s(c->clock); }
+double cartpole_get_monotonic_time_s(cartpole_t *c) { return cartpole_clock_get_monotonic_time_s(c->device.clock); }
 double cartpole_calculate_measurement_age_s(cartpole_t *c, cartpole_measurement_t m)
 {
     return m.received_host_monotonic_s < 0
@@ -69,7 +69,7 @@ cartpole_result_t cartpole_sleep_until(cartpole_t *c, double t)
     if (!mutation_allowed(c)) return CARTPOLE_CALLBACK_ERROR;
     if (!isfinite(t) || t < 0) return CARTPOLE_INVALID_ARGUMENT;
     while (!cartpole_is_stop_requested(c) && cartpole_get_monotonic_time_s(c) < t)
-        cartpole_clock_sleep_until(c->clock, t);
+        cartpole_clock_sleep_until(c->device.clock, t);
     return cartpole_is_stop_requested(c) ? CARTPOLE_CANCELLED : CARTPOLE_OK;
 }
 cartpole_result_t cartpole_get_stream_result(cartpole_t *c)

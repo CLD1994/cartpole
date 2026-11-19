@@ -101,7 +101,8 @@ make -C deploy/v2/edge test-integration PYTHON=/path/to/python
 
 装配入口初始化 `cartpole_clock_t`，用它打开串口适配器，将
 `serial_cartpole_get_device()` 返回的抽象设备能力注入 `cartpole_create()`。
-生命周期函数声明在 `cartpole.h`；会话借用设备与时钟，不负责选择或构造串口。
+生命周期函数声明在 `cartpole.h`；会话借用设备及其时钟，不负责选择或构造串口。
+会话计算截止时间和适配器判断超时使用同一个单调时钟。
 释放顺序是有界停止确认、`cartpole_destroy()`、`serial_cartpole_close()`。
 一个设备只能绑定一个会话，但多个设备/会话可以共享同一时钟。
 

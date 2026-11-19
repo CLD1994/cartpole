@@ -437,7 +437,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    cartpole_t *c = cartpole_create(serial_cartpole_get_device(serial), &clock);
+    cartpole_t *c = cartpole_create(serial_cartpole_get_device(serial));
     if (c) (void)cartpole_set_cancellation_source(c, cancellation_requested, NULL);
     if (!c) {
         serial_cartpole_close(serial);
