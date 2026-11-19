@@ -54,6 +54,80 @@ static void test_delegation_and_invalid_timeouts(void)
     assert(d.detaches == 1 && d.sends == 0 && d.call_count == 3);
 }
 
+static void test_disable_does_not_attempt_automatic_stop_if_busy(void)
+{
+    fake_device d;
+    cartpole_t *c = cartpole_create(fake_device_prepare(&d));
+    assert(c);
+    d.transaction_result = CARTPOLE_BUSY;
+    assert(cartpole_disable(c, .4) == CARTPOLE_BUSY);
+    assert(d.call_count == 1 && d.calls[0].operation == FAKE_DISABLE);
+    assert(d.calls[0].timeout == .4 && d.sends == 0);
+    cartpole_destroy(c);
+}
+
+static void test_confirm_left_returns_the_position_from_the_device(void)
+{
+    fake_device d;
+    cartpole_t *c = cartpole_create(fake_device_prepare(&d));
+    assert(c);
+    d.confirmed_left_position_um = -447422;
+    int64_t position = 0;
+    assert(cartpole_confirm_left(c, &position, .3) == CARTPOLE_OK);
+    assert(position == -447422);
+    assert(d.call_count == 1 && d.calls[0].operation == FAKE_CONFIRM_LEFT);
+    assert(d.calls[0].timeout == .3 && d.sends == 0);
+    cartpole_destroy(c);
+}
+
+static void test_calibration_query_without_output_does_not_access_device(void)
+{
+    fake_device d;
+    cartpole_t *c = cartpole_create(fake_device_prepare(&d));
+    assert(c);
+    assert(cartpole_read_calibration_status(c, NULL, .7) == CARTPOLE_INVALID_ARGUMENT);
+    assert(d.call_count == 0);
+    cartpole_destroy(c);
+}
+
+static void test_read_settings_delegates_and_returns_settings(void)
+{
+    fake_device d;
+    cartpole_t *c = cartpole_create(fake_device_prepare(&d));
+    assert(c);
+    d.settings.values[CARTPOLE_SETTING_POLE_ZERO] = -3000000;
+    d.settings.values[CARTPOLE_SETTING_POLE_INVERT] = 1;
+    cartpole_settings_t readback;
+    assert(cartpole_read_settings(c, &readback, .6) == CARTPOLE_OK);
+    assert(d.call_count == 1 && d.calls[0].operation == FAKE_READ_SETTINGS);
+    assert(d.calls[0].timeout == .6);
+    assert(readback.values[CARTPOLE_SETTING_POLE_ZERO] == -3000000);
+    assert(readback.values[CARTPOLE_SETTING_POLE_INVERT] == 1);
+    cartpole_destroy(c);
+}
+
+static void test_read_settings_preserves_output_on_failure(void)
+{
+    fake_device d;
+    cartpole_t *c = cartpole_create(fake_device_prepare(&d));
+    assert(c);
+    d.transaction_result = CARTPOLE_TIMEOUT;
+    cartpole_settings_t readback = {.values = {[CARTPOLE_SETTING_POLE_ZERO] = 12345}};
+    assert(cartpole_read_settings(c, &readback, .6) == CARTPOLE_TIMEOUT);
+    assert(readback.values[CARTPOLE_SETTING_POLE_ZERO] == 12345);
+    cartpole_destroy(c);
+}
+
+static void test_read_settings_rejects_missing_destination(void)
+{
+    fake_device d;
+    cartpole_t *c = cartpole_create(fake_device_prepare(&d));
+    assert(c);
+    assert(cartpole_read_settings(c, NULL, .6) == CARTPOLE_INVALID_ARGUMENT);
+    assert(d.call_count == 0);
+    cartpole_destroy(c);
+}
+
 typedef struct { cartpole_t *session; int calls; cartpole_result_t result; } subscriber;
 static void forbidden_mutation(const cartpole_event_t *event, void *context)
 {
@@ -227,6 +301,12 @@ static void test_operation_cannot_hide_illegal_destroy(void)
 int main(void)
 {
     test_delegation_and_invalid_timeouts();
+    test_disable_does_not_attempt_automatic_stop_if_busy();
+    test_confirm_left_returns_the_position_from_the_device();
+    test_calibration_query_without_output_does_not_access_device();
+    test_read_settings_delegates_and_returns_settings();
+    test_read_settings_preserves_output_on_failure();
+    test_read_settings_rejects_missing_destination();
     test_event_subscription_and_callback_contract();
     test_failed_attach_allows_retry();
     test_operation_scope_and_readonly_evaluation();

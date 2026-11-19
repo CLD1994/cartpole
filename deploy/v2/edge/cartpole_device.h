@@ -18,9 +18,13 @@ typedef struct {
     cartpole_result_t (*query_mode)(void *, double);
     cartpole_result_t (*wait_for_measurement)(void *, double);
     cartpole_result_t (*enable)(void *, double);
+    cartpole_result_t (*disable)(void *, double);
     cartpole_result_t (*reset)(void *, double);
     cartpole_result_t (*refresh_configuration)(void *, double);
+    cartpole_result_t (*read_settings)(void *, cartpole_settings_t *, double);
     cartpole_result_t (*mark_endpoint)(void *, cartpole_endpoint_t, double);
+    cartpole_result_t (*confirm_left)(void *, int64_t *, double);
+    cartpole_result_t (*read_calibration_status)(void *, cartpole_calibration_status_t *, double);
     cartpole_result_t (*configure)(void *, cartpole_setting_t, long, double);
     cartpole_stop_result_t (*stop_and_confirm)(void *, double);
     /* try_once非零：不等待重试；deadline为设备时钟的绝对单调时间。

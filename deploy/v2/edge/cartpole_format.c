@@ -15,8 +15,16 @@ const char *cartpole_result_to_string(cartpole_result_t result)
         return CARTPOLE_TEXT_TRANSPORT_ERROR;
     case CARTPOLE_PROTOCOL_ERROR:
         return CARTPOLE_TEXT_PROTOCOL_ERROR;
+    case CARTPOLE_CALIBRATION_REFERENCE_ERROR:
+        return CARTPOLE_TEXT_CALIBRATION_REFERENCE_ERROR;
+    case CARTPOLE_STORAGE_ERROR:
+        return CARTPOLE_TEXT_STORAGE_ERROR;
     case CARTPOLE_REJECTED:
         return CARTPOLE_TEXT_REJECTED;
+    case CARTPOLE_BUSY:
+        return CARTPOLE_TEXT_BUSY;
+    case CARTPOLE_POWER_UNAVAILABLE:
+        return CARTPOLE_TEXT_POWER_UNAVAILABLE;
     case CARTPOLE_FAULT:
         return CARTPOLE_TEXT_FAULT;
     case CARTPOLE_REPLY_MISMATCH:
@@ -60,6 +68,8 @@ const char *cartpole_reason_to_string(cartpole_reason_t reason)
         return CARTPOLE_TEXT_AS5600;
     case CARTPOLE_REASON_MT6835:
         return CARTPOLE_TEXT_MT6835;
+    case CARTPOLE_REASON_POWER:
+        return CARTPOLE_TEXT_POWER;
     }
     return CARTPOLE_TEXT_UNKNOWN;
 }
@@ -83,6 +93,8 @@ const char *cartpole_setting_to_string(cartpole_setting_t setting)
         return CARTPOLE_TEXT_X_INV;
     case CARTPOLE_SETTING_STEP_LOSS_THRESHOLD:
         return CARTPOLE_TEXT_STEP_LOSS_UM;
+    case CARTPOLE_SETTING_COUNT:
+        break;
     }
     return NULL;
 }
@@ -90,7 +102,7 @@ int cartpole_parse_setting(const char *name, cartpole_setting_t *setting)
 {
     if (!name || !setting)
         return -1;
-    for (int i = CARTPOLE_SETTING_VELOCITY_LIMIT; i <= CARTPOLE_SETTING_STEP_LOSS_THRESHOLD; i++) {
+    for (int i = CARTPOLE_SETTING_VELOCITY_LIMIT; i < CARTPOLE_SETTING_COUNT; i++) {
         if (!strcmp(name, cartpole_setting_to_string((cartpole_setting_t)i))) {
             *setting = (cartpole_setting_t)i;
             return 0;

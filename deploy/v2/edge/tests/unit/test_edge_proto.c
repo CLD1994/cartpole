@@ -40,6 +40,11 @@ int main(void)
     proto_rx_feed(&rx, embedded, sizeof embedded, record, 0);
     assert(proto_parse_line(last, &m) == PROTO_UNKNOWN);
     char buf[64];
+    assert(proto_parse_line("MODE FAULT POWER", &m) == PROTO_MODE);
+    assert(m.mode == FW_FAULT && strcmp(proto_reason_name(m.reason), "POWER") == 0);
+    proto_command_t command;
+    assert(proto_parse_command("CONFIRM LEFT\n", &command));
+    assert(!proto_parse_command("CONFIRM RIGHT\n", &command));
     assert(proto_format_simple(buf, "QUERY\nENABLE") == 0);
     assert(proto_format_config(buf, "A\nENABLE", 1) == 0);
     puts("edge proto passed");

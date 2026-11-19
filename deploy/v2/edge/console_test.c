@@ -78,7 +78,8 @@ int main(void)
     /* config：非法输入 */
     expect_err("config VEL_MAX");
     expect_err("config VEL_MAX 800 extra");
-    expect_err("config vel_max 800"); /* 小写 */
+    CHECK(console_parse("config vel_max 800", &req) == 0 &&
+          !strcmp(req.name, "VEL_MAX") && req.value == 800);
     expect_err("config VEL_MAX 0x10"); /* 非十进制 */
     expect_err("config VEL_MAX 1.5");
     expect_err("config AAAAAAAAAAAAAAAA 5"); /* 16 字符，超出 name 容量 */

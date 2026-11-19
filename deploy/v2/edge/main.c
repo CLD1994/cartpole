@@ -8,7 +8,9 @@
 #include "package.h"
 #include "policy.h"
 #include "serial_cartpole.h"
+#include <errno.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <math.h>
 #include <signal.h>
 #include <stdio.h>
@@ -260,7 +262,7 @@ static int parse_duration(const char *s, double *out)
 static void print_usage(const char *prog)
 {
     fprintf(stderr,
-            "usage: %s [--port /dev/ttyXXXX] [command [args]]\n"
+            "usage: %s [--port /dev/ttyXXXX] [--baud RATE] [command [args]]\n"
             "  (no command)                     interactive console (default)\n"
             "  console                          same as above\n"
             "  run --backend cpu|npu --package edge-package.json       policy "
@@ -273,8 +275,12 @@ static void print_usage(const char *prog)
             "at left end)\n"
             "  mark-right                       one-shot: send MARK RIGHT (cart "
             "at right end)\n"
-            "  enable                           one-shot: ENABLE after "
+            "  confirm-left                     restore saved left reference without enabling\n"
+            "  calib-status                     read track calibration status\n"
+            "  calibrate-pole-down              calibrate the stationary, hanging pole (DISABLED)\n"
+            "  enable [--timeout s]             one-shot: ENABLE after "
             "calibration, wait READY\n"
+            "  disable                          disable only when the firmware is stopped\n"
             "  center                           one-shot: move cart to track "
             "center (needs READY)\n"
             "  vel <mm/s> [--hold s]            one-shot: hold velocity for s "
@@ -283,6 +289,7 @@ static void print_usage(const char *prog)
             "s-second window stats"
             " (rate/unknown/ranges)\n"
             "  query                            one-shot: print firmware mode\n"
+            "  dump                             one-shot: read all firmware settings\n"
             "  config [NAME VALUE]              one-shot: set one param, or dump "
             "all with no args\n"
             "  reset                           one-shot: clear FAULT\n"
@@ -308,20 +315,21 @@ static int dispatch(cartpole_t *c, serial_cartpole_t *serial, const char *cmd, i
     if (strcmp(cmd, "run") == 0) {
         return run_policy(c, argc, argv, first);
     }
-    if (strcmp(cmd, "calib") == 0 || strcmp(cmd, "mark-left") == 0 ||
-        strcmp(cmd, "mark-right") == 0 || strcmp(cmd, "enable") == 0) {
-        if (nargs != 0) {
-            fprintf(stderr, "[edge] %s takes no arguments\n", cmd);
-            return 1;
-        }
+    if (strcmp(cmd, "enable") == 0) {
         console_req_t req;
-        if (parse_argv_as_console(cmd, NULL, NULL, &req) != 0) {
+        if ((nargs != 0 && nargs != 2) ||
+            parse_argv_as_console(cmd, nargs ? argv[first] : NULL,
+                                  nargs ? argv[first + 1] : NULL, &req) != 0) {
             print_usage(prog);
             return 1;
         }
         return console_exec(c, &req) == 0 ? 0 : 1;
     }
-    if (strcmp(cmd, "center") == 0 || strcmp(cmd, "query") == 0 || strcmp(cmd, "reset") == 0) {
+    if (strcmp(cmd, "calib") == 0 || strcmp(cmd, "mark-left") == 0 ||
+        strcmp(cmd, "mark-right") == 0 || strcmp(cmd, "confirm-left") == 0 ||
+        strcmp(cmd, "calib-status") == 0 || strcmp(cmd, "calibrate-pole-down") == 0 ||
+        strcmp(cmd, "disable") == 0 || strcmp(cmd, "center") == 0 ||
+        strcmp(cmd, "query") == 0 || strcmp(cmd, "reset") == 0) {
         if (nargs != 0) {
             fprintf(stderr, "[edge] %s takes no arguments\n", cmd);
             return 1;
@@ -373,6 +381,14 @@ static int dispatch(cartpole_t *c, serial_cartpole_t *serial, const char *cmd, i
         }
         return oneshot_vel(c, req.vel_mm_s, hold);
     }
+    if (strcmp(cmd, "dump") == 0) {
+        console_req_t req;
+        if (nargs != 0 || parse_argv_as_console(cmd, NULL, NULL, &req) != 0) {
+            print_usage(prog);
+            return 1;
+        }
+        return console_exec(c, &req) == 0 ? 0 : 1;
+    }
     if (strcmp(cmd, "config") == 0) {
         console_req_t req;
         if (nargs == 0 || nargs == 2) {
@@ -394,7 +410,8 @@ static int is_known_command(const char *cmd)
 {
     static const char *const names[] = {
         "console", "run",   "calib", "mark-left", "mark-right", "enable",   "center",
-        "vel",     "state", "query", "config",    "reset",      "wdt-test",
+        "vel",     "state", "query", "config",    "dump",       "reset",      "wdt-test",
+        "confirm-left", "calib-status", "calibrate-pole-down", "disable",
     };
     for (size_t k = 0; k < sizeof(names) / sizeof(names[0]); k++) {
         if (strcmp(cmd, names[k]) == 0) {
@@ -407,14 +424,29 @@ static int is_known_command(const char *cmd)
 int main(int argc, char **argv)
 {
     const char *port = CFG_SERIAL_PORT;
+    int baud = CFG_BAUD;
     const char *cmd = NULL;
     int first = argc; /* 子命令参数起点 */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             port = argv[++i];
+        } else if (strcmp(argv[i], "--baud") == 0) {
+            if (i + 1 == argc) {
+                print_usage(argv[0]);
+                return 1;
+            }
+            const char *arg = argv[++i];
+            char *end;
+            errno = 0;
+            long value = strtol(arg, &end, 10);
+            if (errno != 0 || end == arg || *end || value <= 0 || value > INT_MAX) {
+                fprintf(stderr, "[edge] invalid baud rate: %s\n", arg);
+                return 1;
+            }
+            baud = (int)value;
         } else {
-            cmd = argv[i]; /* 第一个非 --port 参数即子命令 */
+            cmd = argv[i]; /* 第一个非全局选项即子命令 */
             first = i + 1;
             break;
         }
@@ -431,9 +463,9 @@ int main(int argc, char **argv)
     cartpole_clock_t clock;
     if (cartpole_clock_init(&clock, NULL))
         return 1;
-    serial_cartpole_t *serial = serial_cartpole_open(port, CFG_BAUD, &clock);
+    serial_cartpole_t *serial = serial_cartpole_open(port, baud, &clock);
     if (!serial) {
-        fprintf(stderr, "[edge] cannot open %s\n", port);
+        fprintf(stderr, "[edge] cannot open %s at %d baud\n", port, baud);
         return 1;
     }
 

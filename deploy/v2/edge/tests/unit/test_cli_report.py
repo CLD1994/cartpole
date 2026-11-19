@@ -49,6 +49,10 @@ class StateReportTests(unittest.TestCase):
                     parse_state_output(event + '\n' + REPORT)
                 self.assertEqual(str(caught.exception), ERROR_INVALID_STATE_WINDOW_REPORT)
 
+    def test_power_fault_is_part_of_known_mode_output(self):
+        parsed = parse_state_output('[edge] MODE FAULT POWER\n' + REPORT)
+        self.assertEqual(parsed.events, (ModeEvent('FAULT', 'POWER'),))
+
     def test_invalid_reports_are_rejected(self):
         lines = REPORT.splitlines(keepends=True)
         bad = [None, '', REPORT.replace('\n', '\v'), REPORT + lines[0], ''.join(lines[:3]),

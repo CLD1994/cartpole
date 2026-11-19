@@ -9,7 +9,8 @@ typedef enum {
     CARTPOLE_REASON_NONE,
     CARTPOLE_REASON_STEP_LOSS,
     CARTPOLE_REASON_AS5600,
-    CARTPOLE_REASON_MT6835
+    CARTPOLE_REASON_MT6835,
+    CARTPOLE_REASON_POWER
 } cartpole_reason_t;
 typedef enum {
     CARTPOLE_OK = 0,
@@ -18,6 +19,8 @@ typedef enum {
     CARTPOLE_TRANSPORT_ERROR,
     CARTPOLE_PROTOCOL_ERROR,
     CARTPOLE_REJECTED,
+    CARTPOLE_STORAGE_ERROR,
+    CARTPOLE_CALIBRATION_REFERENCE_ERROR,
     CARTPOLE_FAULT,
     CARTPOLE_REPLY_MISMATCH,
     CARTPOLE_INVALID_ARGUMENT,
@@ -25,7 +28,9 @@ typedef enum {
     CARTPOLE_MEASUREMENT_UNAVAILABLE,
     CARTPOLE_SESSION_UNAVAILABLE,
     CARTPOLE_CONTROL_DEADLINE,
-    CARTPOLE_CONFIGURATION_CHANGED
+    CARTPOLE_CONFIGURATION_CHANGED,
+    CARTPOLE_BUSY,
+    CARTPOLE_POWER_UNAVAILABLE
 } cartpole_result_t;
 typedef enum {
     CARTPOLE_STOP_UNCONFIRMED = -1,
@@ -60,6 +65,10 @@ typedef struct {
     int64_t track_length_um;
     int64_t velocity_limit_mm_s, acceleration_limit_mm_s2, watchdog_timeout_ms, track_margin_um;
 } cartpole_configuration_t;
+/* 固件 CALIB? 的原始状态与存储错误码；查询成功不等于可使能。 */
+typedef struct {
+    int64_t state, length_um, saved, storage;
+} cartpole_calibration_status_t;
 typedef enum {
     CARTPOLE_SETTING_VELOCITY_LIMIT,
     CARTPOLE_SETTING_ACCELERATION_LIMIT,
@@ -68,8 +77,13 @@ typedef enum {
     CARTPOLE_SETTING_POLE_ZERO,
     CARTPOLE_SETTING_POLE_INVERT,
     CARTPOLE_SETTING_CART_INVERT,
-    CARTPOLE_SETTING_STEP_LOSS_THRESHOLD
+    CARTPOLE_SETTING_STEP_LOSS_THRESHOLD,
+    CARTPOLE_SETTING_COUNT
 } cartpole_setting_t;
+/* 固件设置的完整读回，按 cartpole_setting_t 索引。与控制预检摘要独立。 */
+typedef struct {
+    int64_t values[CARTPOLE_SETTING_COUNT];
+} cartpole_settings_t;
 typedef enum {
     CARTPOLE_EVENT_MEASUREMENT,
     CARTPOLE_EVENT_SESSION,
@@ -108,11 +122,20 @@ double cartpole_get_monotonic_time_s(cartpole_t *);
 cartpole_result_t cartpole_query_mode(cartpole_t *, double timeout_s);
 cartpole_result_t cartpole_wait_for_measurement(cartpole_t *, double timeout_s);
 cartpole_result_t cartpole_enable(cartpole_t *, double timeout_s);
+/* 仅发送禁用请求，不减速；非零速时返回 BUSY，设备故障时保留 FAULT。 */
+cartpole_result_t cartpole_disable(cartpole_t *, double timeout_s);
 cartpole_result_t cartpole_reset(cartpole_t *, double timeout_s);
 cartpole_result_t cartpole_mark_endpoint(cartpole_t *, cartpole_endpoint_t, double timeout_s);
+/* 确认保存行程的左参考点，不使能。成功才写入 position_um。 */
+cartpole_result_t cartpole_confirm_left(cartpole_t *, int64_t *position_um, double timeout_s);
+/* 只查询当前轨道标定，成功才写入 out。 */
+cartpole_result_t cartpole_read_calibration_status(cartpole_t *, cartpole_calibration_status_t *out,
+                                                 double timeout_s);
 cartpole_result_t cartpole_configure(cartpole_t *, cartpole_setting_t, long value,
                                      double timeout_s);
 cartpole_result_t cartpole_refresh_configuration(cartpole_t *, double timeout_s);
+/* 重新读取全部设置；失败不修改 out。 */
+cartpole_result_t cartpole_read_settings(cartpole_t *, cartpole_settings_t *out, double timeout_s);
 /* 清理忽略已请求取消与流失败；FAULT保留故障，不等同DISABLED。
  * UNCONFIRMED不证明设备仍在运动，也不证明已经停下。 */
 cartpole_stop_result_t cartpole_stop_and_confirm(cartpole_t *, double timeout_s);

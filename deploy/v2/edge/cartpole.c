@@ -16,8 +16,10 @@ cartpole_t *cartpole_create(cartpole_device_t device)
         !clock->now || !clock->sleep_until || !o->bind_cancellation || !o->get_latest_measurement ||
         !o->get_session_state || !o->get_configuration || !o->receive || !o->get_error ||
         !o->report_failure || !o->attach_observer || !o->detach_observer || !o->query_mode ||
-        !o->wait_for_measurement || !o->enable || !o->reset || !o->refresh_configuration || !o->mark_endpoint ||
-        !o->configure || !o->stop_and_confirm || !o->send_velocity)
+        !o->wait_for_measurement || !o->enable || !o->disable || !o->reset ||
+        !o->refresh_configuration || !o->mark_endpoint || !o->confirm_left ||
+        !o->read_calibration_status ||
+        !o->read_settings || !o->configure || !o->stop_and_confirm || !o->send_velocity)
         return NULL;
     cartpole_t *c = calloc(1, sizeof *c);
     if (!c)
@@ -197,6 +199,11 @@ cartpole_result_t cartpole_enable(cartpole_t *c, double timeout)
     cartpole_result_t result = transaction_check(c, timeout);
     return result != CARTPOLE_OK ? result : c->device.ops->enable(c->device.context, timeout);
 }
+cartpole_result_t cartpole_disable(cartpole_t *c, double timeout)
+{
+    cartpole_result_t result = transaction_check(c, timeout);
+    return result != CARTPOLE_OK ? result : c->device.ops->disable(c->device.context, timeout);
+}
 cartpole_result_t cartpole_reset(cartpole_t *c, double timeout)
 {
     cartpole_result_t result = transaction_check(c, timeout);
@@ -208,11 +215,51 @@ cartpole_result_t cartpole_refresh_configuration(cartpole_t *c, double timeout)
     return result != CARTPOLE_OK ? result
                                  : c->device.ops->refresh_configuration(c->device.context, timeout);
 }
+cartpole_result_t cartpole_read_settings(cartpole_t *c, cartpole_settings_t *out, double timeout)
+{
+    if (!out)
+        return CARTPOLE_INVALID_ARGUMENT;
+    cartpole_result_t result = transaction_check(c, timeout);
+    if (result != CARTPOLE_OK)
+        return result;
+    cartpole_settings_t settings;
+    result = c->device.ops->read_settings(c->device.context, &settings, timeout);
+    if (result == CARTPOLE_OK)
+        *out = settings;
+    return result;
+}
 cartpole_result_t cartpole_mark_endpoint(cartpole_t *c, cartpole_endpoint_t endpoint, double timeout)
 {
     cartpole_result_t result = transaction_check(c, timeout);
     return result != CARTPOLE_OK ? result
                                  : c->device.ops->mark_endpoint(c->device.context, endpoint, timeout);
+}
+cartpole_result_t cartpole_confirm_left(cartpole_t *c, int64_t *position_um, double timeout)
+{
+    if (!position_um)
+        return CARTPOLE_INVALID_ARGUMENT;
+    cartpole_result_t result = transaction_check(c, timeout);
+    if (result != CARTPOLE_OK)
+        return result;
+    int64_t confirmed_position;
+    result = c->device.ops->confirm_left(c->device.context, &confirmed_position, timeout);
+    if (result == CARTPOLE_OK)
+        *position_um = confirmed_position;
+    return result;
+}
+cartpole_result_t cartpole_read_calibration_status(cartpole_t *c,
+                                                 cartpole_calibration_status_t *out, double timeout)
+{
+    if (!out)
+        return CARTPOLE_INVALID_ARGUMENT;
+    cartpole_result_t result = transaction_check(c, timeout);
+    if (result != CARTPOLE_OK)
+        return result;
+    cartpole_calibration_status_t status;
+    result = c->device.ops->read_calibration_status(c->device.context, &status, timeout);
+    if (result == CARTPOLE_OK)
+        *out = status;
+    return result;
 }
 cartpole_result_t cartpole_configure(cartpole_t *c, cartpole_setting_t setting, long value,
                                      double timeout)
