@@ -46,6 +46,11 @@
     "requested_min_control_hz": 450,
     "variable_control_period_implemented": false,
     "cart_mass_randomization_fraction": 0.1,
+    "pole_mass_randomization_fraction": 0.1,
+    "pole_com_randomization_fraction": 0.03,
+    "pole_inertia_randomization_fraction": 0.15,
+    "cart_damping_range_n_s_per_m": [0.1, 0.6],
+    "pole_damping_range_n_m_s_per_rad": [0.0, 0.01],
     "scope": "固定500Hz训练基线；450–500Hz真实策略节拍波动尚未实现。"
   }
 }

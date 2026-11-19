@@ -146,19 +146,19 @@ class RealCartpoleV2EnvCfg(CartpoleEnvCfg):
             mode="reset",
             params={
                 "asset_cfg": SceneEntityCfg("robot"),
-                "mass_range": {"base_link|cart": (DEVICE["cart_mass_kg"] * (1 - DEVICE["cart_mass_randomization_fraction"]), DEVICE["cart_mass_kg"] * (1 + DEVICE["cart_mass_randomization_fraction"]))},  # 0.065 kg +-10%
+                "mass_range": {"base_link|cart": DEVICE["cart_mass_range_kg"]},
             },
         )
-        # 端点均匀细杆；质量±10%、质心±3%、惯量±15%为初始随机化假设。
+        # 根据设备档案中的训练假设随机化端点均匀细杆的属性。
         self.events.randomize_pole_properties = EventTerm(
             func=mdp_events.randomize_pole_axis_properties,
             mode="reset",
             params={
                 "asset_cfg": SceneEntityCfg("robot"),
-                "mass_range": (DEVICE["pole_mass_kg"] * 0.9, DEVICE["pole_mass_kg"] * 1.1),
+                "mass_range": DEVICE["pole_mass_range_kg"],
                 "length": DEVICE["pole_length_m"],
-                "com_offset_range": (DEVICE["pole_com_m"] * 0.97, DEVICE["pole_com_m"] * 1.03),
-                "inertia_scale_range": (0.85, 1.15),
+                "com_offset_range": DEVICE["pole_com_offset_range_m"],
+                "inertia_scale_range": DEVICE["pole_inertia_scale_range"],
             },
         )
         # the stepper rig's residual rail/belt friction: small, mostly folded into the tracking
@@ -168,7 +168,10 @@ class RealCartpoleV2EnvCfg(CartpoleEnvCfg):
             mode="reset",
             params={
                 "asset_cfg": SceneEntityCfg("robot"),
-                "damping_range": {"slider_to_cart": (0.1, 0.6), "cart_to_pole": (0.0, 0.01)},
+                "damping_range": {
+                    "slider_to_cart": DEVICE["cart_damping_range_n_s_per_m"],
+                    "cart_to_pole": DEVICE["pole_damping_range_n_m_s_per_rad"],
+                },
             },
         )
         # 参考跟踪动态范围；当前装置的速度、加速度与响应参数需要实测辨识。
