@@ -9,6 +9,9 @@ typedef struct {
     uint64_t received_measurements, unknown_received_lines;
 } serial_cartpole_statistics_t;
 serial_cartpole_t *serial_cartpole_open(const char *port, int baud, const cartpole_clock_t *clock);
+/* CLI打开并绑定取消源后调用一次，只接收，启动最多等待25 ms。没有STATE时
+ * 仍可在独立的事务时限内发送命令，已运行会话的清理也不重新同步。 */
+void serial_cartpole_sync_startup(serial_cartpole_t *);
 cartpole_device_t serial_cartpole_get_device(serial_cartpole_t *);
 void serial_cartpole_close(serial_cartpole_t *);
 /* 诊断统计是主机成功解析的测量及未知行累计数，不表示设备丢包数量。 */

@@ -1,5 +1,9 @@
 """Exercise the maintenance CLI with a PTY rather than real hardware."""
+import os
+import select
+import subprocess
 import sys
+import time
 import termios
 import unittest
 from pathlib import Path
@@ -61,6 +65,63 @@ class MaintenanceCommands(unittest.TestCase):
             result = fw.run("query")
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.splitlines(), ["[MODE] READY NONE"])
+
+    def test_query_waits_for_a_complete_startup_state_even_with_no_valid_sensor_lanes(self):
+        fw = Firmware(stream=False)
+        try:
+            with subprocess.Popen([test_cli.BINARY, "--port", fw.path, "query"],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as child:
+                # Wait until the program has configured the PTY, then let its initial flush finish.
+                deadline = time.monotonic() + 1
+                while not termios.tcgetattr(fw.slave)[2] & termios.CLOCAL:
+                    self.assertLess(time.monotonic(), deadline, "serial port not configured")
+                    time.sleep(.001)
+                self.assertFalse(select.select([fw.master], [], [], .003)[0],
+                                 "QUERY preceded any startup framing evidence")
+                # This plausible frame still lacked a known leading line boundary.
+                os.write(fw.master, b"STATE 3 1 2 3 4\n")
+                self.assertFalse(select.select([fw.master], [], [], .003)[0],
+                                 "the ambiguous first line was accepted as startup sync")
+                os.write(fw.master, b"STATE 0 0 0 0 0\n")
+                self.assertTrue(select.select([fw.master], [], [], .2)[0])
+                self.assertEqual(os.read(fw.master, 64), b"QUERY\n")
+                os.write(fw.master, b"MODE DISABLED NONE\n")
+                stdout, stderr = child.communicate(timeout=2)
+                self.assertEqual(child.returncode, 0, stderr)
+                self.assertEqual(stdout.splitlines(), ["[MODE] DISABLED NONE"])
+        finally:
+            os.close(fw.master)
+            os.close(fw.slave)
+
+    def test_query_fallback_drops_incomplete_startup_garbage(self):
+        fw = Firmware(stream=False)
+        try:
+            with subprocess.Popen([test_cli.BINARY, "--port", fw.path, "query"],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as child:
+                deadline = time.monotonic() + 1
+                while not termios.tcgetattr(fw.slave)[2] & termios.CLOCAL:
+                    self.assertLess(time.monotonic(), deadline, "serial port not configured")
+                    time.sleep(.001)
+                self.assertFalse(select.select([fw.master], [], [], .003)[0])
+                # The initial hardware capture contained binary bytes and no LF before the reply.
+                os.write(fw.master, bytes.fromhex("4c4c26d31352a9929aa2aaaa0282028252fe"))
+                self.assertTrue(select.select([fw.master], [], [], .3)[0],
+                                "missing STATE must not block QUERY")
+                self.assertEqual(os.read(fw.master, 64), b"QUERY\n")
+                os.write(fw.master, b"junkMODE READY NONE\nMODE DISABLED NONE\n")
+                stdout, stderr = child.communicate(timeout=2)
+                self.assertEqual(child.returncode, 0, stderr)
+                self.assertEqual(stdout.splitlines(), ["[MODE] DISABLED NONE"])
+        finally:
+            os.close(fw.master)
+            os.close(fw.slave)
+
+    def test_queries_and_disable_still_get_a_reply_without_telemetry(self):
+        for command, request in [("query", "QUERY"), ("disable", "DISABLE")]:
+            with self.subTest(command=command), Firmware(stream=False) as fw:
+                result = fw.run(command)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(fw.commands, [request])
 
     def test_enable_unconfirmed_is_not_automatically_replayed(self):
         with Firmware(mode="DISABLED", acknowledge_enable=False) as fw:

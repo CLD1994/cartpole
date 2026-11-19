@@ -55,6 +55,75 @@ static void expect_request(fake_uart_t *port, const char *wire_request, const ch
     port->write = firmware_reply;
 }
 
+static double first_state_at, reply_at;
+static void startup_state(fake_uart_t *port)
+{
+    if (now >= first_state_at) {
+        fake_uart_queue(port, "STATE 0 0 0 0 0\n");
+        port->before_read = NULL;
+    }
+}
+
+static void test_startup_sync_ends_at_first_valid_boundary(const cartpole_clock_t *clock)
+{
+    fake_uart_reset();
+    serial_cartpole_t *s = serial_cartpole_open("startup", 460800, clock);
+    assert(s);
+    fake_uart_t *p = fake_uart_port(0);
+    cartpole_device_t d = serial_cartpole_get_device(s);
+    double started = now;
+    first_state_at = started + .004;
+    fake_uart_queue(p, "STATE 3 1 2 3 4\n");
+    p->before_read = startup_state;
+    expect_request(p, "QUERY\n", "MODE DISABLED NONE\n");
+
+    serial_cartpole_sync_startup(s);
+    assert(now >= first_state_at && now - started < .010);
+    assert(request_count == 0);
+    cartpole_measurement_t sample = d.ops->get_latest_measurement(d.context);
+    assert(sample.measurement_id == 1 && !sample.cart_valid && !sample.pole_valid);
+    double synchronized_at = now;
+    serial_cartpole_sync_startup(s);
+    assert(now == synchronized_at);
+    assert(d.ops->query_mode(d.context, .010) == CARTPOLE_OK && request_count == 1);
+    serial_cartpole_close(s);
+}
+
+static void delayed_mode(fake_uart_t *port)
+{
+    if (now >= reply_at) {
+        fake_uart_queue(port, "MODE DISABLED NONE\n");
+        port->before_read = NULL;
+    }
+}
+
+static int query_with_delayed_mode(fake_uart_t *port, const uint8_t *bytes, size_t size)
+{
+    assert(size == 6 && memcmp(bytes, "QUERY\n", size) == 0);
+    request_count++;
+    reply_at = now + .008;
+    port->before_read = delayed_mode;
+    return 0;
+}
+
+static void test_startup_fallback_does_not_spend_command_deadline(const cartpole_clock_t *clock)
+{
+    fake_uart_reset();
+    serial_cartpole_t *s = serial_cartpole_open("no-telemetry", 460800, clock);
+    assert(s);
+    fake_uart_t *p = fake_uart_port(0);
+    cartpole_device_t d = serial_cartpole_get_device(s);
+    fake_uart_queue(p, "incomplete garbage without newline");
+    request_count = 0;
+    p->write = query_with_delayed_mode;
+    double started = now;
+    serial_cartpole_sync_startup(s);
+    assert(now - started > .024 && now - started < .026);
+    assert(request_count == 0);
+    assert(d.ops->query_mode(d.context, .010) == CARTPOLE_OK && request_count == 1);
+    serial_cartpole_close(s);
+}
+
 static int congested_config_write(fake_uart_t *port, const uint8_t *bytes, size_t size)
 {
     const char command[] = "CONFIG POLE_ZERO_URAD 17\n";
@@ -197,6 +266,8 @@ int main(void)
     assert(stats.received_measurements == 2 && stats.unknown_received_lines == 0);
     serial_cartpole_close(a);
     serial_cartpole_close(b);
+    test_startup_sync_ends_at_first_valid_boundary(&clock);
+    test_startup_fallback_does_not_spend_command_deadline(&clock);
     test_maintenance_wire_contracts(&clock);
     test_configure_rechecks_telemetry_after_backpressure(&clock);
     puts("serial_cartpole: ok");
