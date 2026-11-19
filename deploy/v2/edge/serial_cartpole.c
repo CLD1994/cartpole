@@ -32,7 +32,7 @@ struct serial_cartpole {
     proto_rx_t rx;
     serial_snapshot_t snapshot;
     int need_frame_boundary;
-    uint64_t mode_seq, fault_seq;
+    uint64_t mode_seq, fault_seq, non_disabled_seq, invalid_dual_state_seq;
     cartpole_result_t stream_error;
     char wait_name[16];
     int reply_seen;
@@ -112,7 +112,8 @@ static cartpole_result_t adapter_query_mode(serial_cartpole_t *s, double timeout
 static cartpole_result_t adapter_wait_measurement(serial_cartpole_t *s, double timeout_s);
 static cartpole_result_t adapter_wait_reply(serial_cartpole_t *s, double end, uint64_t faults);
 static cartpole_result_t adapter_configure(serial_cartpole_t *s, cartpole_setting_t setting,
-                                           long value, double timeout_s);
+                                           long value, double timeout_s,
+                                           cartpole_configure_observer_t observer, void *context);
 static cartpole_result_t adapter_refresh_configuration(serial_cartpole_t *s, double timeout_s);
 static cartpole_result_t adapter_mode_transaction(serial_cartpole_t *s, const char *command,
                                                   fw_mode_t target, double timeout_s);
@@ -120,7 +121,7 @@ static cartpole_result_t adapter_enable(serial_cartpole_t *s, double timeout_s);
 static cartpole_stop_result_t adapter_stop_and_confirm(serial_cartpole_t *s, double timeout_s);
 static cartpole_result_t adapter_reset(serial_cartpole_t *s, double timeout_s);
 static cartpole_result_t adapter_mark(serial_cartpole_t *s, cartpole_endpoint_t endpoint,
-                                      double timeout_s);
+                                      int64_t *value_um, double timeout_s);
 static cartpole_mode_t adapter_business_mode(fw_mode_t mode);
 static cartpole_reason_t adapter_business_reason(fw_reason_t reason);
 static cartpole_measurement_t adapter_measurement(serial_cartpole_t *s);
@@ -318,12 +319,14 @@ static cartpole_result_t adapter_special_reply_error(const char *awaiting, const
 static void adapter_handle_line(const char *line, size_t len, void *user)
 {
     serial_cartpole_t *s = user;
-    (void)len;
-    (void)user;
     proto_msg_t m;
     s->configuration_changed = 0;
     if (proto_parse_line(line, &m) == PROTO_UNKNOWN) {
         s->snapshot.received_unknown_line_count++;
+        if (len) {
+            const cartpole_event_t event = {.kind = CARTPOLE_EVENT_UNRECOGNIZED_LINE};
+            deliver_event(s, &event);
+        }
         if (!strncmp(line, "STATE", 5) || !strncmp(line, "MODE", 4) || !strcmp(line, "!OVERLONG"))
             stream_failed(s, CARTPOLE_PROTOCOL_ERROR);
         return;
@@ -331,6 +334,8 @@ static void adapter_handle_line(const char *line, size_t len, void *user)
     switch (m.type) {
     case PROTO_STATE:
         s->snapshot.measurement_validity_bits = m.valid_flags;
+        if (m.valid_flags != (CARTPOLE_MEASUREMENT_CART_VALID | CARTPOLE_MEASUREMENT_POLE_VALID))
+            s->invalid_dual_state_seq++;
         s->snapshot.x_um = m.x_um;
         s->snapshot.theta_urad = m.theta_urad;
         s->snapshot.vx_mm_s = m.vx_mm_s;
@@ -343,6 +348,8 @@ static void adapter_handle_line(const char *line, size_t len, void *user)
         s->snapshot.reported_mode_reason = m.reason;
         s->snapshot.is_mode_received = 1;
         s->mode_seq++;
+        if (m.mode != FW_DISABLED || m.reason != FW_REASON_NONE)
+            s->non_disabled_seq++;
         if (m.mode == FW_FAULT) {
             s->snapshot.has_received_fault_mode = 1;
             s->fault_seq++;
@@ -453,18 +460,51 @@ static cartpole_result_t adapter_wait_reply(serial_cartpole_t *s, double end, ui
         nap_ms(s, 1);
     }
 }
+static cartpole_result_t adapter_send_checked_config(serial_cartpole_t *s, const char *name,
+                                                      const char *line, size_t n, double end,
+                                                      cartpole_configure_observer_t observer,
+                                                      void *context)
+{
+    if (s->need_frame_boundary) {
+        TX_TRY(adapter_write_until(s, (const uint8_t *)"\n", 1, end, 0));
+        s->need_frame_boundary = 0;
+    }
+    for (;;) {
+        /* 背压期间也要接收和核验；上一次检查不授权下一次写入。 */
+        TX_TRY(adapter_drain(s, end));
+        TX_TRY(observer(CARTPOLE_CONFIGURE_CHECK, context));
+        TX_TRY(adapter_checkpoint(s, end, 0));
+        adapter_await_name(s, name);
+        const int written = uart_try_write_all(&s->uart, (const uint8_t *)line, n);
+        const cartpole_result_t observed = written <= 0
+            ? observer(CARTPOLE_CONFIGURE_ATTEMPTED, context) : CARTPOLE_OK;
+        if (written < 0) {
+            stream_failed(s, CARTPOLE_TRANSPORT_ERROR);
+            s->need_frame_boundary = 1;
+            return CARTPOLE_TRANSPORT_ERROR;
+        }
+        if (written == 0)
+            return observed != CARTPOLE_OK ? observed : adapter_checkpoint(s, end, 0);
+        nap_ms(s, 1);
+    }
+}
 static cartpole_result_t adapter_configure(serial_cartpole_t *s, cartpole_setting_t setting,
-                                           long value, double timeout_s)
+                                           long value, double timeout_s,
+                                           cartpole_configure_observer_t observer, void *context)
 {
     double end;
     TX_TRY(adapter_deadline(s, timeout_s, &end));
     const char *name = cartpole_setting_to_string(setting);
     char line[64];
-    if (!name || strlen(name) >= sizeof s->wait_name || !proto_format_config(line, name, value))
+    const size_t n = name ? proto_format_config(line, name, value) : 0;
+    if (!n || strlen(name) >= sizeof s->wait_name)
         return CARTPOLE_INVALID_ARGUMENT;
     TX_TRY(adapter_drain(s, end));
     uint64_t faults = s->fault_seq;
-    TX_TRY(adapter_send_config(s, name, value, end));
+    if (observer)
+        TX_TRY(adapter_send_checked_config(s, name, line, n, end, observer, context));
+    else
+        TX_TRY(adapter_send_config(s, name, value, end));
     TX_TRY(adapter_wait_reply(s, end, faults));
     return s->reply_value == value ? CARTPOLE_OK : CARTPOLE_REPLY_MISMATCH;
 }
@@ -509,33 +549,49 @@ static cartpole_result_t adapter_refresh_configuration(serial_cartpole_t *s, dou
     }
 }
 static cartpole_result_t adapter_read_settings(serial_cartpole_t *s, cartpole_settings_t *out,
-                                               double timeout_s)
+                                               uint32_t *received_mask, double timeout_s)
 {
     double end;
     TX_TRY(adapter_deadline(s, timeout_s, &end));
     TX_TRY(adapter_begin_metadata_query(s, end, 0, 1));
     for (;;) {
-        TX_TRY(adapter_receive(s, end));
+        cartpole_result_t result = adapter_receive(s, end);
         cartpole_settings_t settings;
-        int i;
-        for (i = 0; i < CARTPOLE_SETTING_COUNT; i++)
-            if (adapter_cached_value(s, cartpole_setting_to_string(i), &settings.values[i]) != 0)
-                break;
-        if (i == CARTPOLE_SETTING_COUNT) {
+        uint32_t received = 0;
+        for (int i = 0; i < CARTPOLE_SETTING_COUNT; i++)
+            if (adapter_cached_value(s, cartpole_setting_to_string(i), &settings.values[i]) == 0)
+                received |= UINT32_C(1) << i;
+        *received_mask = received;
+        if (result != CARTPOLE_OK)
+            return result;
+        if (received == ((UINT32_C(1) << CARTPOLE_SETTING_COUNT) - 1)) {
             *out = settings;
             return CARTPOLE_OK;
         }
         nap_ms(s, 1);
     }
 }
-static cartpole_result_t adapter_mode_transaction(serial_cartpole_t *s, const char *command,
-                                                  fw_mode_t target, double timeout_s)
+static cartpole_result_t adapter_read_pole_settings(serial_cartpole_t *s,
+                                                   cartpole_pole_settings_t *out, double timeout_s)
 {
     double end;
     TX_TRY(adapter_deadline(s, timeout_s, &end));
-    TX_TRY(adapter_drain(s, end));
-    uint64_t seq = s->mode_seq, faults = s->fault_seq;
-    TX_TRY(adapter_send_simple(s, command, end, 0));
+    /* 固件用 CONFIG? 广播参数。这里只等待摆杆零点和方向，不依赖其他参数。 */
+    TX_TRY(adapter_begin_metadata_query(s, end, 0, 1));
+    for (;;) {
+        TX_TRY(adapter_receive(s, end));
+        cartpole_pole_settings_t settings;
+        if (adapter_cached_value(s, CARTPOLE_TEXT_POLE_ZERO_URAD, &settings.zero_urad) == 0 &&
+            adapter_cached_value(s, CARTPOLE_TEXT_POLE_INV, &settings.inverted) == 0) {
+            *out = settings;
+            return CARTPOLE_OK;
+        }
+        nap_ms(s, 1);
+    }
+}
+static cartpole_result_t adapter_wait_mode(serial_cartpole_t *s, fw_mode_t target, double end,
+                                           uint64_t seq, uint64_t faults)
+{
     for (;;) {
         TX_TRY(adapter_receive(s, end));
         if (s->reply_seen && s->reply_err)
@@ -548,9 +604,84 @@ static cartpole_result_t adapter_mode_transaction(serial_cartpole_t *s, const ch
         nap_ms(s, 1);
     }
 }
+static cartpole_result_t adapter_mode_transaction(serial_cartpole_t *s, const char *command,
+                                                  fw_mode_t target, double timeout_s)
+{
+    double end;
+    TX_TRY(adapter_deadline(s, timeout_s, &end));
+    TX_TRY(adapter_drain(s, end));
+    uint64_t seq = s->mode_seq, faults = s->fault_seq;
+    TX_TRY(adapter_send_simple(s, command, end, 0));
+    return adapter_wait_mode(s, target, end, seq, faults);
+}
+
+static int enable_mode_is_disabled(const serial_cartpole_t *s)
+{
+    return s->snapshot.is_mode_received && s->snapshot.reported_mode == FW_DISABLED &&
+           s->snapshot.reported_mode_reason == FW_REASON_NONE;
+}
+
+static int enable_state_is_fresh(serial_cartpole_t *s)
+{
+    const double age = state_age(s);
+    return s->snapshot.measurement_validity_bits ==
+               (CARTPOLE_MEASUREMENT_CART_VALID | CARTPOLE_MEASUREMENT_POLE_VALID) &&
+           age >= 0. && age <= CFG_STATE_TIMEOUT_S;
+}
+
 static cartpole_result_t adapter_enable(serial_cartpole_t *s, double timeout_s)
 {
-    return adapter_mode_transaction(s, "ENABLE", FW_READY, timeout_s);
+    double end;
+    TX_TRY(adapter_deadline(s, timeout_s, &end));
+    if (s->snapshot.is_mode_received && s->snapshot.reported_mode == FW_FAULT)
+        return CARTPOLE_FAULT;
+    if (!enable_mode_is_disabled(s))
+        return CARTPOLE_REJECTED;
+
+    const uint64_t faults = s->fault_seq, non_disabled = s->non_disabled_seq,
+                   invalid_states = s->invalid_dual_state_seq;
+    int have_valid_state = enable_state_is_fresh(s);
+    /* 每次真正写前先处理已有输入；UART 接受零字节时，下一次尝试重新检查。 */
+    for (;;) {
+        cartpole_result_t result = adapter_drain(s, end);
+        if (s->fault_seq != faults)
+            return CARTPOLE_FAULT;
+        if (result == CARTPOLE_TIMEOUT && !have_valid_state)
+            return CARTPOLE_MEASUREMENT_UNAVAILABLE;
+        if (result != CARTPOLE_OK)
+            return result;
+        if (s->non_disabled_seq != non_disabled || !enable_mode_is_disabled(s))
+            return CARTPOLE_REJECTED;
+        if (s->invalid_dual_state_seq != invalid_states)
+            return CARTPOLE_MEASUREMENT_UNAVAILABLE;
+        if (!enable_state_is_fresh(s)) {
+            if (have_valid_state)
+                return CARTPOLE_MEASUREMENT_UNAVAILABLE;
+            nap_ms(s, 1);
+            continue;
+        }
+        have_valid_state = 1;
+        TX_TRY(adapter_checkpoint(s, end, 0));
+        if (!enable_state_is_fresh(s))
+            return CARTPOLE_MEASUREMENT_UNAVAILABLE;
+        /* 前一帧部分写入会锁住流，不允许用 ENABLE 修复帧边界。 */
+        if (s->need_frame_boundary)
+            return CARTPOLE_TRANSPORT_ERROR;
+        adapter_await_name(s, "ENABLE");
+        uint64_t seq = s->mode_seq;
+        const char command[] = "ENABLE\n";
+        int written = uart_try_write_all(&s->uart, (const uint8_t *)command, sizeof command - 1);
+        if (written < 0) {
+            stream_failed(s, CARTPOLE_TRANSPORT_ERROR);
+            s->need_frame_boundary = 1;
+            return CARTPOLE_TRANSPORT_ERROR;
+        }
+        if (written == 0) {
+            TX_TRY(adapter_checkpoint(s, end, 0));
+            return adapter_wait_mode(s, FW_READY, end, seq, faults);
+        }
+        nap_ms(s, 1);
+    }
 }
 static cartpole_result_t adapter_disable(serial_cartpole_t *s, double timeout_s)
 {
@@ -625,7 +756,7 @@ static cartpole_result_t adapter_reset(serial_cartpole_t *s, double timeout_s)
     return adapter_mode_transaction(s, "RESET", FW_DISABLED, timeout_s);
 }
 static cartpole_result_t adapter_mark(serial_cartpole_t *s, cartpole_endpoint_t endpoint,
-                                      double timeout_s)
+                                      int64_t *value_um, double timeout_s)
 {
     double end;
     TX_TRY(adapter_deadline(s, timeout_s, &end));
@@ -634,7 +765,9 @@ static cartpole_result_t adapter_mark(serial_cartpole_t *s, cartpole_endpoint_t 
     TX_TRY(adapter_drain(s, end));
     uint64_t faults = s->fault_seq;
     TX_TRY(adapter_send_simple(s, endpoint == CARTPOLE_LEFT ? "MARK LEFT" : "MARK RIGHT", end, 0));
-    return adapter_wait_reply(s, end, faults);
+    TX_TRY(adapter_wait_reply(s, end, faults));
+    *value_um = s->reply_value;
+    return CARTPOLE_OK;
 }
 static cartpole_result_t adapter_confirm_left(serial_cartpole_t *s, int64_t *position_um,
                                                double timeout_s)
@@ -696,7 +829,8 @@ static cartpole_session_t adapter_session(serial_cartpole_t *s)
                                 .reported_mode_reason =
                                     adapter_business_reason(s->snapshot.reported_mode_reason),
                                 .has_stream_failure_latch = s->snapshot.has_stream_failure_latch,
-                                .has_received_fault_mode = s->snapshot.has_received_fault_mode};
+                                .has_received_fault_mode = s->snapshot.has_received_fault_mode,
+                                .received_fault_mode_count = s->fault_seq};
 }
 static cartpole_configuration_t adapter_configuration(serial_cartpole_t *s)
 {
@@ -715,6 +849,7 @@ static cartpole_configuration_t adapter_configuration(serial_cartpole_t *s)
     c.complete &= adapter_cached_value(s, "ACC_MAX", &c.acceleration_limit_mm_s2) == 0;
     c.complete &= adapter_cached_value(s, "WDT_MS", &c.watchdog_timeout_ms) == 0;
     c.complete &= adapter_cached_value(s, "X_MARGIN_UM", &c.track_margin_um) == 0;
+    c.has_legacy_watchdog_deceleration = adapter_cached_value(s, "WDT_DEC", NULL) == 0;
     return c;
 }
 static void adapter_dispatch_business_event(serial_cartpole_t *s, const proto_msg_t *message)
@@ -732,10 +867,14 @@ static void adapter_dispatch_business_event(serial_cartpole_t *s, const proto_ms
         event.data.session = adapter_session(s);
         break;
     case PROTO_OK:
-        if (!s->configuration_changed || !configuration_parameter(message->param))
+        if (!s->configuration_changed ||
+            (!configuration_parameter(message->param) && strcmp(message->param, "WDT_DEC") != 0))
             return;
         event.kind = CARTPOLE_EVENT_CONFIGURATION;
         event.data.configuration = adapter_configuration(s);
+        break;
+    case PROTO_ERR:
+        event.kind = CARTPOLE_EVENT_FIRMWARE_ERROR;
         break;
     case PROTO_STEP_LOSS:
         event.kind = CARTPOLE_EVENT_STEP_LOSS;
@@ -811,14 +950,21 @@ static cartpole_result_t port_refresh_configuration(void *context, double timeou
     serial_cartpole_t *s = context;
     return adapter_refresh_configuration(s, timeout);
 }
-static cartpole_result_t port_read_settings(void *context, cartpole_settings_t *out, double timeout)
+static cartpole_result_t port_read_pole_settings(void *context, cartpole_pole_settings_t *out,
+                                                double timeout)
 {
-    return adapter_read_settings(context, out, timeout);
+    return adapter_read_pole_settings(context, out, timeout);
 }
-static cartpole_result_t port_mark(void *context, cartpole_endpoint_t endpoint, double timeout)
+static cartpole_result_t port_read_settings(void *context, cartpole_settings_t *out,
+                                             uint32_t *received_mask, double timeout)
+{
+    return adapter_read_settings(context, out, received_mask, timeout);
+}
+static cartpole_result_t port_mark(void *context, cartpole_endpoint_t endpoint,
+                                  int64_t *value_um, double timeout)
 {
     serial_cartpole_t *s = context;
-    return adapter_mark(s, endpoint, timeout);
+    return adapter_mark(s, endpoint, value_um, timeout);
 }
 static cartpole_result_t port_confirm_left(void *context, int64_t *position_um, double timeout)
 {
@@ -831,10 +977,11 @@ static cartpole_result_t port_read_calibration_status(void *context,
     return adapter_read_calibration_status(context, out, timeout);
 }
 static cartpole_result_t port_configure(void *context, cartpole_setting_t setting, long value,
-                                        double timeout)
+                                        double timeout, cartpole_configure_observer_t observer,
+                                        void *observer_context)
 {
     serial_cartpole_t *s = context;
-    return adapter_configure(s, setting, value, timeout);
+    return adapter_configure(s, setting, value, timeout, observer, observer_context);
 }
 static cartpole_stop_result_t port_stop_and_confirm(void *context, double timeout)
 {
@@ -884,6 +1031,7 @@ static const cartpole_device_ops_t operations = {
     .reset = port_reset,
     .refresh_configuration = port_refresh_configuration,
     .read_settings = port_read_settings,
+    .read_pole_settings = port_read_pole_settings,
     .mark_endpoint = port_mark,
     .confirm_left = port_confirm_left,
     .read_calibration_status = port_read_calibration_status,

@@ -52,6 +52,7 @@ typedef struct {
     cartpole_reason_t reported_mode_reason;
     /* 禁止继续非零驱动；零速与停机清理仍可用。FAULT历史不被READY/RESET清除。 */
     int has_stream_failure_latch, has_received_fault_mode;
+    uint64_t received_fault_mode_count; /* 本会话收到的 FAULT 帧数，退回 DISABLED 不清零。 */
 } cartpole_session_t;
 typedef enum {
     CARTPOLE_CALIBRATION_NOT_READY,
@@ -62,6 +63,7 @@ typedef struct {
     int complete; /* 全部部署配置已获取；false时其他值不构成可运行配置 */
     cartpole_calibration_state_t calibration_state;
     int calibration_saved, calibration_storage_ok;
+    int has_legacy_watchdog_deceleration;
     int64_t track_length_um;
     int64_t velocity_limit_mm_s, acceleration_limit_mm_s2, watchdog_timeout_ms, track_margin_um;
 } cartpole_configuration_t;
@@ -84,11 +86,17 @@ typedef enum {
 typedef struct {
     int64_t values[CARTPOLE_SETTING_COUNT];
 } cartpole_settings_t;
+
+typedef struct {
+    int64_t zero_urad, inverted;
+} cartpole_pole_settings_t;
 typedef enum {
     CARTPOLE_EVENT_MEASUREMENT,
     CARTPOLE_EVENT_SESSION,
     CARTPOLE_EVENT_CONFIGURATION,
-    CARTPOLE_EVENT_STEP_LOSS
+    CARTPOLE_EVENT_STEP_LOSS,
+    CARTPOLE_EVENT_FIRMWARE_ERROR,
+    CARTPOLE_EVENT_UNRECOGNIZED_LINE
 } cartpole_event_kind_t;
 typedef struct {
     cartpole_event_kind_t kind;
@@ -121,11 +129,15 @@ double cartpole_get_monotonic_time_s(cartpole_t *);
  * configure值单位按setting：mm/s、mm/s²、ms、µm、µrad或反向布尔0/1。 */
 cartpole_result_t cartpole_query_mode(cartpole_t *, double timeout_s);
 cartpole_result_t cartpole_wait_for_measurement(cartpole_t *, double timeout_s);
+/* 在已收到 DISABLED NONE 后请求使能；发送时必须有新鲜、双路有效的 STATE。
+ * 发送前发现新的 FAULT、模式转移或无效测量即中止，不自动重发已写入的 ENABLE。 */
 cartpole_result_t cartpole_enable(cartpole_t *, double timeout_s);
 /* 仅发送禁用请求，不减速；非零速时返回 BUSY，设备故障时保留 FAULT。 */
 cartpole_result_t cartpole_disable(cartpole_t *, double timeout_s);
 cartpole_result_t cartpole_reset(cartpole_t *, double timeout_s);
-cartpole_result_t cartpole_mark_endpoint(cartpole_t *, cartpole_endpoint_t, double timeout_s);
+/* 仅成功才返回固件读数（左端位置或标定长度，单位 µm）。 */
+cartpole_result_t cartpole_mark_endpoint(cartpole_t *, cartpole_endpoint_t,
+                                                  int64_t *value_um, double timeout_s);
 /* 确认保存行程的左参考点，不使能。成功才写入 position_um。 */
 cartpole_result_t cartpole_confirm_left(cartpole_t *, int64_t *position_um, double timeout_s);
 /* 只查询当前轨道标定，成功才写入 out。 */
@@ -136,6 +148,16 @@ cartpole_result_t cartpole_configure(cartpole_t *, cartpole_setting_t, long valu
 cartpole_result_t cartpole_refresh_configuration(cartpole_t *, double timeout_s);
 /* 重新读取全部设置；失败不修改 out。 */
 cartpole_result_t cartpole_read_settings(cartpole_t *, cartpole_settings_t *out, double timeout_s);
+/* 如超时，只返回本次已收到字段的掩码，不修改 out；位号对应 cartpole_setting_t。 */
+cartpole_result_t cartpole_read_settings_observed(cartpole_t *, cartpole_settings_t *out,
+                                                uint32_t *received_mask, double timeout_s);
+cartpole_result_t cartpole_read_pole_settings(cartpole_t *, cartpole_pole_settings_t *, double timeout_s);
+typedef enum { CARTPOLE_CONFIGURE_CHECK, CARTPOLE_CONFIGURE_ATTEMPTED } cartpole_configure_stage_t;
+/* 在设备排空待收消息后、每次尝试写入前同步检查。ATTEMPTED 表示帧已由驱动接收
+ * 或写入结果有疑义，不代表收到固件回执。回调不得调用设备 IO。 */
+typedef cartpole_result_t (*cartpole_configure_observer_t)(cartpole_configure_stage_t, void *);
+cartpole_result_t cartpole_configure_checked(cartpole_t *, cartpole_setting_t, long, double,
+                                             cartpole_configure_observer_t, void *);
 /* 清理忽略已请求取消与流失败；FAULT保留故障，不等同DISABLED。
  * UNCONFIRMED不证明设备仍在运动，也不证明已经停下。 */
 cartpole_stop_result_t cartpole_stop_and_confirm(cartpole_t *, double timeout_s);
@@ -167,6 +189,8 @@ cartpole_send_result_t cartpole_send_velocity(cartpole_t *, double velocity_mm_s
 cartpole_result_t cartpole_get_stream_result(cartpole_t *);
 /* 非负有限绝对时间；可被取消中断，回调内禁止阻塞。 */
 cartpole_result_t cartpole_sleep_until(cartpole_t *, double deadline_s);
+/* 只在有界停车清理中使用；即使已取消也等待注入时钟到达期限。 */
+cartpole_result_t cartpole_sleep_for_cleanup_until(cartpole_t *, double deadline_s);
 typedef cartpole_result_t (*cartpole_operation_t)(cartpole_t *, void *);
 /* 同步独占一个设备操作：禁止操作重入或销毁会话；observer 在显示订阅前
  * 收到每一条报告，不能修改会话。返回时自动解绑 observer 和解除独占。

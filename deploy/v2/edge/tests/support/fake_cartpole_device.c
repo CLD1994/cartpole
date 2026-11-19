@@ -83,18 +83,31 @@ TRANSACTION(enable, FAKE_ENABLE)
 TRANSACTION(disable, FAKE_DISABLE)
 TRANSACTION(reset, FAKE_RESET)
 TRANSACTION(refresh, FAKE_REFRESH)
-static cartpole_result_t read_settings(void *ctx, cartpole_settings_t *out, double timeout)
+static cartpole_result_t read_settings(void *ctx, cartpole_settings_t *out, uint32_t *mask, double timeout)
 {
     fake_device *d = ctx;
     record(d, FAKE_READ_SETTINGS, timeout, 0, 0);
+    *mask = d->transaction_result == CARTPOLE_OK
+                ? ((UINT32_C(1) << CARTPOLE_SETTING_COUNT) - 1) : 0;
     if (d->transaction_result == CARTPOLE_OK)
         *out = d->settings;
     return d->transaction_result;
 }
-static cartpole_result_t mark(void *ctx, cartpole_endpoint_t endpoint, double timeout)
+static cartpole_result_t read_pole_settings(void *ctx, cartpole_pole_settings_t *out, double timeout)
+{
+    fake_device *d = ctx;
+    record(d, FAKE_READ_SETTINGS, timeout, 0, 0);
+    if (d->transaction_result == CARTPOLE_OK)
+        *out = (cartpole_pole_settings_t){d->settings.values[CARTPOLE_SETTING_POLE_ZERO],
+                                         d->settings.values[CARTPOLE_SETTING_POLE_INVERT]};
+    return d->transaction_result;
+}
+static cartpole_result_t mark(void *ctx, cartpole_endpoint_t endpoint, int64_t *value, double timeout)
 {
     fake_device *d = ctx;
     record(d, FAKE_MARK, timeout, endpoint, 0);
+    if (d->transaction_result == CARTPOLE_OK)
+        *value = 0;
     return d->transaction_result;
 }
 static cartpole_result_t confirm_left(void *ctx, int64_t *position_um, double timeout)
@@ -114,9 +127,16 @@ static cartpole_result_t read_calibration_status(void *ctx, cartpole_calibration
         *out = d->calibration_status;
     return d->transaction_result;
 }
-static cartpole_result_t configure(void *ctx, cartpole_setting_t setting, long value, double timeout)
+static cartpole_result_t configure(void *ctx, cartpole_setting_t setting, long value, double timeout,
+                                   cartpole_configure_observer_t observer, void *observer_context)
 {
     fake_device *d = ctx;
+    if (observer) {
+        cartpole_result_t result = observer(CARTPOLE_CONFIGURE_CHECK, observer_context);
+        if (result != CARTPOLE_OK)
+            return result;
+        observer(CARTPOLE_CONFIGURE_ATTEMPTED, observer_context);
+    }
     record(d, FAKE_CONFIGURE, timeout, setting, value);
     return d->transaction_result;
 }
@@ -146,6 +166,7 @@ static const cartpole_device_ops_t ops = {.bind_cancellation = bind_cancellation
                                           .disable = disable,
                                           .reset = reset,
                                           .refresh_configuration = refresh,
+                                          .read_pole_settings = read_pole_settings,
                                           .read_settings = read_settings,
                                           .mark_endpoint = mark,
                                           .confirm_left = confirm_left,

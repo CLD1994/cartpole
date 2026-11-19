@@ -6,10 +6,11 @@ sys.path.insert(0, str(Path(__file__).parents[2]))
 from cli_report import (parse_state_window_summary, parse_state_output, ModeEvent, StepLossEvent,
                         ERROR_INVALID_STATE_WINDOW_REPORT)
 
-REPORT = ('[edge] window 1.0 s: 500 STATE lines -> 500.0 Hz (observed)\n'
-          '[edge] unknown lines: 0 (require 0)\n'
-          '[edge] sampled x range [-123, 456] um\n'
-          '[edge] sampled theta range [-42, 13] urad\n')
+REPORT = ('时长 1.0 s，有效 STATE 500 行 → 500.0 Hz（接收总数 500 行）\n'
+          'UNKNOWN 行：0（要求 0）\n'
+          'x_um ∈ [-123, 456]（漂移 579 µm；x ≈ 0.17 mm）\n'
+          'theta_urad ∈ [-42, 13]（θ ∈ [-0.00°, 0.00°]）\n'
+          '未指定目标频率，仅检查收到有效 STATE 且 UNKNOWN 为 0；不证明期间没有无效帧。\n')
 
 
 class StateReportTests(unittest.TestCase):
@@ -26,21 +27,21 @@ class StateReportTests(unittest.TestCase):
         self.assertEqual(parse_state_window_summary(REPORT.rstrip('\n')), report)
 
     def test_unavailable_lanes_are_not_zero_measurements(self):
-        text = REPORT.replace('[edge] sampled x range [-123, 456] um', '[edge] cart samples unavailable')
-        text = text.replace('[edge] sampled theta range [-42, 13] urad', '[edge] pole samples unavailable')
+        text = REPORT.replace('x_um ∈ [-123, 456]（漂移 579 µm；x ≈ 0.17 mm）', '小车测量不可用')
+        text = text.replace('theta_urad ∈ [-42, 13]（θ ∈ [-0.00°, 0.00°]）', '摆杆测量不可用')
         report = parse_state_window_summary(text)
         self.assertIsNone(report.cart_range_um)
         self.assertIsNone(report.pole_range_urad)
 
     def test_full_stdout_retains_only_defined_events_and_report(self):
-        output = '[edge] MODE READY NONE\n[edge] STEP_LOSS event=12 run=34 device_us=5678\n' + REPORT
+        output = '[MODE] READY NONE\n[edge] STEP_LOSS event=12 run=34 device_us=5678\n' + REPORT
         parsed = parse_state_output(output)
         self.assertEqual(parsed.report, parse_state_window_summary(REPORT))
         self.assertEqual(parsed.events, (ModeEvent('READY', 'NONE'), StepLossEvent(12, 34, 5678)))
         self.assertEqual(parse_state_output(REPORT).events, ())
 
     def test_full_stdout_rejects_unknown_or_malformed_events(self):
-        for event in ('[edge] MODE RUNNING NONE', '[edge] MODE READY OTHER',
+        for event in ('[MODE] RUNNING NONE', '[MODE] READY OTHER',
                       '[edge] STEP_LOSS event=-1 run=2 device_us=3',
                       '[edge] STEP_LOSS event=1 run=2 device_us=9223372036854775808',
                       '[edge] STEP_LOSS event=1 run=2', '[edge] unrelated warning'):
@@ -50,7 +51,7 @@ class StateReportTests(unittest.TestCase):
                 self.assertEqual(str(caught.exception), ERROR_INVALID_STATE_WINDOW_REPORT)
 
     def test_power_fault_is_part_of_known_mode_output(self):
-        parsed = parse_state_output('[edge] MODE FAULT POWER\n' + REPORT)
+        parsed = parse_state_output('[MODE] FAULT POWER\n' + REPORT)
         self.assertEqual(parsed.events, (ModeEvent('FAULT', 'POWER'),))
 
     def test_invalid_reports_are_rejected(self):
@@ -58,9 +59,9 @@ class StateReportTests(unittest.TestCase):
         bad = [None, '', REPORT.replace('\n', '\v'), REPORT + lines[0], ''.join(lines[:3]),
                ''.join([lines[0], lines[0], *lines[2:]]),
                ''.join([lines[1], lines[0], *lines[2:]]),
-               REPORT.replace('500 STATE', '-1 STATE'), REPORT.replace('500 STATE', '1.5 STATE'),
+               REPORT.replace('STATE 500', 'STATE -1'), REPORT.replace('STATE 500', 'STATE 1.5'),
                REPORT.replace('500.0 Hz', 'nan Hz'), REPORT.replace('1.0 s', 'inf s'),
-               REPORT.replace('[-123, 456]', '[456, -123]'), REPORT.replace(' um', ' mm'),
+               REPORT.replace('[-123, 456]', '[456, -123]'), REPORT.replace(' µm', ' mm'),
                REPORT.replace('[-42, 13]', '[x, 13]'), REPORT + '\n', REPORT.replace('500.0 Hz', '9'*400+'.0 Hz')]
         for text in bad:
             with self.subTest(text=text):

@@ -104,6 +104,10 @@ class Firmware:
                                 self.send(f"OK {key} {value}")
                         elif command in self.mark_errors:
                             self.send(f"ERR {self.mark_errors[command]}")
+                        elif command == "MARK LEFT":
+                            self.send("OK MARK_LEFT -447422")
+                        elif command == "MARK RIGHT":
+                            self.send("OK MARK_RIGHT 894845")
                         elif command == "CONFIRM LEFT":
                             if self.mode == "DISABLED":
                                 self.send("OK CONFIRM_LEFT -447422")
@@ -119,6 +123,10 @@ class Firmware:
                             elif key not in self.settings or (key.startswith("POLE_") and self.mode != "DISABLED"):
                                 self.send(f"ERR {key}")
                             else:
+                                if key == "POLE_ZERO_URAD":
+                                    delta = self.settings[key] - int(value)
+                                    direction = -1 if self.settings["POLE_INV"] else 1
+                                    self.theta = (self.theta + direction * delta + 3141592) % 6283185 - 3141592
                                 self.settings[key] = int(value)
                                 self.send(f"OK {key} {value}")
                         elif command.startswith("VEL ") and float(command.split()[1]) != 0:
@@ -189,13 +197,13 @@ class CommandTests(unittest.TestCase):
             fw.fault_reason = "POWER"
             result = fw.run("disable")
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("MODE FAULT POWER", result.stdout)
+            self.assertIn("[MODE] FAULT POWER", result.stdout)
             self.assertIn("DISABLE: FAULT", result.stderr)
             self.assertEqual(fw.commands, ["DISABLE"])
             self.assertEqual(fw.mode, "FAULT")
 
     def test_calibrate_pole_down_writes_only_final_zero_without_enabling(self):
-        with Firmware(mode="DISABLED") as fw:
+        with Firmware(mode="DISABLED", missing_setting="STEP_LOSS_UM") as fw:
             fw.theta = 3000000
             result = fw.run("calibrate-pole-down")
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -215,13 +223,13 @@ class CommandTests(unittest.TestCase):
             result = fw.run("--baud", "1000000", "query")
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(fw.commands, ["QUERY"])
-            self.assertIn("MODE READY NONE", result.stdout)
+            self.assertIn("[MODE] READY NONE", result.stdout)
 
     def test_enable_accepts_timeout(self):
         with Firmware(mode="DISABLED") as fw:
             result = fw.run("enable", "--timeout", "1.5")
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(fw.commands, ["ENABLE"])
+            self.assertEqual(fw.commands, ["QUERY", "ENABLE"])
 
     def test_enable_rejects_nonpositive_timeout_without_writing(self):
         with Firmware(mode="DISABLED") as fw:
@@ -233,8 +241,8 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         values = {}
         for line in result.stdout.splitlines():
-            self.assertTrue(line.startswith("[edge] ") and " = " in line, line)
-            name, value = line[len("[edge] "):].split(" = ", 1)
+            self.assertTrue(line.startswith("[OK] ") and " = " in line, line)
+            name, value = line[len("[OK] "):].split(" = ", 1)
             self.assertNotIn(name, values)
             values[name] = int(value)
         self.assertEqual(values, fw.settings)
@@ -438,8 +446,8 @@ class CommandTests(unittest.TestCase):
             result = fw.run("enable", "--timeout", "0.2")
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("ENABLE: TIMEOUT", result.stderr)
-            self.assertIn("execution unconfirmed", result.stderr)
-            self.assertIn("do not automatically retry", result.stderr)
+            self.assertIn("执行未确认", result.stderr)
+            self.assertIn("不要自动重试", result.stderr)
             self.assertEqual(fw.commands.count("ENABLE"), 1)
 
     def test_velocity_invalid_cart_is_not_mislabeled_as_bad_velocity(self):
@@ -483,12 +491,20 @@ class CommandTests(unittest.TestCase):
     def test_state_pole_invalid_not_displayed_as_valid_zero_angle(self):
         with Firmware(flags=1) as fw:
             result = fw.run("state", "--secs", "0.06")
-            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotEqual(result.returncode, 0)
             report = parse_state_output(result.stdout).report
             self.assertEqual(report.cart_range_um, (123, 123))
             self.assertIsNone(report.pole_range_urad)
-            self.assertIn("pole samples unavailable", result.stdout)
-            self.assertNotIn("sampled theta range", result.stdout)
+            self.assertEqual(report.valid_state_count, 0)
+
+    def test_state_expected_hz_fails_with_a_report_when_observed_rate_differs(self):
+        with Firmware() as fw:
+            result = fw.run("state", "--expected-hz", "1", "--secs", "0.12")
+            self.assertNotEqual(result.returncode, 0)
+            report = parse_state_output(result.stdout).report
+            self.assertEqual(report.expected_hz, 1)
+            self.assertFalse(report.rate_ok)
+            self.assertGreater(report.valid_state_count, 0)
 
     def test_state_without_stream_fails(self):
         with Firmware(stream=False) as fw:
@@ -502,6 +518,20 @@ class CommandTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("usage:", result.stderr)
         self.assertNotIn("cannot open", result.stderr)
+
+    def test_vel_plan_accepts_reserve_and_options_before_velocity(self):
+        with Firmware(mode="DISABLED") as fw:
+            result = fw.run("vel", "--plan", "600", "--reserve-mm", "30")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(fw.commands, ["CALIB?", "CONFIG?", "QUERY"])
+            self.assertIn("目标 407.422 mm", result.stdout)
+            self.assertIn("正常提前制动预算", result.stdout)
+
+    def test_vel_rejects_combining_plan_and_hold_without_motion(self):
+        with Firmware() as fw:
+            result = fw.run("vel", "600", "--hold", "1", "--plan")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(fw.commands, [])
 
     def test_vel_exit_confirms_disabled(self):
         with Firmware() as fw:
